@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+Thumbs.db
+.DS_Store
+
+# Debug screenshots / captures
+*.png
+*.bmp
+
+# External tools / deps
+FFmpeg/
+
+# Crash telemetry
+.sentry-native/
+
+*.bin
+*.cue
+*.iso
