@@ -1,0 +1,668 @@
+[Launcher] Disc: C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA).cue
+=== PSXRecomp v2 ===
+EXE: C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\SLUS_000.67
+CUE: C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA).cue
+
+[KeyConfig] Loading from C:/Users/Leona/Documents/GitHub/psxrecomp/CastlevaniaRecomp/build/keyconfig.ini
+[XA] Volume set to 50%
+[KeyConfig] UP=265 DOWN=264 CROSS=83 START=257
+[XA] Opened C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA) (Track 1).bin
+[XA] WAV capture: C:/temp/xa_capture.wav (up to 30s)
+[XA] Audio ready (decode 37800 Hz → waveOut 44100 Hz)
+[FMV] Opened C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA) (Track 1).bin
+[SPU] Initialised — 24 voices, 44100 Hz stereo
+Detected PS-X header, skipping 2048 bytes
+Loaded 561152 bytes
+Loaded into PS1 RAM at 0x80010000
+[OpenGLRenderer] Initialize() called
+[OpenGLRenderer] InitializeWindow() - Creating GLFW window...
+[OpenGLRenderer] GLFW window created successfully (960x720)
+[OpenGLRenderer] InitializeOpenGL() - Loading OpenGL functions...
+[OpenGLRenderer] OpenGL initialized successfully!
+[OpenGLRenderer]   Version:  3.3.0 - Build 31.0.101.5522
+[OpenGLRenderer]   Renderer: Intel(R) Iris(R) Xe Graphics
+[OpenGLRenderer]   Vendor:   Intel
+[OpenGLRenderer] OpenGL 3.3 Core Profile ready
+[OpenGLRenderer] InitializeShaders() - Compiling shaders...
+[OpenGLRenderer]   - Primitive shader compiled (program ID: 3)
+[OpenGLRenderer]   - Textured shader compiled (program ID: 4)
+[OpenGLRenderer]   - Fill shader compiled (program ID: 5)
+[OpenGLRenderer]   - Copy shader compiled (program ID: 6)
+[OpenGLRenderer] All 4 shaders compiled successfully!
+[OpenGLRenderer] InitializeBuffers() - Creating VAO and VBO...
+[OpenGLRenderer] VAO and VBO created (max 4096 vertices per batch)
+[OpenGLRenderer] InitializeVRAM() - Creating VRAM texture and FBO...
+[OpenGLRenderer] VRAM texture created (1024x512, RGB5A1, 1024 KB)
+[OpenGLRenderer] VRAM FBO created and verified (complete)
+[OpenGLRenderer] Initialization complete!
+Renderer ready
+
+Calling entry point 0x80010DF4...
+[CALLEE-FIX] #1 f0 call_by_address(0x80010DF4) sp:801FFF00->80200000 s0:00000000->00000000 s1:00000000->00000000 — restoring
+Entry point returned.
+[BLACKSCREEN] Entry 0x80010DF4 returned immediately; trying bootstrap entry 0x80010EB8
+[BLACKSCREEN] Bootstrap entry 0x80010EB8 returned
+[BLACKSCREEN] Seeded synthetic RA=0x8001A184 before display bootstrap
+[BLACKSCREEN] Entry returned before first PS1 frame; trying display entry 0x800191E0
+[TRACE] func_800191E0 (display thread) sp=0x801FFF00
+[BLACKSCREEN] Display entry returned
+[BLACKSCREEN] Display entry 0x800191E0 returned; trying alternate display entry 0x80019844
+[FORCE-CB] f0 inject func_800194F0 old=0x00000000 new=0x80032A00 ra=0x8001A184
+[SCHED-GATE-OVR] f0 call=1 addr=0x800194F0 ra=0x8001A184 ds=0/0 sub=0/0 t=0/0 tcb=0/0/0 cb=0x00000000 cbctx=0x01FE01FE a5398=0,0,0 scr=0,0,0,0
+[SCHED-GATE] f0 call=1 addr=0x80019844 ra=0x8001A184 v0:FFFFFC00->00000000 cb:00000000->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN] Alternate display entry 0x80019844 returned
+[BLACKSCREEN] Enabling display pump fallback at 0x80019844
+[TRACE] FUN_80019844 (game logic loop entry)
+[RENDER-TRACE] f0 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f0 call=2 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=1 f=1 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 1]
+[RENDER-TRACE] f0 drawotag=0 addprim=0
+[RENDER-HOT] f0 0x80010DF4(c=1 ra=0x00000000) 0x80010EB8(c=1 ra=0x00000000) 0x800191E0(c=1 ra=0x8001A184) 0x800194F0(c=1 ra=0x8001A184) 0x80019844(c=1 ra=0x8001A184)
+[TRACE] FUN_80019844 (game logic loop entry)
+[RENDER-TRACE] f1 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f1 call=3 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=2 f=2 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 2]
+[RENDER-TRACE] f1 drawotag=0 addprim=0
+[RENDER-HOT] f1 0x80019844(c=1 ra=0x8001A184)
+[TRACE] FUN_80019844 (game logic loop entry)
+[RENDER-TRACE] f2 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f2 call=4 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=3 f=3 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 3]
+[RENDER-TRACE] f2 drawotag=0 addprim=0
+[RENDER-HOT] f2 0x80019844(c=1 ra=0x8001A184)
+[TRACE] FUN_80019844 (game logic loop entry)
+[RENDER-TRACE] f3 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f3 call=5 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=4 f=4 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 4]
+[RENDER-TRACE] f3 drawotag=0 addprim=0
+[RENDER-HOT] f3 0x80019844(c=1 ra=0x8001A184)
+[TRACE] FUN_80019844 (game logic loop entry)
+[RENDER-TRACE] f4 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f4 call=6 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=5 f=5 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 5]
+[RENDER-TRACE] f4 drawotag=0 addprim=0
+[RENDER-HOT] f4 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f5 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f5 call=7 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=6 f=6 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f5 drawotag=0 addprim=0
+[RENDER-HOT] f5 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f6 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f6 call=8 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=7 f=7 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f6 drawotag=0 addprim=0
+[RENDER-HOT] f6 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f7 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f7 call=9 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=8 f=8 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f7 drawotag=0 addprim=0
+[RENDER-HOT] f7 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f8 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f8 call=10 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=9 f=9 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f8 drawotag=0 addprim=0
+[RENDER-HOT] f8 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f9 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f9 call=11 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=10 f=10 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f9 drawotag=0 addprim=0
+[RENDER-HOT] f9 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f10 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f10 call=12 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=11 f=11 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f10 drawotag=0 addprim=0
+[RENDER-HOT] f10 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f11 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f11 call=13 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=12 f=12 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f11 drawotag=0 addprim=0
+[RENDER-HOT] f11 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f12 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f12 call=14 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=13 f=13 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f12 drawotag=0 addprim=0
+[RENDER-HOT] f12 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f13 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f13 call=15 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=14 f=14 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f13 drawotag=0 addprim=0
+[RENDER-HOT] f13 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f14 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f14 call=16 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=15 f=15 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f14 drawotag=0 addprim=0
+[RENDER-HOT] f14 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f15 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f15 call=17 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=16 f=16 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f15 drawotag=0 addprim=0
+[RENDER-HOT] f15 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f16 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f16 call=18 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=17 f=17 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f16 drawotag=0 addprim=0
+[RENDER-HOT] f16 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f17 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f17 call=19 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=18 f=18 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f17 drawotag=0 addprim=0
+[RENDER-HOT] f17 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f18 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f18 call=20 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=19 f=19 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f18 drawotag=0 addprim=0
+[RENDER-HOT] f18 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f19 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f19 call=21 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[BLACKSCREEN][RendererPresent] present=20 f=20 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[RENDER-TRACE] f19 drawotag=0 addprim=0
+[RENDER-HOT] f19 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f20 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f20 call=22 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f20 drawotag=0 addprim=0
+[RENDER-HOT] f20 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f21 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f21 call=23 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f21 drawotag=0 addprim=0
+[RENDER-HOT] f21 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f22 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f22 call=24 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f22 drawotag=0 addprim=0
+[RENDER-HOT] f22 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f23 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f23 call=25 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f23 drawotag=0 addprim=0
+[RENDER-HOT] f23 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f24 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f24 call=26 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f24 drawotag=0 addprim=0
+[RENDER-HOT] f24 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f25 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f25 call=27 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f25 drawotag=0 addprim=0
+[RENDER-HOT] f25 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f26 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f26 call=28 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f26 drawotag=0 addprim=0
+[RENDER-HOT] f26 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f27 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f27 call=29 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f27 drawotag=0 addprim=0
+[RENDER-HOT] f27 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f28 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f28 call=30 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f28 drawotag=0 addprim=0
+[RENDER-HOT] f28 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f29 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f29 call=31 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f29 drawotag=0 addprim=0
+[RENDER-HOT] f29 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f30 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f30 call=32 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f30 drawotag=0 addprim=0
+[RENDER-HOT] f30 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f31 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f31 call=33 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f31 drawotag=0 addprim=0
+[RENDER-HOT] f31 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f32 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f32 call=34 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f32 drawotag=0 addprim=0
+[RENDER-HOT] f32 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f33 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f33 call=35 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f33 drawotag=0 addprim=0
+[RENDER-HOT] f33 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f34 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f34 call=36 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f34 drawotag=0 addprim=0
+[RENDER-HOT] f34 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f35 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f35 call=37 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f35 drawotag=0 addprim=0
+[RENDER-HOT] f35 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f36 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f36 call=38 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f36 drawotag=0 addprim=0
+[RENDER-HOT] f36 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f37 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f37 call=39 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f37 drawotag=0 addprim=0
+[RENDER-HOT] f37 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f38 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f38 call=40 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f38 drawotag=0 addprim=0
+[RENDER-HOT] f38 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f39 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f39 call=41 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f39 drawotag=0 addprim=0
+[RENDER-HOT] f39 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f40 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f40 call=42 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f40 drawotag=0 addprim=0
+[RENDER-HOT] f40 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f41 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f41 call=43 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f41 drawotag=0 addprim=0
+[RENDER-HOT] f41 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f42 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f42 call=44 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f42 drawotag=0 addprim=0
+[RENDER-HOT] f42 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f43 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f43 call=45 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f43 drawotag=0 addprim=0
+[RENDER-HOT] f43 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f44 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f44 call=46 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f44 drawotag=0 addprim=0
+[RENDER-HOT] f44 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f45 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f45 call=47 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f45 drawotag=0 addprim=0
+[RENDER-HOT] f45 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f46 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f46 call=48 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f46 drawotag=0 addprim=0
+[RENDER-HOT] f46 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f47 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f47 call=49 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f47 drawotag=0 addprim=0
+[RENDER-HOT] f47 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f48 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f48 call=50 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f48 drawotag=0 addprim=0
+[RENDER-HOT] f48 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f49 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f49 call=51 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f49 drawotag=0 addprim=0
+[RENDER-HOT] f49 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f50 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f50 call=52 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f50 drawotag=0 addprim=0
+[RENDER-HOT] f50 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f51 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f51 call=53 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f51 drawotag=0 addprim=0
+[RENDER-HOT] f51 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f52 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f52 call=54 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f52 drawotag=0 addprim=0
+[RENDER-HOT] f52 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f53 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f53 call=55 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f53 drawotag=0 addprim=0
+[RENDER-HOT] f53 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f54 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f54 call=56 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f54 drawotag=0 addprim=0
+[RENDER-HOT] f54 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f55 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f55 call=57 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f55 drawotag=0 addprim=0
+[RENDER-HOT] f55 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f56 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f56 call=58 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f56 drawotag=0 addprim=0
+[RENDER-HOT] f56 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f57 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f57 call=59 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f57 drawotag=0 addprim=0
+[RENDER-HOT] f57 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f58 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f58 call=60 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f58 drawotag=0 addprim=0
+[RENDER-HOT] f58 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f59 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f59 call=61 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[frame 60]
+[RENDER-TRACE] f59 drawotag=0 addprim=0
+[RENDER-HOT] f59 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f60 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f60 call=62 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f60 drawotag=0 addprim=0
+[RENDER-HOT] f60 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f61 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f61 call=63 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f61 drawotag=0 addprim=0
+[RENDER-HOT] f61 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f62 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f62 call=64 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f62 drawotag=0 addprim=0
+[RENDER-HOT] f62 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f63 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f63 call=65 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f63 drawotag=0 addprim=0
+[RENDER-HOT] f63 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f64 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f64 call=66 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f64 drawotag=0 addprim=0
+[RENDER-HOT] f64 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f65 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f65 call=67 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f65 drawotag=0 addprim=0
+[RENDER-HOT] f65 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f66 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f66 call=68 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f66 drawotag=0 addprim=0
+[RENDER-HOT] f66 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f67 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f67 call=69 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f67 drawotag=0 addprim=0
+[RENDER-HOT] f67 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f68 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f68 call=70 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f68 drawotag=0 addprim=0
+[RENDER-HOT] f68 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f69 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f69 call=71 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f69 drawotag=0 addprim=0
+[RENDER-HOT] f69 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f70 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f70 call=72 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f70 drawotag=0 addprim=0
+[RENDER-HOT] f70 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f71 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f71 call=73 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f71 drawotag=0 addprim=0
+[RENDER-HOT] f71 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f72 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f72 call=74 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f72 drawotag=0 addprim=0
+[RENDER-HOT] f72 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f73 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f73 call=75 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f73 drawotag=0 addprim=0
+[RENDER-HOT] f73 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f74 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f74 call=76 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f74 drawotag=0 addprim=0
+[RENDER-HOT] f74 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f75 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f75 call=77 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f75 drawotag=0 addprim=0
+[RENDER-HOT] f75 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f76 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f76 call=78 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f76 drawotag=0 addprim=0
+[RENDER-HOT] f76 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f77 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f77 call=79 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f77 drawotag=0 addprim=0
+[RENDER-HOT] f77 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f78 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f78 call=80 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f78 drawotag=0 addprim=0
+[RENDER-HOT] f78 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f79 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f79 call=81 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f79 drawotag=0 addprim=0
+[RENDER-HOT] f79 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f80 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f80 call=82 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f80 drawotag=0 addprim=0
+[RENDER-HOT] f80 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f81 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f81 call=83 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f81 drawotag=0 addprim=0
+[RENDER-HOT] f81 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f82 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f82 call=84 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f82 drawotag=0 addprim=0
+[RENDER-HOT] f82 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f83 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f83 call=85 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f83 drawotag=0 addprim=0
+[RENDER-HOT] f83 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f84 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f84 call=86 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f84 drawotag=0 addprim=0
+[RENDER-HOT] f84 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f85 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f85 call=87 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f85 drawotag=0 addprim=0
+[RENDER-HOT] f85 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f86 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f86 call=88 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f86 drawotag=0 addprim=0
+[RENDER-HOT] f86 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f87 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f87 call=89 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f87 drawotag=0 addprim=0
+[RENDER-HOT] f87 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f88 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f88 call=90 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f88 drawotag=0 addprim=0
+[RENDER-HOT] f88 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f89 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f89 call=91 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f89 drawotag=0 addprim=0
+[RENDER-HOT] f89 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f90 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f90 call=92 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f90 drawotag=0 addprim=0
+[RENDER-HOT] f90 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f91 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f91 call=93 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f91 drawotag=0 addprim=0
+[RENDER-HOT] f91 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f92 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f92 call=94 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f92 drawotag=0 addprim=0
+[RENDER-HOT] f92 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f93 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f93 call=95 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f93 drawotag=0 addprim=0
+[RENDER-HOT] f93 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f94 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f94 call=96 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f94 drawotag=0 addprim=0
+[RENDER-HOT] f94 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f95 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f95 call=97 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f95 drawotag=0 addprim=0
+[RENDER-HOT] f95 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f96 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f96 call=98 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f96 drawotag=0 addprim=0
+[RENDER-HOT] f96 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f97 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f97 call=99 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f97 drawotag=0 addprim=0
+[RENDER-HOT] f97 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f98 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f98 call=100 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f98 drawotag=0 addprim=0
+[RENDER-HOT] f98 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f99 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f99 call=101 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f99 drawotag=0 addprim=0
+[RENDER-HOT] f99 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f100 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f100 call=102 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f100 drawotag=0 addprim=0
+[RENDER-HOT] f100 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f101 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f101 call=103 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f101 drawotag=0 addprim=0
+[RENDER-HOT] f101 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f102 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f102 call=104 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f102 drawotag=0 addprim=0
+[RENDER-HOT] f102 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f103 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f103 call=105 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f103 drawotag=0 addprim=0
+[RENDER-HOT] f103 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f104 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f104 call=106 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f104 drawotag=0 addprim=0
+[RENDER-HOT] f104 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f105 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f105 call=107 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f105 drawotag=0 addprim=0
+[RENDER-HOT] f105 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f106 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f106 call=108 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f106 drawotag=0 addprim=0
+[RENDER-HOT] f106 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f107 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f107 call=109 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f107 drawotag=0 addprim=0
+[RENDER-HOT] f107 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f108 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f108 call=110 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f108 drawotag=0 addprim=0
+[RENDER-HOT] f108 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f109 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f109 call=111 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f109 drawotag=0 addprim=0
+[RENDER-HOT] f109 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f110 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f110 call=112 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f110 drawotag=0 addprim=0
+[RENDER-HOT] f110 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f111 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f111 call=113 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f111 drawotag=0 addprim=0
+[RENDER-HOT] f111 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f112 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f112 call=114 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f112 drawotag=0 addprim=0
+[RENDER-HOT] f112 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f113 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f113 call=115 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f113 drawotag=0 addprim=0
+[RENDER-HOT] f113 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f114 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f114 call=116 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f114 drawotag=0 addprim=0
+[RENDER-HOT] f114 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f115 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f115 call=117 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f115 drawotag=0 addprim=0
+[RENDER-HOT] f115 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f116 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f116 call=118 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f116 drawotag=0 addprim=0
+[RENDER-HOT] f116 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f117 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f117 call=119 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f117 drawotag=0 addprim=0
+[RENDER-HOT] f117 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f118 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f118 call=120 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f118 drawotag=0 addprim=0
+[RENDER-HOT] f118 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f119 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f119 call=121 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[frame 120]
+[RENDER-TRACE] f119 drawotag=0 addprim=0
+[RENDER-HOT] f119 0x80019844(c=1 ra=0x8001A184)
+[RENDER-TRACE] f120 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f120 call=122 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f120 drawotag=0 addprim=0
+[RENDER-HOT] f120 0x80019844(c=1 ra=0x8001A184)
+[SCHED-GATE] f121 call=123 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f122 call=124 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f123 call=125 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f124 call=126 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f125 call=127 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f126 call=128 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f127 call=129 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f128 call=130 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f129 call=131 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f130 call=132 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f131 call=133 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f132 call=134 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f133 call=135 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f134 call=136 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f135 call=137 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f136 call=138 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f137 call=139 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f138 call=140 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f139 call=141 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f140 call=142 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f141 call=143 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f142 call=144 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f143 call=145 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f144 call=146 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f145 call=147 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f146 call=148 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f147 call=149 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f148 call=150 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f149 call=151 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f150 call=152 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f151 call=153 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f152 call=154 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f153 call=155 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f154 call=156 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f155 call=157 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f156 call=158 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f157 call=159 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f158 call=160 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f159 call=161 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f160 call=162 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f161 call=163 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f162 call=164 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f163 call=165 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f164 call=166 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f165 call=167 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f166 call=168 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f167 call=169 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f168 call=170 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f169 call=171 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f170 call=172 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f171 call=173 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f172 call=174 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f173 call=175 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f174 call=176 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f175 call=177 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f176 call=178 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f177 call=179 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f178 call=180 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f179 call=181 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[frame 180]
+[SCHED-GATE] f180 call=182 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f181 call=183 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f182 call=184 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f183 call=185 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f184 call=186 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f185 call=187 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f186 call=188 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f187 call=189 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f188 call=190 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f189 call=191 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f190 call=192 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f191 call=193 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f192 call=194 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f193 call=195 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f194 call=196 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f195 call=197 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f196 call=198 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f197 call=199 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[SCHED-GATE] f198 call=200 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[frame 240]
+[BLACKSCREEN][RendererPresent] present=300 f=300 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 300]
+[RENDER-TRACE] f300 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f300 call=302 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f300 drawotag=0 addprim=0
+[RENDER-HOT] f300 0x80019844(c=1 ra=0x8001A184)
+[AutoShot] saved C:/temp/game_shot_01.png
+[AutoVRAM] saved C:/temp/game_vram.png
+[frame 360]
+[frame 420]
+[frame 480]
+[frame 540]
+[BLACKSCREEN][RendererPresent] present=600 f=600 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 600]
+[RENDER-TRACE] f600 heartbeat drawotag=0 addprim=0 ra=0x8001A184
+[SCHED-GATE] f600 call=602 addr=0x80019844 ra=0x8001A184 v0:00000000->00000000 cb:80032A00->80032A00 cbctx:01FE01FE->01FE01FE ds:0/0->0/0 sub:0/0->0/0 t:0/0->0/0 tcb:0/0/0->0/0/0 a5398:0,0,0->0,0,0 scr:0,0,0,0->0,0,0,0
+[RENDER-TRACE] f600 drawotag=0 addprim=0
+[RENDER-HOT] f600 0x80019844(c=1 ra=0x8001A184)

@@ -1,0 +1,8 @@
+15308 default-on check summary
+total_lines=942
+max_frame_seen=0
+guard=0
+a110_exit=0
+nogpu=0
+events=0
+s309c=0

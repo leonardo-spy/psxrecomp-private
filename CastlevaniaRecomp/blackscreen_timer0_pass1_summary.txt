@@ -1,0 +1,12 @@
+timer0 pass1 summary
+total_lines=1897
+max_frame_seen=88
+a65c_ovr=0
+2ab0_fn=0
+2ab0_w=0
+disp_call=180
+disp_ret=180
+events=0
+bios_b0=0
+state_309c=0
+nogpu=80

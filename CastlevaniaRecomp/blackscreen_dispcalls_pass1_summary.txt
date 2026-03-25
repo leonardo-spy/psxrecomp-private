@@ -1,0 +1,16 @@
+dispcalls pass1 summary
+total_lines=1904
+max_frame_seen=145
+disp_call=180
+disp_ret=180
+disp_tail=0
+events=0
+bios_b0=0
+state_309c=0
+nogpu=82
+starts:
+  0x80019844: 180
+call_targets:
+  0x8001A65C: 179
+  0x8001A110: 1
+tail_targets:

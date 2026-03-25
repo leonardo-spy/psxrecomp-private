@@ -1,0 +1,265 @@
+[Launcher] Disc: C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA).cue
+=== PSXRecomp v2 ===
+EXE: C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\SLUS_000.67
+CUE: C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA).cue
+
+[KeyConfig] Loading from C:/Users/Leona/Documents/GitHub/psxrecomp/CastlevaniaRecomp/build/keyconfig.ini
+[XA] Volume set to 50%
+[KeyConfig] UP=265 DOWN=264 CROSS=83 START=257
+[XA] Opened C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA) (Track 1).bin
+[XA] WAV capture: C:/temp/xa_capture.wav (up to 30s)
+[XA] Audio ready (decode 37800 Hz → waveOut 44100 Hz)
+[FMV] Opened C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA) (Track 1).bin
+[SPU] Initialised — 24 voices, 44100 Hz stereo
+Detected PS-X header, skipping 2048 bytes
+Loaded 561152 bytes
+Loaded into PS1 RAM at 0x80010000
+[OpenGLRenderer] Initialize() called
+[OpenGLRenderer] InitializeWindow() - Creating GLFW window...
+[OpenGLRenderer] GLFW window created successfully (960x720)
+[OpenGLRenderer] InitializeOpenGL() - Loading OpenGL functions...
+[OpenGLRenderer] OpenGL initialized successfully!
+[OpenGLRenderer]   Version:  3.3.0 - Build 31.0.101.5522
+[OpenGLRenderer]   Renderer: Intel(R) Iris(R) Xe Graphics
+[OpenGLRenderer]   Vendor:   Intel
+[OpenGLRenderer] OpenGL 3.3 Core Profile ready
+[OpenGLRenderer] InitializeShaders() - Compiling shaders...
+[OpenGLRenderer]   - Primitive shader compiled (program ID: 3)
+[OpenGLRenderer]   - Textured shader compiled (program ID: 4)
+[OpenGLRenderer]   - Fill shader compiled (program ID: 5)
+[OpenGLRenderer]   - Copy shader compiled (program ID: 6)
+[OpenGLRenderer] All 4 shaders compiled successfully!
+[OpenGLRenderer] InitializeBuffers() - Creating VAO and VBO...
+[OpenGLRenderer] VAO and VBO created (max 4096 vertices per batch)
+[OpenGLRenderer] InitializeVRAM() - Creating VRAM texture and FBO...
+[OpenGLRenderer] VRAM texture created (1024x512, RGB5A1, 1024 KB)
+[OpenGLRenderer] VRAM FBO created and verified (complete)
+[OpenGLRenderer] Initialization complete!
+Renderer ready
+
+Calling entry point 0x80010DF4...
+[CALLEE-FIX] #1 f0 call_by_address(0x80010DF4) sp:801FFF00->80200000 s0:00000000->00000000 s1:00000000->00000000 — restoring
+Entry point returned.
+[BLACKSCREEN] Entry 0x80010DF4 returned immediately; trying bootstrap entry 0x80010EB8
+[BLACKSCREEN] Bootstrap entry 0x80010EB8 returned
+[BLACKSCREEN] Seeded synthetic RA=0x8001A184 before display bootstrap
+[BLACKSCREEN] Entry returned before first PS1 frame; trying display entry 0x800191E0
+[TRACE] func_800191E0 (display thread) sp=0x801FFF00
+[BLACKSCREEN] Display entry returned
+[BLACKSCREEN] Display entry 0x800191E0 returned; trying alternate display entry 0x80019844
+[TRACE] FUN_80019844 (game logic loop entry)
+[BLACKSCREEN] Alternate display entry 0x80019844 returned
+[BLACKSCREEN] Castlevania pump entry overridden by env: 0x80017024
+[BLACKSCREEN] Enabling display pump fallback at 0x80017024
+[SCHED-BRANCH] f0 call=1 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=1 f=1 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 1]
+[SCHED-BRANCH] f1 call=2 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=2 f=2 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 2]
+[SCHED-BRANCH] f2 call=3 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=3 f=3 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 3]
+[SCHED-BRANCH] f3 call=4 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=4 f=4 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 4]
+[SCHED-BRANCH] f4 call=5 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=5 f=5 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 5]
+[SCHED-BRANCH] f5 call=6 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=6 f=6 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f6 call=7 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=7 f=7 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f7 call=8 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=8 f=8 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f8 call=9 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=9 f=9 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f9 call=10 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=10 f=10 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f10 call=11 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=11 f=11 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f11 call=12 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=12 f=12 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f12 call=13 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=13 f=13 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f13 call=14 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=14 f=14 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f14 call=15 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=15 f=15 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f15 call=16 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=16 f=16 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f16 call=17 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=17 f=17 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f17 call=18 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=18 f=18 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f18 call=19 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=19 f=19 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f19 call=20 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=20 f=20 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[SCHED-BRANCH] f20 call=21 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f21 call=22 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f22 call=23 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f23 call=24 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f24 call=25 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f25 call=26 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f26 call=27 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f27 call=28 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f28 call=29 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f29 call=30 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f30 call=31 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f31 call=32 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f32 call=33 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f33 call=34 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f34 call=35 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f35 call=36 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f36 call=37 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f37 call=38 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f38 call=39 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f39 call=40 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f40 call=41 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f41 call=42 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f42 call=43 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f43 call=44 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f44 call=45 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f45 call=46 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f46 call=47 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f47 call=48 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f48 call=49 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f49 call=50 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f50 call=51 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f51 call=52 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f52 call=53 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f53 call=54 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f54 call=55 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f55 call=56 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f56 call=57 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f57 call=58 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f58 call=59 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f59 call=60 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[frame 60]
+[SCHED-BRANCH] f60 call=61 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f61 call=62 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f62 call=63 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f63 call=64 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f64 call=65 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f65 call=66 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f66 call=67 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f67 call=68 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f68 call=69 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f69 call=70 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f70 call=71 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f71 call=72 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f72 call=73 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f73 call=74 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f74 call=75 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f75 call=76 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f76 call=77 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f77 call=78 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f78 call=79 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f79 call=80 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f80 call=81 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f81 call=82 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f82 call=83 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f83 call=84 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f84 call=85 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f85 call=86 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f86 call=87 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f87 call=88 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f88 call=89 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f89 call=90 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f90 call=91 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f91 call=92 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f92 call=93 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f93 call=94 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f94 call=95 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f95 call=96 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f96 call=97 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f97 call=98 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f98 call=99 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f99 call=100 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f100 call=101 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f101 call=102 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f102 call=103 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f103 call=104 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f104 call=105 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f105 call=106 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f106 call=107 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f107 call=108 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f108 call=109 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f109 call=110 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f110 call=111 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f111 call=112 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f112 call=113 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f113 call=114 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f114 call=115 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f115 call=116 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f116 call=117 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f117 call=118 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f118 call=119 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f119 call=120 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[frame 120]
+[SCHED-BRANCH] f120 call=121 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f121 call=122 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f122 call=123 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f123 call=124 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f124 call=125 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f125 call=126 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f126 call=127 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f127 call=128 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f128 call=129 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f129 call=130 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f130 call=131 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f131 call=132 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f132 call=133 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f133 call=134 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f134 call=135 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f135 call=136 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f136 call=137 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f137 call=138 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f138 call=139 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f139 call=140 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f140 call=141 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f141 call=142 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f142 call=143 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f143 call=144 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f144 call=145 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f145 call=146 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f146 call=147 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f147 call=148 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f148 call=149 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f149 call=150 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f150 call=151 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f151 call=152 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f152 call=153 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f153 call=154 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f154 call=155 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f155 call=156 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f156 call=157 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f157 call=158 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f158 call=159 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[SCHED-BRANCH] f159 call=160 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[frame 180]
+[frame 240]
+[SCHED-BRANCH] f299 call=300 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=300 f=300 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 300]
+[AutoShot] saved C:/temp/game_shot_01.png
+[AutoVRAM] saved C:/temp/game_vram.png
+[frame 360]
+[frame 420]
+[frame 480]
+[frame 540]
+[SCHED-BRANCH] f599 call=600 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=600 f=600 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 600]
+[frame 660]
+[frame 720]
+[frame 780]
+[frame 840]
+[SCHED-BRANCH] f899 call=900 addr=0x80017078 ra=0x80017034 ds=0 dss=0 sub2=0 sub3=0 timer=0 ctr=0 scr={cc:0 ce:0 d3:0 c6:0} a5398={0,0,0} tcb={0,0,0} cb=0x00000000
+[BLACKSCREEN][RendererPresent] present=900 f=900 disp=(0,0 320x240) vis=320x240 uv=(0.000,0.000)-(1.000,1.000)
+[frame 900]
+[AutoShot] saved C:/temp/game_shot_02.png
+[frame 960]
+[frame 1020]
+[frame 1080]

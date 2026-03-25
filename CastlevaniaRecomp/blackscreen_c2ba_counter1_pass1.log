@@ -1,0 +1,12 @@
+=== PSXRecomp v2 ===
+EXE: SLUS_000.67
+CUE: isos/Castlevania - Symphony of the Night (USA).cue
+
+[KeyConfig] Loading from C:/Users/Leona/Documents/GitHub/psxrecomp/CastlevaniaRecomp/build/keyconfig.ini
+[XA] Volume set to 50%
+[KeyConfig] UP=265 DOWN=264 CROSS=83 START=257
+[XA] Opened isos\Castlevania - Symphony of the Night (USA) (Track 1).bin
+[XA] WAV capture: C:/temp/xa_capture.wav (up to 30s)
+[XA] Audio ready (decode 37800 Hz → waveOut 44100 Hz)
+[FMV] Opened isos\Castlevania - Symphony of the Night (USA) (Track 1).bin
+[SPU] Initialised — 24 voices, 44100 Hz stereo

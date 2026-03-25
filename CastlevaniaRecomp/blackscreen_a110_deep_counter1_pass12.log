@@ -1,0 +1,7 @@
+=== PSXRecomp v2 ===
+EXE: isos\Castlevania
+CUE: -
+
+[KeyConfig] Loading from C:/Users/Leona/Documents/GitHub/psxrecomp/CastlevaniaRecomp/build/keyconfig.ini
+[XA] Volume set to 50%
+[KeyConfig] UP=265 DOWN=264 CROSS=83 START=257
