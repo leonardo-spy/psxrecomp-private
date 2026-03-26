@@ -830,17 +830,17 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
 
     /* Minimal render loop — present frames until window closed */
     GLFWwindow* win = (GLFWwindow*)renderer.GetWindow();
-    int frame = 0;
+
+    /* Castlevania display pump: the recompiled entry (func_80010DF4) exits
+     * immediately because the JAL to func_80019844 was dropped.  Drive the
+     * display callback each frame ourselves so GPU commands are submitted. */
+    extern "C" void cv_display_pump_frame(CPUState* cpu);
+    printf("[CV-PUMP] Entering display pump loop\n");
+    fflush(stdout);
     while (win && !glfwWindowShouldClose(win)) {
-        renderer.Present();
-        renderer.VSync();
-        frame++;
-        if (frame <= 5 || frame % 60 == 0) {
-            printf("[frame %d]\n", frame);
-            fflush(stdout);
-        }
+        cv_display_pump_frame(&cpu);
+        psx_present_frame();
     }
 
     renderer.Shutdown();
-    printf("\nDone. Frames: %d\n", frame);
 }

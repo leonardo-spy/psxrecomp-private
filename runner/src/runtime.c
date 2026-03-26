@@ -106,6 +106,12 @@ uint32_t g_addprim_count = 0;
  * While g_ps1_frame < g_attack_trace_end_frame, all overlay→compiled calls are logged. */
 uint32_t g_attack_trace_end_frame = 0;
 
+/* CV display-pump re-entrancy guard: set to 1 while mips_interpret(0x8001A664) is
+ * executing, so that any indirect call back to func_8001A664 via call_by_address →
+ * psx_override_dispatch uses the compiled stub (which returns quickly) instead of
+ * spawning another interpreter level.  This prevents unbounded recursion. */
+static int s_interp_a664 = 0;
+
 
 /* ---------------------------------------------------------------------------
  * Long-frame watchdog: detect when a frame takes >2s (stall / infinite loop).
@@ -2558,6 +2564,33 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
         }
     }
 
+    /* CV-LOOP-BREAK: func_8001A860 is the head of the PS1 VBlank wait tail-call loop:
+     *   A664 calls A860 → A860 calls A91C → A91C calls A9E0 → A9E0 tail-calls A860 ...
+     * On real hardware the VBlank ISR clears the loop condition after one frame.
+     * In the recompiler there are no ISRs, so the chain recurses until C-stack overflow
+     * (observed: ~650 levels before crash).
+     *
+     * Fix: allow only one active level of A860.  When A9E0 tries to tail-call A860
+     * while it is already on the C stack, return immediately — this simulates the
+     * VBlank clearing the loop condition. */
+    if (kseg0 == 0x8001A860u) {
+        static int s_a860_active = 0;
+        if (s_a860_active) {
+            static uint32_t s_a860_break = 0;
+            if (++s_a860_break <= 3) {
+                printf("[CV-LOOP-BREAK] #%u f%u 0x8001A860 re-entry blocked (VBlank sim)\n",
+                       s_a860_break, g_ps1_frame);
+                fflush(stdout);
+            }
+            cpu->v0 = 0;
+            return;
+        }
+        s_a860_active = 1;
+        if (!psx_dispatch_compiled(cpu, kseg0)) mips_interpret(cpu, kseg0);
+        s_a860_active = 0;
+        goto sp_check;
+    }
+
     /* In-binary function — try compiled dispatch first (runs C function including
      * psx_override_dispatch), then fall back to mips_interpret for functions the
      * recompiler didn't discover (e.g. runtime-patched handler tables). */
@@ -4068,6 +4101,24 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         case 0x800223a0u: { static uint32_t _c = 0; if (++_c <= 5) { printf("[TRACE] FUN_800223a0 (display state-0 setup)\n"); fflush(stdout); } break; }
         case 0x80016ddcu: { static uint32_t _c = 0; if (++_c <= 5) { printf("[TRACE] FUN_80016ddc (display state-10 init)\n"); fflush(stdout); } break; }
         case 0x80019844u: { static uint32_t _c = 0; if (++_c <= 5) { printf("[TRACE] FUN_80019844 (game logic loop entry)\n"); fflush(stdout); } break; }
+
+        /* func_8001A664 — display callback (submits GPU commands, manages display state).
+         * The compiled version (generated/SLUS_000.67_full.c) was produced by the
+         * recompiler which dropped all internal JAL instructions.  The missing calls
+         * include the A860/A91C/A9E0 VBlank wait chain.  Running the compiled version
+         * therefore returns immediately without submitting any GPU work.
+         *
+         * Fix: run the original MIPS code via the interpreter instead.
+         * Re-entrancy guard (s_interp_a664): if a call reaches psx_override_dispatch
+         * while the interpreter is already executing A664 (e.g. A664 → A110 → callback
+         * → A664 again), fall through to the compiled stub so we don't recurse. */
+        case 0x8001A664u: {
+            if (s_interp_a664) return 0;   /* allow compiled stub on re-entry */
+            s_interp_a664 = 1;
+            mips_interpret(cpu, 0x8001A664u);
+            s_interp_a664 = 0;
+            return 1;
+        }
         /* FUN_8005D4D0 handled below in call_by_address proper */
         /* func_800211AC sub-functions */
         case 0x8006BA8Cu: { static uint32_t _c = 0; if (++_c <= 5) { printf("[TRACE] func_8006BA8C sp=0x%08X\n", cpu->sp); fflush(stdout); } break; }
@@ -5021,3 +5072,65 @@ void psx_set_pad1(uint16_t buttons) {
 
 uint8_t* psx_get_ram(void) { return g_ram; }
 uint8_t* psx_get_scratch(void) { return g_scratch; }
+
+/* ---------------------------------------------------------------------------
+ * Castlevania display pump.
+ *
+ * The game's recompiled entry (func_80010DF4) exits immediately because the
+ * JAL to func_80019844 was dropped by the recompiler.  After entry returns,
+ * the main loop in main_runner.cpp calls this function once per rendered frame
+ * to drive the display state machine (func_80019844 → func_8001A664 GPU flush).
+ *
+ * Approach:
+ *  1. Seed RAM[0x80032AB0] with the display callback address (0x8001A664).
+ *     Normally func_800194F0 writes this, but that function is never reached.
+ *  2. Call mips_interpret(0x80019844) with the arguments that func_80010DF4
+ *     would have supplied.  The interpreter executes the original MIPS code,
+ *     which eventually calls back to func_8001A664 via the callback pointer.
+ *  3. psx_override_dispatch intercepts func_8001A664 and runs it through the
+ *     interpreter too (the compiled version omits the VBlank wait chain).
+ *  4. The A860 re-entrancy guard in call_by_address breaks the infinite
+ *     VBlank wait tail-call loop after one iteration per pump call.
+ * --------------------------------------------------------------------------- */
+void cv_display_pump_frame(CPUState* cpu) {
+    /* Step 1 — seed display callback if not yet written */
+    uint32_t cb = 0;
+    memcpy(&cb, &g_ram[0x32AB0], 4);
+    if (cb == 0) {
+        cb = 0x8001A664u;
+        memcpy(&g_ram[0x32AB0], &cb, 4);
+        printf("[CV-PUMP] f%u seeded display callback = 0x8001A664\n", g_ps1_frame);
+        fflush(stdout);
+    }
+
+    /* Step 2 — save the full CPU context, set up pump call registers, run pump */
+    uint32_t save_sp = cpu->sp;
+    uint32_t save_ra = cpu->ra;
+    uint32_t save_s0 = cpu->s0, save_s1 = cpu->s1;
+    uint32_t save_s2 = cpu->s2, save_s3 = cpu->s3;
+    uint32_t save_s4 = cpu->s4, save_s5 = cpu->s5;
+    uint32_t save_s6 = cpu->s6, save_s7 = cpu->s7;
+    uint32_t save_fp = cpu->fp;
+
+    /* Simulate the dropped call site at 0x80010E9C inside func_80010DF4:
+     *   a0 = 0x800988A4  (display data base, computed by func_80010DF4 MIPS code)
+     *   sp = 0x801FFE00  (well below the reset top-of-stack, leaves room for frames)
+     *   ra = 0x80010EA4  (return address = break-trap instruction = safe landing pad) */
+    cpu->sp  = 0x801FFE00u;
+    cpu->ra  = 0x80010EA4u;
+    cpu->a0  = 0x800988A4u;
+    cpu->a1  = 0;
+    cpu->a2  = 0;
+    cpu->a3  = 0;
+
+    mips_interpret(cpu, 0x80019844u);
+
+    /* Restore context so the idle loop in main_runner.cpp sees a clean CPU */
+    cpu->sp = save_sp;
+    cpu->ra = save_ra;
+    cpu->s0 = save_s0; cpu->s1 = save_s1;
+    cpu->s2 = save_s2; cpu->s3 = save_s3;
+    cpu->s4 = save_s4; cpu->s5 = save_s5;
+    cpu->s6 = save_s6; cpu->s7 = save_s7;
+    cpu->fp = save_fp;
+}
