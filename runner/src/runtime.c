@@ -4112,6 +4112,31 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
          * Re-entrancy guard (s_interp_a664): if a call reaches psx_override_dispatch
          * while the interpreter is already executing A664 (e.g. A664 → A110 → callback
          * → A664 again), fall through to the compiled stub so we don't recurse. */
+        /* func_80015308 — PS1 timer read (RCNT2 / system clock counter).
+         * The recompiler split the single MIPS function at 0x80015308 into two
+         * separate C functions (80015308 and 80015318) breaking the fallthrough
+         * semantics.  The compiled stub returns immediately after loading two
+         * pointer values into v0/v1, before the actual timer computation in
+         * func_80015318 runs.  This causes both JAL 0x80015308 calls inside
+         * func_8001A664 to return 0, so the timer-advance check
+         *   (g_ram[0x39278]+960 < second_call_result)
+         * never fires and the GPU submit path at 0x8001A8A8 is never reached.
+         *
+         * Fix: simulate the PS1 RCNT2 timer using the host QueryPerformanceCounter.
+         * The PS1 CPU runs at ~33.868 MHz; return a 32-bit value scaled to that
+         * frequency so that two calls separated by real microseconds differ by the
+         * expected number of ticks (~960 ticks ≈ 28 µs at 33.868 MHz). */
+        case 0x80015308u: {
+            static LARGE_INTEGER s_qpc_freq = { .QuadPart = 0 };
+            if (s_qpc_freq.QuadPart == 0)
+                QueryPerformanceFrequency(&s_qpc_freq);
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            /* Scale host counter to PS1 ~33.868 MHz */
+            cpu->v0 = (uint32_t)((now.QuadPart * 33868800ULL) / (uint64_t)s_qpc_freq.QuadPart);
+            return 1;
+        }
+
         case 0x8001A664u: {
             if (s_interp_a664) return 0;   /* allow compiled stub on re-entry */
             s_interp_a664 = 1;
