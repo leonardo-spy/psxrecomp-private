@@ -112,9 +112,8 @@ static void record_tick(uint32_t frame, uint16_t pad, int turbo) {
 }
 
 /* ---------------------------------------------------------------------------
- * Generated entry point (in generated/tomba_full.c)
+ * Game entry point — dispatched via the compiled function table.
  * --------------------------------------------------------------------------- */
-extern "C" void func_8006B58C(CPUState* cpu);
 
 /* ---------------------------------------------------------------------------
  * GPU hook — called by runtime when DMA submits GPU packets.
@@ -823,9 +822,9 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     cpu.gp = 0x0u;         /* GP set by game init */
 
     /* Run game entry point */
-    printf("Calling func_8006B58C (entry point)...\n");
+    printf("Calling game entry point 0x%08X...\n", game_get_entry_addr());
     fflush(stdout);
-    func_8006B58C(&cpu);
+    psx_dispatch_compiled(&cpu, game_get_entry_addr());
     printf("Entry point returned.\n");
     fflush(stdout);
 

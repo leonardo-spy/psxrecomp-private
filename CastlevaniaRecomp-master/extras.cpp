@@ -10,6 +10,10 @@ uint32_t game_get_display_entry(void) {
     return (uint32_t)GAME_DISPLAY_ENTRY;
 }
 
+uint32_t game_get_entry_addr(void) {
+    return (uint32_t)GAME_ENTRY_ADDR;
+}
+
 const char *game_get_exe_filename(void) {
     return GAME_EXE_FILENAME;
 }

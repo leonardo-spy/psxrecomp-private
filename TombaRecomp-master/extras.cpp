@@ -8,6 +8,10 @@ uint32_t game_get_display_entry(void) {
     return 0x800191E0u;
 }
 
+uint32_t game_get_entry_addr(void) {
+    return 0x8006B58Cu;
+}
+
 void game_on_init(void) {
     /* TODO: move Tomba-specific init here */
 }

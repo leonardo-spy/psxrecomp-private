@@ -11,6 +11,9 @@ const char *game_get_name(void);
 /* PS1 address of the display thread entry function (initial value for g_display_entry) */
 uint32_t game_get_display_entry(void);
 
+/* PS1 address of the main game entry function (first compiled function called at startup) */
+uint32_t game_get_entry_addr(void);
+
 /* Called once after EXE is loaded and runtime_init() completes */
 void game_on_init(void);
 

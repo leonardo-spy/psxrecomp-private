@@ -49,6 +49,10 @@ void psx_install_crash_handler(void);
  * Logs any address not yet implemented. Never crashes on unknown calls. */
 void call_by_address(CPUState* cpu, uint32_t addr);
 
+/* Compiled-code dispatch — calls the recompiled function for addr.
+ * Returns 1 if a compiled function was found and called, 0 otherwise. */
+int psx_dispatch_compiled(CPUState* cpu, uint32_t addr);
+
 /* Override gate — emitted by code_generator at the top of every function.
  * Returns 1 if intercepted (body skipped), 0 if normal execution continues.
  * Default: always returns 0. Add real implementations in runtime.c when needed. */
