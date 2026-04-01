@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
     fmt::print("============================================\n\n");
 
     if (argc < 2) {
-        fmt::print("Usage: {} <PS1-EXE file>\n", argv[0]);
+        fmt::print("Usage: {} <PS1-EXE file> [forced_entries.txt]\n", argv[0]);
         fmt::print("Example: {} SLUS_006.30\n\n", argv[0]);
         return 0;
     }
@@ -146,12 +146,44 @@ int main(int argc, char** argv) {
 
     PSXRecomp::FunctionAnalyzer analyzer(*exe);
 
-    // Forced entry points: functions called from the dispatch table but not
-    // automatically detected by the heuristic-based function analysis.
-    // These are typically functions without standard prologues or epilogues.
-    // 0x8006B58C: game entrypoint (main boot sequence, called from test harness
-    //             and dispatch table; absorbed into func_8006B4EC without this).
-    analyzer.add_forced_entry(0x8006B58Cu);
+    // Forced entry points: functions called from runtime but not automatically
+    // detected by the heuristic-based function analysis.
+    // Read from file if provided as second argument, or auto-detect from
+    // "forced_entries.txt" next to the EXE.
+    std::filesystem::path entries_path;
+    if (argc >= 3) {
+        entries_path = argv[2];
+    } else {
+        entries_path = exe_path.parent_path() / "forced_entries.txt";
+    }
+
+    if (std::filesystem::exists(entries_path)) {
+        std::ifstream entries_file(entries_path);
+        std::string line;
+        int count = 0;
+        while (std::getline(entries_file, line)) {
+            // Skip empty lines and comments
+            if (line.empty() || line[0] == '#') continue;
+            // Parse hex address (with or without 0x prefix)
+            uint32_t addr = 0;
+            try {
+                size_t pos = 0;
+                if (line.find("0x") == 0 || line.find("0X") == 0)
+                    addr = static_cast<uint32_t>(std::stoul(line.substr(2), &pos, 16));
+                else
+                    addr = static_cast<uint32_t>(std::stoul(line, &pos, 16));
+            } catch (...) {
+                continue;
+            }
+            if (addr != 0) {
+                analyzer.add_forced_entry(addr);
+                count++;
+            }
+        }
+        if (count > 0) {
+            fmt::print("✓ Loaded {} forced entry points from {}\n", count, entries_path.filename().string());
+        }
+    }
 
     auto analysis_result = analyzer.analyze();
 

@@ -13,7 +13,7 @@ namespace PSXRecomp {
 //   - A single exit point (the last instruction, which is a branch/jump or end-of-code)
 //   - No branches/jumps except at the end
 // MIPS delay slots: the instruction after a branch/jump is part of the same block.
-struct BasicBlock {
+struct LegacyBasicBlock {
     uint32_t start_addr;          // Address of first instruction
     uint32_t end_addr;            // Address of last instruction (inclusive)
     uint32_t instr_count;         // Total instructions including delay slot
@@ -36,15 +36,15 @@ public:
 
     // Find all basic blocks in the executable.
     // Returns blocks sorted by start_addr.
-    std::vector<BasicBlock> analyze();
+    std::vector<LegacyBasicBlock> analyze();
 
     // After analyze(), find the block containing addr.
     // Returns nullptr if not found.
-    const BasicBlock* find_block(uint32_t addr) const;
+    const LegacyBasicBlock* find_block(uint32_t addr) const;
 
     // Build predecessor lists for all blocks.
     // Call this after analyze() to populate block.predecessors.
-    static void build_predecessors(std::vector<BasicBlock>& blocks);
+    static void build_predecessors(std::vector<LegacyBasicBlock>& blocks);
 
 private:
     const PS1Executable& exe_;
@@ -56,7 +56,7 @@ private:
     std::unordered_map<uint32_t, size_t> addr_to_idx_;
 
     // Resulting blocks (populated by analyze())
-    std::vector<BasicBlock> blocks_;
+    std::vector<LegacyBasicBlock> blocks_;
 
     // Map from start_addr → block index (for find_block)
     std::unordered_map<uint32_t, size_t> addr_to_block_;
@@ -69,7 +69,7 @@ private:
     std::vector<uint32_t> find_leaders();
 
     // Build a single block starting at start_addr.
-    BasicBlock build_block(uint32_t start_addr);
+    LegacyBasicBlock build_block(uint32_t start_addr);
 };
 
 } // namespace PSXRecomp

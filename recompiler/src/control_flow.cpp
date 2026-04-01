@@ -183,11 +183,14 @@ std::set<uint32_t> ControlFlowAnalyzer::find_block_boundaries(const Function& fu
 
     // Scan all instructions in function
     uint32_t addr = func.start_addr;
+    uint32_t max_iterations = (func.end_addr - func.start_addr) / 4 + 1;
+    uint32_t iterations = 0;
+    
     while (addr < func.end_addr) {
+        if (++iterations > max_iterations) break;
+        
         auto instr_opt = exe_.read_word(addr);
-        if (!instr_opt.has_value()) {
-            break;
-        }
+        if (!instr_opt.has_value()) break;
 
         uint32_t instr = *instr_opt;
 
@@ -203,14 +206,13 @@ std::set<uint32_t> ControlFlowAnalyzer::find_block_boundaries(const Function& fu
             if (cf.type == ControlFlowType::Branch ||
                 cf.type == ControlFlowType::JumpLink ||
                 cf.type == ControlFlowType::JumpLinkReg) {
-                uint32_t fall_through = addr + 8; // After delay slot
+                uint32_t fall_through = addr + 8;
                 if (fall_through < func.end_addr) {
                     boundaries.insert(fall_through);
                 }
             }
 
             // For unconditional jump/return, next instruction is unreachable
-            // (unless it's a jump target from elsewhere)
             if (cf.type == ControlFlowType::Jump ||
                 cf.type == ControlFlowType::JumpRegister ||
                 cf.type == ControlFlowType::Return) {
@@ -257,7 +259,6 @@ std::map<uint32_t, BasicBlock> ControlFlowAnalyzer::build_basic_blocks(
             block.exit_instr = analyze_instruction(block.end_addr, *exit_instr_opt);
 
             // If last instruction is not control flow, check if it's a delay slot
-            // (i.e., the instruction before it is a branch/jump with delay slot)
             if (block.exit_instr.type == ControlFlowType::None &&
                 block.end_addr > block.start_addr) {
                 auto branch_instr_opt = exe_.read_word(block.end_addr - 4);
@@ -354,6 +355,21 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
     cfg.function_start = func.start_addr;
     cfg.function_end = func.end_addr;
 
+    // Skip data sections
+    if (func.is_data_section) {
+        BasicBlock block;
+        block.start_addr = func.start_addr;
+        block.end_addr = func.end_addr - 4;
+        block.instruction_count = func.size / 4;
+        block.is_entry = true;
+        block.is_exit = true;
+        block.is_loop_header = false;
+        block.exit_instr.type = ControlFlowType::None;
+        cfg.blocks[func.start_addr] = block;
+        cfg.block_order.push_back(func.start_addr);
+        return cfg;
+    }
+
     // Step 1: Find basic block boundaries
     std::set<uint32_t> boundaries = find_block_boundaries(func);
 
@@ -383,15 +399,23 @@ std::map<uint32_t, ControlFlowGraph> ControlFlowAnalyzer::analyze_all_functions(
 
     fmt::print("\n=== Control Flow Analysis ===\n\n");
     fmt::print("Analyzing {} functions...\n", functions.size());
+    std::fflush(stdout);
 
     int total_blocks = 0;
     int total_loops = 0;
+    int progress = 0;
 
     for (const Function& func : functions) {
+        progress++;
+        if (progress <= 5 || progress % 100 == 0 || progress == static_cast<int>(functions.size())) {
+            fmt::print("  Progress: {}/{}\n", progress, functions.size());
+            std::fflush(stdout);
+        }
+        
         ControlFlowGraph cfg = analyze_function(func);
         total_blocks += static_cast<int>(cfg.blocks.size());
         total_loops += cfg.loop_count;
-        all_cfgs[func.start_addr] = cfg;
+        all_cfgs[func.start_addr] = std::move(cfg);
     }
 
     fmt::print("✓ Created {} basic blocks\n", total_blocks);

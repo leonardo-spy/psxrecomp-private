@@ -77,6 +77,20 @@ uint8_t* psx_get_scratch(void);
 /* Frame-gated GP1 display command tracker (called from gpu_write_gp1). */
 void diag_track_gp1(uint32_t cmd);
 
+/* Castlevania display pump helper implemented in runtime.c. */
+void cv_display_pump_frame(CPUState* cpu);
+
+/* Diagnostic helper: run the runtime interpreter from an arbitrary PC.
+ * Intended for bootstrap experiments when compiled dispatch has no entry. */
+void psx_interpret_from(CPUState* cpu, uint32_t start_pc);
+
+/* Global interpreter instruction limit — set to N>0 before a potentially-hanging
+ * interpret call and reset to 0 afterwards.  The interpreter counts instructions
+ * across all nested mips_interpret/call_by_address calls and bails out when the
+ * total exceeds this limit. 0 = unlimited. */
+extern uint32_t g_interp_total_limit;
+extern uint32_t g_interp_total_counter;
+
 #ifdef __cplusplus
 }
 #endif

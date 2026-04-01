@@ -25,4 +25,12 @@ int psx_cdrom_read_sector(uint32_t lba, uint8_t* buffer) {
     return g_iso.ReadSector(lba, buffer) ? 1 : 0;
 }
 
+int psx_cdrom_find_file(const char* name, uint32_t* start_lba, uint32_t* file_size) {
+    PS1::ISOFileEntry entry;
+    if (!g_iso.FindFile(name, entry)) return 0;
+    *start_lba = entry.lba;
+    *file_size = entry.size;
+    return 1;
+}
+
 } /* extern "C" */

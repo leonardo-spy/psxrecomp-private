@@ -49,10 +49,10 @@ std::vector<uint32_t> BasicBlockAnalyzer::find_leaders() {
 }
 
 // ---------------------------------------------------------------------------
-// build_block: construct a BasicBlock starting at start_addr
+// build_block: construct a LegacyBasicBlock starting at start_addr
 // ---------------------------------------------------------------------------
-BasicBlock BasicBlockAnalyzer::build_block(uint32_t start_addr) {
-    BasicBlock block{};
+LegacyBasicBlock BasicBlockAnalyzer::build_block(uint32_t start_addr) {
+    LegacyBasicBlock block{};
     block.start_addr    = start_addr;
     block.end_addr      = start_addr;
     block.instr_count   = 0;
@@ -156,7 +156,7 @@ BasicBlock BasicBlockAnalyzer::build_block(uint32_t start_addr) {
 // ---------------------------------------------------------------------------
 // analyze: main entry point
 // ---------------------------------------------------------------------------
-std::vector<BasicBlock> BasicBlockAnalyzer::analyze() {
+std::vector<LegacyBasicBlock> BasicBlockAnalyzer::analyze() {
     blocks_.clear();
     addr_to_block_.clear();
     decoded_.clear();
@@ -185,7 +185,7 @@ std::vector<BasicBlock> BasicBlockAnalyzer::analyze() {
         // Only create a block if start_addr is in the decoded range
         if (addr_to_idx_.count(start) == 0) continue;
 
-        BasicBlock block{};
+        LegacyBasicBlock block{};
         block.start_addr  = start;
         block.end_addr    = start;
         block.instr_count = 0;
@@ -307,7 +307,7 @@ std::vector<BasicBlock> BasicBlockAnalyzer::analyze() {
 // ---------------------------------------------------------------------------
 // build_predecessors: reverse the successor edges
 // ---------------------------------------------------------------------------
-void BasicBlockAnalyzer::build_predecessors(std::vector<BasicBlock>& blocks) {
+void BasicBlockAnalyzer::build_predecessors(std::vector<LegacyBasicBlock>& blocks) {
     // Build addr → block index map
     std::unordered_map<uint32_t, size_t> addr_map;
     for (size_t i = 0; i < blocks.size(); ++i) {
@@ -328,7 +328,7 @@ void BasicBlockAnalyzer::build_predecessors(std::vector<BasicBlock>& blocks) {
 // ---------------------------------------------------------------------------
 // find_block: look up a block containing addr
 // ---------------------------------------------------------------------------
-const BasicBlock* BasicBlockAnalyzer::find_block(uint32_t addr) const {
+const LegacyBasicBlock* BasicBlockAnalyzer::find_block(uint32_t addr) const {
     // First check if addr is an exact start address
     auto it = addr_to_block_.find(addr);
     if (it != addr_to_block_.end()) {

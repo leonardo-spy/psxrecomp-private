@@ -51,14 +51,14 @@ struct BasicBlock {
 
 // Control flow graph for a function
 struct ControlFlowGraph {
-    uint32_t function_start;
-    uint32_t function_end;
+    uint32_t function_start = 0;
+    uint32_t function_end = 0;
     std::map<uint32_t, BasicBlock> blocks; // Map: block start address -> block
     std::vector<uint32_t> block_order;     // Blocks in address order
 
     // Loop information
     std::vector<std::pair<uint32_t, uint32_t>> loops; // (header, back_edge_source)
-    int loop_count;
+    int loop_count = 0;
 };
 
 class ControlFlowAnalyzer {
