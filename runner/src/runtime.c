@@ -4,6 +4,7 @@
 #include "cdrom_stub.h"
 #include "spu.h"
 #include "automation.h"
+#include "func_logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,13 +35,26 @@ static uint8_t g_ram[2 * 1024 * 1024];   /* 2MB main RAM */
 static uint8_t g_scratch[1024];           /* 1KB scratchpad */
 
 /* Global CPU pointer for watchpoint diagnostics */
-static CPUState* g_diag_cpu = NULL;
+CPUState* g_diag_cpu = NULL;
 
-/* Scripting VM per-frame opcode counter (reset each VM entry, used to force yield) */
+/* Current pad1 button state (active-high), exposed for debug_server.c */
+uint16_t g_pad1_state = 0;
+
+/* Scripting VM per-frame opcode counter(reset each VM entry, used to force yield) */
 uint32_t g_vm_ops_this_frame = 0;
 
 /* Current CDROM seek position (LBA), set by CdlSeekL intercept */
 static uint32_t g_cdrom_lba = 0;
+
+/* Dispatch miss tracking */
+#define MAX_DISPATCH_MISS_UNIQUE 256
+static uint32_t s_dispatch_miss_count = 0;
+static uint32_t s_dispatch_miss_addrs[MAX_DISPATCH_MISS_UNIQUE];
+static int      s_dispatch_miss_unique_count = 0;
+
+uint32_t psx_get_dispatch_miss_count(void) {
+    return s_dispatch_miss_count;
+}
 
 /* ---------------------------------------------------------------------------
  * PS1 BIOS interrupt handler chains
@@ -61,21 +75,227 @@ static uint32_t g_cdrom_lba = 0;
 static uint32_t g_int_chains[4] = {0};
 
 /* ---------------------------------------------------------------------------
- * Memory card file I/O — backs B(0x32-0x36) BIOS calls with flat files on disk.
- * Save files are stored in C:/temp/memcard/ named by slot and game path.
+ * Memory card — proper 128KB raw card image with PS1 directory structure.
+ *
+ * Layout: 1024 sectors × 128 bytes = 128KB
+ *   Block 0 (sectors 0-63):  Directory block
+ *     Sector 0:    Header ("MC" + padding + XOR checksum)
+ *     Sectors 1-15: Directory entries (one per data block 1-15)
+ *       +0x00  uint32_t state  (0x51=first, 0xA1=mid, 0xA2=last, 0xA0=deleted, 0x00=free)
+ *       +0x04  uint32_t size   (file size in bytes)
+ *       +0x08  uint16_t next   (next block, 0xFFFF=last)
+ *       +0x0A  char     name[21] (ASCII, null-terminated)
+ *       +0x7F  uint8_t  xor    (XOR checksum of bytes 0-126)
+ *     Sectors 16-35: Broken sector list (unused, zeroed)
+ *     Sectors 36-62: Broken sector replacement (unused)
+ *     Sector 63: Write test sector
+ *   Blocks 1-15 (sectors 64-1023): Data blocks, 64 sectors (8KB) each
+ *
+ * Reference: nocash PSX specs — Memory Card I/O Ports
  * --------------------------------------------------------------------------- */
-/* Real PS1 BIOS allows at most 2 simultaneously open memory card files.
- * open() returns 0 or 1 on success, -1 if both slots are full.
- * Repeated O_CREAT to the SAME file path returns the SAME fd (BIOS slot reuse).
- * O_WRONLY to the same file allocates a second fd (separate write handle). */
-#define MEMCARD_MAX_FD 2
-typedef struct { FILE* fp; char path[256]; } mc_fd_t;
-static mc_fd_t s_mc_fds[MEMCARD_MAX_FD];  /* open file handles; path="" if free */
-static int     s_nextfile_remain = 0;    /* remaining blocks after firstfile; set by FUN_B4CC intercept */
-static char    s_last_mc_name[21] = {0}; /* last O_CREAT filename (PS1 name part, e.g. BASCUS-94236TOMBA-00) */
+
+#define MC_SECTOR_SIZE  128
+#define MC_SECTORS      1024
+#define MC_CARD_SIZE    (MC_SECTOR_SIZE * MC_SECTORS)  /* 128KB */
+#define MC_BLOCK_SIZE   (MC_SECTOR_SIZE * 64)          /* 8KB */
+#define MC_NUM_BLOCKS   16  /* block 0 = directory, 1-15 = data */
+
+/* In-memory card images (loaded from disk on init) */
+static uint8_t s_card[2][MC_CARD_SIZE];  /* slot 0 and slot 1 */
+static int     s_card_loaded[2] = {0, 0};
+static char    s_card_path[2][256];
+
+static void mc_card_path(int slot, char *out, int max) {
+    snprintf(out, max, "memcard/slot%d.mcd", slot);
+}
+
+static void mc_ensure_dir(void) {
+    CreateDirectoryA("memcard", NULL);
+}
+
+/* Initialize a blank card with proper header */
+static void mc_format_card(uint8_t *card) {
+    memset(card, 0, MC_CARD_SIZE);
+    /* Sector 0: header */
+    card[0] = 'M'; card[1] = 'C';
+    /* XOR checksum of sector 0 */
+    uint8_t xor = 0;
+    for (int i = 0; i < 127; i++) xor ^= card[i];
+    card[127] = xor;
+    /* Sectors 1-15: directory entries — mark all as free (0xA0 = freshly formatted) */
+    for (int i = 1; i <= 15; i++) {
+        uint8_t *de = &card[i * MC_SECTOR_SIZE];
+        de[0] = 0xA0; de[1] = 0x00; de[2] = 0x00; de[3] = 0x00; /* state = free/formatted */
+        de[8] = 0xFF; de[9] = 0xFF; /* next = none */
+        xor = 0;
+        for (int j = 0; j < 127; j++) xor ^= de[j];
+        de[127] = xor;
+    }
+}
+
+static void mc_load_card(int slot) {
+    if (s_card_loaded[slot]) return;
+    mc_ensure_dir();
+    mc_card_path(slot, s_card_path[slot], sizeof(s_card_path[slot]));
+    FILE *f = fopen(s_card_path[slot], "rb");
+    if (f) {
+        fread(s_card[slot], 1, MC_CARD_SIZE, f);
+        fclose(f);
+    } else {
+        mc_format_card(s_card[slot]);
+    }
+    s_card_loaded[slot] = 1;
+}
+
+static void mc_save_card(int slot) {
+    if (!s_card_loaded[slot]) return;
+    mc_ensure_dir();
+    FILE *f = fopen(s_card_path[slot], "wb");
+    if (f) {
+        fwrite(s_card[slot], 1, MC_CARD_SIZE, f);
+        fclose(f);
+    }
+}
+
+/* Low-level sector read/write — used by B(0x4E)/B(0x4F) and internally by _bu_* */
+static int mc_read_sector(int slot, uint32_t sector, uint8_t *buf) {
+    if (slot < 0 || slot > 1 || sector >= MC_SECTORS) return 0;
+    mc_load_card(slot);
+    memcpy(buf, &s_card[slot][sector * MC_SECTOR_SIZE], MC_SECTOR_SIZE);
+    return 1;
+}
+
+static int mc_write_sector(int slot, uint32_t sector, const uint8_t *buf) {
+    if (slot < 0 || slot > 1 || sector >= MC_SECTORS) return 0;
+    mc_load_card(slot);
+    memcpy(&s_card[slot][sector * MC_SECTOR_SIZE], buf, MC_SECTOR_SIZE);
+    mc_save_card(slot);  /* flush to disk after every write */
+    return 1;
+}
+
+/* Directory helpers */
+static uint8_t* mc_dir_entry(int slot, int block) {
+    /* block 1-15 → directory sector 1-15 */
+    if (block < 1 || block > 15) return NULL;
+    mc_load_card(slot);
+    return &s_card[slot][block * MC_SECTOR_SIZE];
+}
+
+static int mc_find_file(int slot, const char *name) {
+    /* Search directory entries (blocks 1-15) for a file with matching name */
+    for (int blk = 1; blk <= 15; blk++) {
+        uint8_t *de = mc_dir_entry(slot, blk);
+        uint32_t state = de[0] | (de[1] << 8) | (de[2] << 16) | (de[3] << 24);
+        if (state != 0x51) continue;  /* only first-block entries */
+        if (strncmp((const char *)&de[0x0A], name, 20) == 0)
+            return blk;
+    }
+    return -1; /* not found */
+}
+
+static int mc_find_free_block(int slot) {
+    for (int blk = 1; blk <= 15; blk++) {
+        uint8_t *de = mc_dir_entry(slot, blk);
+        uint32_t state = de[0] | (de[1] << 8) | (de[2] << 16) | (de[3] << 24);
+        if (state == 0xA0 || state == 0x00)
+            return blk;
+    }
+    return -1; /* card full */
+}
+
+static void mc_update_dir_checksum(int slot, int block) {
+    uint8_t *de = mc_dir_entry(slot, block);
+    uint8_t xor = 0;
+    for (int i = 0; i < 127; i++) xor ^= de[i];
+    de[127] = xor;
+    mc_save_card(slot);
+}
+
+/* Open file descriptor table */
+#define MC_MAX_FD 4
+typedef struct {
+    int  active;
+    int  slot;       /* card slot 0 or 1 */
+    int  block;      /* starting block (1-15) */
+    uint32_t size;   /* file size */
+    uint32_t pos;    /* current read/write position */
+    int  writable;
+} mc_fd_t;
+static mc_fd_t s_mc_fds[MC_MAX_FD];
+
+/* FDs 0-1 are reserved (stdin/stdout on real PS1), so use 2+ */
+#define MC_FD_BASE 2
+
+static int mc_alloc_fd(void) {
+    for (int i = 0; i < MC_MAX_FD; i++)
+        if (!s_mc_fds[i].active) return i;
+    return -1;
+}
+
+/* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename */
+static int mc_parse_path(const char* path, int* slot_out, char* name_out, int name_max) {
+    if (strncmp(path, "bu", 2) != 0) return -1;
+    *slot_out = (path[2] == '1') ? 1 : 0;
+    const char* colon = strchr(path, ':');
+    if (!colon) return -1;
+    const char* name = colon + 1;
+    while (*name == '\\' || *name == '/') name++;
+    strncpy(name_out, name, name_max - 1);
+    name_out[name_max - 1] = '\0';
+    return 0;
+}
+
+/* firstfile/nextfile state */
+static int  s_ff_slot = 0;
+static int  s_ff_block = 0;  /* next block to check (1-15) */
+static char s_ff_pattern[32] = {0};
+
+/* Memcard activity log — queryable via TCP debug server "memcard_log" command */
+#define MC_LOG_CAP 32
+typedef struct {
+    uint32_t frame;
+    uint32_t bios_fn;   /* 0x32=open, 0x33=lseek, 0x34=read, 0x35=write, 0x36=close */
+    uint32_t a0, a1, a2, a3;
+    uint32_t ret;       /* v0 return value */
+    uint32_t ra;
+    uint8_t  buf_head[16]; /* first 16 bytes of buffer (for write/read) */
+    int      buf_nonzero;  /* count of non-zero bytes in buffer */
+} mc_log_entry_t;
+static mc_log_entry_t s_mc_log[MC_LOG_CAP];
+static int s_mc_log_count = 0;
+
+static void mc_log_push(uint32_t fn, CPUState* cpu, uint32_t ret, uint32_t buf_addr, uint32_t buf_len) {
+    int idx = s_mc_log_count % MC_LOG_CAP;
+    mc_log_entry_t *e = &s_mc_log[idx];
+    e->frame = g_ps1_frame;
+    e->bios_fn = fn;
+    e->a0 = cpu->a0; e->a1 = cpu->a1; e->a2 = cpu->a2; e->a3 = cpu->a3;
+    e->ret = ret;
+    e->ra = cpu->ra;
+    memset(e->buf_head, 0, 16);
+    e->buf_nonzero = 0;
+    if (buf_addr > 0 && buf_len > 0) {
+        uint32_t phys = buf_addr & 0x1FFFFFFFu;
+        if (phys + buf_len <= sizeof(g_ram)) {
+            for (uint32_t i = 0; i < buf_len && i < 16; i++)
+                e->buf_head[i] = g_ram[phys + i];
+            for (uint32_t i = 0; i < buf_len && i < 8192; i++)
+                if (g_ram[phys + i]) e->buf_nonzero++;
+        }
+    }
+    s_mc_log_count++;
+}
+
+/* Exposed for debug_server.c */
+int psx_mc_log_count(void) { return s_mc_log_count; }
+const void* psx_mc_log_entry(int i) {
+    if (i < 0 || i >= s_mc_log_count) return NULL;
+    if (s_mc_log_count > MC_LOG_CAP && i < s_mc_log_count - MC_LOG_CAP) return NULL;
+    return &s_mc_log[i % MC_LOG_CAP];
+}
 
 /* ---------------------------------------------------------------------------
- * CDROM virtual file descriptors — backs B(0x32-0x36) for cdrom:/sim: paths.
+ * CDROM virtual file descriptors— backs B(0x32-0x36) for cdrom:/sim: paths.
  * Files are served from the mounted ISO image via psx_cdrom_read_sector().
  * --------------------------------------------------------------------------- */
 #define CDROM_FD_BASE 0x40   /* cdrom fds: 0x40..0x43 (no overlap with memcard 0..1) */
@@ -128,28 +348,8 @@ static int is_cdrom_path(const char* path) {
     return 0;
 }
 
-static void mc_ensure_dir(void) {
-    CreateDirectoryA("C:/temp/memcard", NULL);  /* no-op if exists */
-}
-
-/* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename.
- * Returns 0 on success, -1 on bad format. */
-static int mc_parse_path(const char* path, int* slot_out, char* name_out, int name_max) {
-    if (!path || path[0] != 'b' || path[1] != 'u') return -1;
-    *slot_out = (path[3] == '1') ? 1 : 0;
-    /* skip past ':' and optional backslash */
-    const char* p = strchr(path + 4, ':');
-    if (p) p++;
-    else    p = path + 4;
-    if (*p == '\\' || *p == '/') p++;
-    int i = 0;
-    while (*p && i < name_max - 1) { name_out[i++] = *p++; }
-    name_out[i] = '\0';
-    return (i > 0) ? 0 : -1;
-}
-
 /* ---------------------------------------------------------------------------
- * Frame-gated diagnostic logging — fires only during DIAG_FRAME_START..END
+ * Frame-gated diagnostic logging— fires only during DIAG_FRAME_START..END
  * --------------------------------------------------------------------------- */
 extern uint32_t g_ps1_frame;
 
@@ -511,12 +711,14 @@ static LPVOID g_fiber_main      = NULL;  /* main thread fiber */
 static LPVOID g_fiber_display   = NULL;  /* display thread fiber */
 static LPVOID g_fiber_loading   = NULL;  /* loading/CDROM thread fiber */
 static LPVOID g_fiber_secondary = NULL;  /* secondary processing thread (TCB[1]) */
+static LPVOID g_fiber_game      = NULL;  /* MainGame fiber (DRA.BIN 0x800E3988) */
 
 /* Saved MIPS GP register banks (one per thread) */
 static uint32_t g_main_saved[MIPS_GP_REGS];
 static uint32_t g_display_saved[MIPS_GP_REGS];
 static uint32_t g_loading_saved[MIPS_GP_REGS];
 static uint32_t g_secondary_saved[MIPS_GP_REGS];
+static uint32_t g_game_saved[MIPS_GP_REGS];
 
 /* Loading fiber setup from OpenThread */
 static uint32_t g_loading_sp    = 0x801FF400u;  /* initial MIPS SP for loading thread */
@@ -591,6 +793,28 @@ static VOID WINAPI fiber_secondary_func(PVOID param) {
            g_secondary_entry, g_secondary_sp);
     fflush(stdout);
     psx_dispatch_compiled(cpu, g_secondary_entry);
+    for (;;) { SwitchToFiber(g_fiber_main); }
+}
+
+/* Forward declaration — defined later in this file */
+void mips_interpret(CPUState* cpu, uint32_t start_pc);
+
+/* MainGame fiber — runs DRA.BIN's MainGame loop (0x800E3988) via interpreter.
+ * MainGame is an infinite loop: UpdateGame → Render → AddPrim → DrawOTag → VSync.
+ * VSync (0x80016C54) yields back to the pump loop each frame. The fiber preserves
+ * the interpreter's entire host stack (including interp_call_stack and PC), so
+ * MainGame resumes exactly where it left off next frame. */
+static VOID WINAPI fiber_game_func(PVOID param) {
+    CPUState* cpu = (CPUState*)param;
+    memcpy(cpu, g_game_saved, MIPS_GP_REGS * sizeof(uint32_t));
+    printf("[GAME-FIBER] Starting MainGame at 0x800E3988 sp=0x%08X ra=0x%08X\n",
+           cpu->sp, cpu->ra);
+    fflush(stdout);
+    /* MainGame is an infinite loop. The interpreter guard is set very large
+     * (10M instructions) since VSync yields the fiber every frame. */
+    mips_interpret(cpu, 0x800E3988u);
+    printf("[GAME-FIBER] MainGame returned (unexpected — infinite loop exited)\n");
+    fflush(stdout);
     for (;;) { SwitchToFiber(g_fiber_main); }
 }
 
@@ -1747,7 +1971,7 @@ static uint32_t g_heap_ptr  = 0;  /* next free PS1 address */
  * --------------------------------------------------------------------------- */
 
 /* Forward declaration — mips_interpret calls call_by_address for compiled fns */
-static void mips_interpret(CPUState* cpu, uint32_t start_pc);
+void mips_interpret(CPUState* cpu, uint32_t start_pc);
 
 static int cv_force_interpret_range(uint32_t addr) {
     return (addr == 0x80019844u ||
@@ -1830,9 +2054,13 @@ static int mips_exec_one(CPUState* cpu, uint32_t* R[32],
         case 0x27: *R[rd] = ~(*R[rs] | *R[rt]); break; /* NOR */
         case 0x2A: *R[rd] = (int32_t)*R[rs] < (int32_t)*R[rt] ? 1 : 0; break; /* SLT  */
         case 0x2B: *R[rd] = *R[rs] < *R[rt] ? 1 : 0; break;                   /* SLTU */
-        default:
-            printf("[INTERP] SPECIAL funct=0x%02X at 0x%08X\n", funct, pc);
-            fflush(stdout);
+        default: {
+            static uint32_t s_bad_funct = 0;
+            if (++s_bad_funct <= 20u || (s_bad_funct % 10000u) == 0u) {
+                printf("[INTERP] SPECIAL funct=0x%02X at 0x%08X (#%u)\n", funct, pc, s_bad_funct);
+                fflush(stdout);
+            }
+        }
         }
         return 0;
 
@@ -1932,14 +2160,18 @@ static int mips_exec_one(CPUState* cpu, uint32_t* R[32],
     case 0x3A: /* SWC2 — store word from GTE data register */
         cpu->write_word(*R[rs]+(uint32_t)simm, gte_read_data(cpu, (uint8_t)rt));
         return 0;
-    default:
-        printf("[INTERP] opcode=0x%02X at 0x%08X instr=0x%08X\n", op, pc, instr);
-        fflush(stdout);
+    default: {
+        static uint32_t s_bad_op = 0;
+        if (++s_bad_op <= 20u || (s_bad_op % 10000u) == 0u) {
+            printf("[INTERP] opcode=0x%02X at 0x%08X instr=0x%08X (#%u)\n", op, pc, instr, s_bad_op);
+            fflush(stdout);
+        }
         return 0;
+    }
     }
 }
 
-static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
+void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     /* Register pointer array — builds once per call depth */
     uint32_t zero_sink = 0;
     uint32_t* R[32];
@@ -2226,10 +2458,11 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                          * at C778/C780. The original game reads these during early init
                          * (frame 1, before overlay loads), getting garbage. Fix by writing
                          * the correct values now. */
-                        uint32_t ovl_fn0 = 0, ovl_fn1 = 0;
+                        uint32_t ovl_fn0 = 0, ovl_fn1 = 0, ovl_fn2 = 0;
                         memcpy(&ovl_fn0, &g_ram[0x180000], 4);  /* overlay[+0x00] */
                         memcpy(&ovl_fn1, &g_ram[0x180004], 4);  /* overlay[+0x04] */
-                        fprintf(stderr, "[OVL-FIX-DBG] step 6b: ovl_fn0=0x%08X ovl_fn1=0x%08X\n", ovl_fn0, ovl_fn1); fflush(stderr);
+                        memcpy(&ovl_fn2, &g_ram[0x180008], 4);  /* overlay[+0x08] */
+                        fprintf(stderr, "[OVL-FIX-DBG] step 6b: ovl_fn0=0x%08X ovl_fn1=0x%08X ovl_fn2=0x%08X\n", ovl_fn0, ovl_fn1, ovl_fn2); fflush(stderr);
                         if (ovl_fn0 >= 0x80180000u && ovl_fn0 <= 0x801FFFFFu) {
                             memcpy(&g_ram[0x3C778], &ovl_fn0, 4);
                             fprintf(stderr, "[OVL-FIX] Set C778 = 0x%08X (overlay[0])\n", ovl_fn0); fflush(stderr);
@@ -2237,6 +2470,10 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         if (ovl_fn1 >= 0x80180000u && ovl_fn1 <= 0x801FFFFFu) {
                             memcpy(&g_ram[0x3C780], &ovl_fn1, 4);
                             fprintf(stderr, "[OVL-FIX] Set C780 = 0x%08X (overlay[4])\n", ovl_fn1); fflush(stderr);
+                        }
+                        if (ovl_fn2 >= 0x80180000u && ovl_fn2 <= 0x801FFFFFu) {
+                            memcpy(&g_ram[0x3C774], &ovl_fn2, 4);
+                            fprintf(stderr, "[OVL-FIX] Set C774 = 0x%08X (overlay[8])\n", ovl_fn2); fflush(stderr);
                         }
                         /* Skip calling init function since 0x800DCDF4 is actually 
                          * a string table ("F_SEL", "NO3", etc.), not executable code */
@@ -2773,6 +3010,15 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     if (start_pc == 0x8001A664u && s_interp_guard_a664 != 0u) {
         guard_limit = s_interp_guard_a664;
     }
+    /* MainGame (0x800E3988) runs in its own fiber. VSync yields the fiber each
+     * frame, so the guard just needs to be large enough to cover several frames
+     * in case VSync doesn't fire immediately. 10M instructions is plenty.
+     * UpdateGame (0x800E7AEC) is the core per-frame game logic (state machine,
+     * entity updates, rendering). Its entity init loops alone need 25K+ compiled
+     * calls, so it also needs a generous guard limit. */
+    if (start_pc == 0x800E3988u || start_pc == 0x800E7AECu) {
+        guard_limit = 10000000u;
+    }
     /* DRA.BIN overlay code (≥0x800A0000): the main game function at 0x800E3988
      * is an infinite loop (init + while(1) { frame... }).  The default 10K guard
      * kills it prematurely, causing boot to return before rendering starts.
@@ -2788,10 +3034,15 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         }
     }
     /* Iterative call stack — avoids deep recursion that overflows the native stack
-     * when interpreting DRA.BIN overlay code (many non-compiled sub-function calls). */
-    #define INTERP_CALL_STACK_MAX 128
-    uint32_t interp_call_stack[INTERP_CALL_STACK_MAX];
-    int      interp_call_sp = 0;
+     * when interpreting DRA.BIN overlay code (many non-compiled sub-function calls).
+     * Static to reduce mips_interpret's stack frame size (~512 bytes saved).
+     * Uses a global 'top' pointer so nested mips_interpret calls (e.g. the A664
+     * override calling mips_interpret from inside a compiled function) use a
+     * separate region of the array instead of overwriting the outer call's entries. */
+    #define INTERP_CALL_STACK_MAX 512
+    static uint32_t interp_call_stack[INTERP_CALL_STACK_MAX];
+    static int      interp_call_top = 0;
+    int      interp_call_base = interp_call_top;  /* base for this nesting level */
     int guard;
 
     for (guard = 0; guard < (int)guard_limit; guard++) {
@@ -2803,7 +3054,7 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                        g_interp_total_limit, start_pc, pc);
                 fflush(stdout);
             }
-            return;
+            interp_call_top = interp_call_base; return;
         }
         if (s_interp_min_sp != 0u && cpu->sp < s_interp_min_sp) {
             static uint32_t s_interp_min_sp_hits = 0;
@@ -2813,7 +3064,7 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                        s_interp_min_sp_hits, start_pc, pc, cpu->sp, cpu->ra);
                 fflush(stdout);
             }
-            return;
+            interp_call_top = interp_call_base; return;
         }
         cpu->zero = 0;
         cpu->pc = pc;
@@ -2878,6 +3129,25 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
          * pc+8 (the instruction after the delay slot).  Just returning would
          * leave the outer mips_interpret in a bad state (it already set *R[rd]
          * = pc+8 in the JALR case, so we want to continue from there). */
+        /* JR $ra — check FIRST before null-guard, because the interp_call_stack
+         * holds the correct return address even when cpu->ra == 0 (e.g. restored
+         * from a different stack frame by compiled epilogue code). */
+        if (is_jr31 && !is_link) {
+            if (interp_call_top > interp_call_base) {
+                pc = interp_call_stack[--interp_call_top];
+                continue;
+            }
+            /* Top-level return — log if from MainGame for debugging */
+            if (start_pc == 0x800E3988u) {
+                printf("[MAINGAME-EXIT] f%u JR $ra at pc=0x%08X ra=0x%08X guard=%d/%u sp=0x%08X depth=%d\n",
+                       g_ps1_frame, pc, cpu->ra, guard, guard_limit, cpu->sp,
+                       interp_call_top - interp_call_base);
+                fflush(stdout);
+            }
+            interp_call_top = interp_call_base;  /* restore for outer level */
+            return;
+        }
+
         if (target == 0 || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)) {
             if (trace_cv_interp) {
                 static uint32_t s_cv_null_target = 0;
@@ -2897,24 +3167,19 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 pc = pc + 8;  /* skip past JALR+delay-slot, treat call as no-op */
                 continue;
             }
-            return;
+            if (start_pc == 0x800E3988u) {
+                printf("[MAINGAME-EXIT-NULL] f%u pc=0x%08X target=0x%08X ra=0x%08X guard=%d\n",
+                       g_ps1_frame, pc, target, cpu->ra, guard);
+                fflush(stdout);
+            }
+            interp_call_top = interp_call_base; return;
         }
 
         /* BIOS dispatch: jr/jalr to 0xA0/0xB0/0xC0 from interpreted BIOS stubs */
         if (target == 0xA0u || target == 0xB0u || target == 0xC0u) {
             call_by_address(cpu, target);
             if (is_link) { pc = pc + 8; continue; }
-            return;
-        }
-
-        if (is_jr31) {
-            /* JR $ra — function return. If we have an iterative call on
-             * the stack, pop and continue; otherwise return to caller. */
-            if (interp_call_sp > 0) {
-                pc = interp_call_stack[--interp_call_sp];
-                continue;
-            }
-            return;
+            interp_call_top = interp_call_base; return;
         }
 
         if (is_link) {
@@ -2923,8 +3188,8 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             if (is_compiled_addr(target)) {
                 if (cv_force_interpret_range(target)) {
                     /* Interpret iteratively instead of recursively */
-                    if (interp_call_sp < INTERP_CALL_STACK_MAX) {
-                        interp_call_stack[interp_call_sp++] = ret_pc;
+                    if (interp_call_top < INTERP_CALL_STACK_MAX) {
+                        interp_call_stack[interp_call_top++] = ret_pc;
                         pc = target;
                         continue;
                     }
@@ -3040,15 +3305,25 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                 }
             } else {
-                /* Non-compiled target (DRA.BIN / overlay): handle iteratively
-                 * to avoid stack overflow from deep recursion. */
-                if (interp_call_sp < INTERP_CALL_STACK_MAX) {
-                    interp_call_stack[interp_call_sp++] = ret_pc;
+                /* Non-compiled target (DRA.BIN / overlay).
+                 * Functions with start_pc intercepts MUST use recursive dispatch
+                 * so the start_pc checks at the top of mips_interpret fire.
+                 * All other functions use the iterative call stack. */
+                int needs_start_pc_intercept =
+                    target == 0x800E2F34u ||  /* DebugUpdate: force v0=1 */
+                    target == 0x800E7AECu ||  /* UpdateGame: overlay loading */
+                    target == 0x801073C0u ||  /* CD sector loader */
+                    target == 0x801073E8u;    /* CD status check */
+                if (needs_start_pc_intercept) {
+                    mips_interpret(cpu, target);
+                } else if (interp_call_top < INTERP_CALL_STACK_MAX) {
+                    interp_call_stack[interp_call_top++] = ret_pc;
                     pc = target;
                     continue;
+                } else {
+                    /* Stack full — rare fallback to recursive */
+                    mips_interpret(cpu, target);
                 }
-                /* Stack full — rare fallback to recursive */
-                mips_interpret(cpu, target);
             }
             pc = ret_pc;
         } else {
@@ -3101,12 +3376,25 @@ static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                 }
                 call_by_address(cpu, target);
-                return;
+                if (start_pc == 0x800E3988u) {
+                    printf("[MAINGAME-EXIT-TAIL] f%u pc=0x%08X → compiled 0x%08X ra=0x%08X guard=%d\n",
+                           g_ps1_frame, pc, target, cpu->ra, guard);
+                    fflush(stdout);
+                }
+                interp_call_top = interp_call_base; return;
             } else {
                 /* Local jump within overlay space */
                 pc = target;
             }
         }
+    }
+
+    interp_call_top = interp_call_base;
+
+    if (start_pc == 0x800E3988u) {
+        printf("[MAINGAME-EXIT-GUARD] f%u pc=0x%08X guard=%d/%u ra=0x%08X sp=0x%08X\n",
+               g_ps1_frame, pc, guard, guard_limit, cpu->ra, cpu->sp);
+        fflush(stdout);
     }
 
     if (start_pc == 0x8001A664u) {
@@ -4043,36 +4331,20 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 cpu->v0 = 0;
                 return;
             }
-            /* Memory card file I/O — B(0x32) open, B(0x33) lseek, B(0x34) read,
-             * B(0x35) write, B(0x36) close.  Backed by flat files in C:/temp/memcard/. */
-            case 0x32: {  /* open(path, flags) → fd or -1 */
+            /* Memory card I/O — proper 128KB raw card image implementation.
+             * B(0x32) open, B(0x33) lseek, B(0x34) read, B(0x35) write, B(0x36) close
+             * B(0x42) firstfile, B(0x43) nextfile
+             * B(0x4A) InitCard, B(0x4B) StartCard, B(0x4E) card_write, B(0x4F) card_read */
+            case 0x32: {  /* _bu_open(path, flags, size) → fd or -1 */
                 uint32_t pa = cpu->a0 & 0x1FFFFFFFu;
                 uint32_t flags = cpu->a1;
-                const char* path = (pa < sizeof(g_ram)) ? (const char*)&g_ram[pa] : "";
-                /* [OPEN-DUMP] one-shot overlay dump — data collected, no longer needed.
-                 * Result: a2=0x0C00 (save data size), ra=0x800E7BDC, overlay at 0x800E7BD0.
-                 * Re-enable: remove comment-out below.
-                if ((flags & 0x200u) && g_ps1_frame >= 3490u && g_ps1_frame <= 3510u) {
-                    static int s_dump_done = 0;
-                    if (!s_dump_done) {
-                        s_dump_done = 1;
-                        printf("[OPEN-DUMP] f%u a0=0x%08X(\"%s\") a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X\n",
-                               g_ps1_frame, cpu->a0, path, cpu->a1, cpu->a2, cpu->a3, cpu->ra);
-                        uint32_t dump_start = (cpu->ra - 0x30u) & 0x1FFFFFFFu;
-                        uint32_t dump_end   = (cpu->ra + 0x60u) & 0x1FFFFFFFu;
-                        printf("[OPEN-DUMP] overlay code 0x%08X - 0x%08X:\n", dump_start + 0x80000000u, dump_end + 0x80000000u);
-                        for (uint32_t i = dump_start; i < dump_end && i < sizeof(g_ram); i += 4) {
-                            uint32_t w = g_ram[i] | (g_ram[i+1]<<8) | (g_ram[i+2]<<16) | (g_ram[i+3]<<24);
-                            printf("  0x%08X: %08X\n", i + 0x80000000u, w);
-                        }
-                        fflush(stdout);
-                    }
-                } */
+                uint32_t file_size = cpu->a2;
+                const char *path = (pa < sizeof(g_ram)) ? (const char*)&g_ram[pa] : "";
                 /* --- CDROM / sim: file open --- */
                 if (is_cdrom_path(path)) {
                     const char* fname = cdrom_extract_filename(path);
-                    uint32_t start_lba = 0, file_size = 0;
-                    int found = psx_cdrom_find_file(fname, &start_lba, &file_size);
+                    uint32_t start_lba = 0, file_size_cd = 0;
+                    int found = psx_cdrom_find_file(fname, &start_lba, &file_size_cd);
                     /* If not found with path, try just the filename (root directory) */
                     if (!found) {
                         const char* just_name = fname;
@@ -4080,7 +4352,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                             if (*p == '/') just_name = p + 1;
                         }
                         if (just_name != fname) {
-                            found = psx_cdrom_find_file(just_name, &start_lba, &file_size);
+                            found = psx_cdrom_find_file(just_name, &start_lba, &file_size_cd);
                             if (found) fname = just_name;
                         }
                     }
@@ -4101,94 +4373,135 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     }
                     s_cdrom_vfds[vfd_idx].active    = 1;
                     s_cdrom_vfds[vfd_idx].start_lba = start_lba;
-                    s_cdrom_vfds[vfd_idx].file_size = file_size;
+                    s_cdrom_vfds[vfd_idx].file_size = file_size_cd;
                     s_cdrom_vfds[vfd_idx].position  = 0;
                     int fd = CDROM_FD_BASE + vfd_idx;
                     cpu->v0 = (uint32_t)fd;
                     printf("[CDROM open] fd=%d \"%s\" LBA=%u size=%u ra=0x%08X\n",
-                           fd, fname, start_lba, file_size, cpu->ra);
+                           fd, fname, start_lba, file_size_cd, cpu->ra);
                     fflush(stdout);
                     return;
                 }
                 /* --- Memory card file open --- */
                 int slot = 0;  char name[64] = {0};
                 if (mc_parse_path(path, &slot, name, sizeof(name)) < 0) {
-                    printf("[BIOS open] unhandled path: \"%s\" flags=0x%05X ra=0x%08X\n",
-                           path, flags, cpu->ra);
-                    cpu->v0 = (uint32_t)-1; return;
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
                 }
-                mc_ensure_dir();
-                char filepath[256];
-                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_%s.bin", slot, name);
-                /* flags: bit 9 (0x200) = O_CREAT, bit 1 (0x2) = write, bit 0 (0x1) = read
-                 * PS1 O_CREAT = create if not exists, open if exists (no truncation).
-                 * Real PS1 BIOS: repeated O_CREAT to the same path returns same fd (slot reuse). */
+                mc_load_card(slot);
                 int create = (flags & 0x200u) != 0;
-                int write  = (flags & 0x002u) != 0;
-                /* On O_CREAT: if path already open, return existing fd (PS1 BIOS slot reuse) */
+                int writable = (flags & 0x002u) != 0 || create;
+                int existing_block = mc_find_file(slot, name);
+
                 if (create) {
-                    for (int i = 0; i < MEMCARD_MAX_FD; i++) {
-                        if (s_mc_fds[i].fp && strcmp(s_mc_fds[i].path, filepath) == 0) {
-                            cpu->v0 = (uint32_t)i;
-                            printf("[MEMCARD open] fd=%d reuse %s flags=0x%05X ra=0x%08X\n", i, filepath, flags, cpu->ra);
-                            return;
+                    if (existing_block >= 0) {
+                        /* File already exists — return -1 per PS1 BIOS O_CREAT semantics */
+                        cpu->v0 = (uint32_t)-1;
+                        mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                        return;
+                    }
+
+                    /* Check if this is a continuation block (name ends in -01, -02, etc.)
+                     * If so, link it to the parent -00 block instead of creating independently. */
+                    int nlen = (int)strlen(name);
+                    int is_continuation = 0;
+                    int parent_block = -1;
+                    int block_index = 0;  /* 0=first, 1=second, 2=third... */
+                    if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] >= '0' && name[nlen-1] >= '0') {
+                        block_index = (name[nlen-2] - '0') * 10 + (name[nlen-1] - '0');
+                        if (block_index > 0) {
+                            is_continuation = 1;
+                            /* Find the parent -00 block */
+                            char parent_name[64];
+                            strncpy(parent_name, name, sizeof(parent_name) - 1);
+                            parent_name[nlen-2] = '0'; parent_name[nlen-1] = '0';
+                            parent_block = mc_find_file(slot, parent_name);
                         }
                     }
-                }
-                /* Find a free FD slot — PS1 BIOS uses 0 and 1 (no stdin/stdout reservation) */
-                int fd = -1;
-                for (int i = 0; i < MEMCARD_MAX_FD; i++) {
-                    if (!s_mc_fds[i].fp) { fd = i; break; }
-                }
-                if (fd < 0) { cpu->v0 = (uint32_t)-1; return; }
-                if (create) {
-                    /* Try to open existing file first (r+b), fall back to create (w+b) */
-                    s_mc_fds[fd].fp = fopen(filepath, "r+b");
-                    if (!s_mc_fds[fd].fp) {
-                        /* New file: create and pre-fill 8 KB with zeros so read-back verify returns data */
-                        static const char zeros[0x2000];
-                        s_mc_fds[fd].fp = fopen(filepath, "w+b");
-                        if (s_mc_fds[fd].fp) {
-                            fwrite(zeros, 1, sizeof(zeros), s_mc_fds[fd].fp);
-                            rewind(s_mc_fds[fd].fp);
-                        }
-                        /* If this is a "-00" block, also create companion "-01" and "-02" files */
-                        int nlen = (int)strlen(name);
-                        if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] == '0' && name[nlen-1] == '0') {
-                            for (int blk = 1; blk <= 2; blk++) {
-                                char comp_path[256];
-                                snprintf(comp_path, sizeof(comp_path), "C:/temp/memcard/slot%d_%s.bin", slot, name);
-                                int clen = (int)strlen(comp_path);
-                                comp_path[clen - 5] = '0' + blk;  /* -00.bin → -01.bin / -02.bin */
-                                FILE *cfp = fopen(comp_path, "r+b");
-                                if (!cfp) {
-                                    cfp = fopen(comp_path, "w+b");
-                                    if (cfp) {
-                                        fwrite(zeros, 1, sizeof(zeros), cfp);
-                                        printf("[MEMCARD create] companion %s\n", comp_path);
-                                        fclose(cfp);
-                                    }
-                                } else {
-                                    fclose(cfp);
-                                }
-                            }
-                        }
+
+                    /* Allocate one free block */
+                    int new_block = mc_find_free_block(slot);
+                    if (new_block < 0) {
+                        cpu->v0 = (uint32_t)-1;  /* card full */
+                        mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                        return;
                     }
-                } else if (write) {
-                    s_mc_fds[fd].fp = fopen(filepath, "r+b");
-                    if (!s_mc_fds[fd].fp) s_mc_fds[fd].fp = fopen(filepath, "w+b");
-                } else {
-                    s_mc_fds[fd].fp = fopen(filepath, "rb");
+
+                    /* Write directory entry */
+                    uint8_t *de = mc_dir_entry(slot, new_block);
+                    memset(de, 0, MC_SECTOR_SIZE);
+
+                    if (is_continuation && parent_block >= 0) {
+                        /* Continuation block: state = 0xA1 (middle) or 0xA2 (last, we'll set A2 for now) */
+                        uint32_t state = 0xA2;  /* assume last; if another -0N follows it updates to A1 */
+                        de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
+                        de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
+                        de[8] = 0xFF; de[9] = 0xFF;  /* next = none (last block) */
+                        mc_update_dir_checksum(slot, new_block);
+
+                        /* Walk the chain from parent to find the last block, then link to us */
+                        int prev = parent_block;
+                        while (1) {
+                            uint8_t *pde = mc_dir_entry(slot, prev);
+                            uint16_t pnext = pde[8] | (pde[9] << 8);
+                            if (pnext == 0xFFFF) break;
+                            prev = (int)(pnext + 1);
+                            if (prev < 1 || prev > 15) break;
+                        }
+                        /* Link previous last block to this new block */
+                        uint8_t *pde = mc_dir_entry(slot, prev);
+                        uint16_t link = (uint16_t)(new_block - 1);
+                        pde[8] = link & 0xFF; pde[9] = (link >> 8) & 0xFF;
+                        /* Update previous block state: if it was 0xA2 (last), change to 0xA1 (middle) */
+                        uint32_t prev_state = pde[0] | (pde[1]<<8) | (pde[2]<<16) | (pde[3]<<24);
+                        if (prev_state == 0xA2) {
+                            pde[0] = 0xA1; pde[1] = 0; pde[2] = 0; pde[3] = 0;
+                        }
+                        mc_update_dir_checksum(slot, prev);
+
+                        /* Update parent's size to reflect total */
+                        uint8_t *parent_de = mc_dir_entry(slot, parent_block);
+                        uint32_t total_size = (block_index + 1) * MC_BLOCK_SIZE;
+                        parent_de[4] = total_size & 0xFF; parent_de[5] = (total_size>>8)&0xFF;
+                        parent_de[6] = (total_size>>16)&0xFF; parent_de[7] = (total_size>>24)&0xFF;
+                        mc_update_dir_checksum(slot, parent_block);
+                    } else {
+                        /* First block of a new file */
+                        uint32_t state = 0x51;
+                        de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
+                        de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
+                        de[4] = file_size & 0xFF; de[5] = (file_size>>8)&0xFF;
+                        de[6] = (file_size>>16)&0xFF; de[7] = (file_size>>24)&0xFF;
+                        de[8] = 0xFF; de[9] = 0xFF;  /* next = none (single block for now) */
+                        strncpy((char*)&de[0x0A], name, 20);
+                        mc_update_dir_checksum(slot, new_block);
+                    }
+                    existing_block = new_block;
                 }
-                if (!s_mc_fds[fd].fp) {
-                    printf("[MEMCARD open] FAIL %s flags=0x%05X\n", filepath, flags);
-                    cpu->v0 = (uint32_t)-1; return;
+
+                if (existing_block < 0) {
+                    cpu->v0 = (uint32_t)-1;  /* file not found */
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
                 }
-                strncpy(s_mc_fds[fd].path, filepath, sizeof(s_mc_fds[fd].path) - 1);
-                /* Track the PS1 name for firstfile/nextfile direntry population */
-                if (create) strncpy(s_last_mc_name, name, sizeof(s_last_mc_name) - 1);
-                cpu->v0 = (uint32_t)fd;
-                printf("[MEMCARD open] fd=%d %s flags=0x%05X ra=0x%08X\n", fd, filepath, flags, cpu->ra);
+
+                /* Allocate fd */
+                int fdi = mc_alloc_fd();
+                if (fdi < 0) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                    return;
+                }
+                s_mc_fds[fdi].active = 1;
+                s_mc_fds[fdi].slot = slot;
+                s_mc_fds[fdi].block = existing_block;
+                uint8_t *de = mc_dir_entry(slot, existing_block);
+                s_mc_fds[fdi].size = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
+                s_mc_fds[fdi].pos = 0;
+                s_mc_fds[fdi].writable = writable;
+                cpu->v0 = (uint32_t)(fdi + MC_FD_BASE);
+                mc_log_push(0x32, cpu, cpu->v0, 0, 0);
                 return;
             }
             case 0x33: {  /* lseek(fd, offset, whence) → new position */
@@ -4209,11 +4522,21 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     cpu->v0 = pos;
                     return;
                 }
-                printf("[MEMCARD lseek] fd=%d offset=%d whence=%d ra=0x%08X\n", fd, offset, whence, cpu->ra);
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
-                int w = (whence == 0) ? SEEK_SET : (whence == 1) ? SEEK_CUR : SEEK_END;
-                fseek(s_mc_fds[fd].fp, offset, w);
-                cpu->v0 = (uint32_t)ftell(s_mc_fds[fd].fp); return;
+                /* Memcard lseek */
+                int fdi = fd - MC_FD_BASE;
+                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x33, cpu, cpu->v0, 0, 0);
+                    return;
+                }
+                uint32_t newpos = s_mc_fds[fdi].pos;
+                if (whence == 0) newpos = (uint32_t)offset;
+                else if (whence == 1) newpos = (uint32_t)((int32_t)newpos + offset);
+                else if (whence == 2) newpos = (uint32_t)((int32_t)s_mc_fds[fdi].size + offset);
+                s_mc_fds[fdi].pos = newpos;
+                cpu->v0 = newpos;
+                mc_log_push(0x33, cpu, cpu->v0, 0, 0);
+                return;
             }
             case 0x34: {  /* read(fd, buf, len) → bytes read */
                 int fd = (int)cpu->a0;
@@ -4262,27 +4585,108 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     fflush(stdout);
                     return;
                 }
-                printf("[MEMCARD read] fd=%d buf=0x%08X len=%u ra=0x%08X\n", fd, cpu->a1, len, cpu->ra);
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
-                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
-                size_t n = fread(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
-                cpu->v0 = (uint32_t)n; return;
+                /* Memcard read */
+                int fdi = fd - MC_FD_BASE;
+                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
+                    return;
+                }
+                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len); return; }
+                /* Read from card sectors: block N starts at sector N*64 */
+                uint32_t bytes_read = 0;
+                int mc_slot = s_mc_fds[fdi].slot;
+                int blk = s_mc_fds[fdi].block;
+                uint32_t pos = s_mc_fds[fdi].pos;
+                while (bytes_read < len && blk >= 1 && blk <= 15) {
+                    uint32_t blk_offset = pos % MC_BLOCK_SIZE;
+                    uint32_t blk_remain = MC_BLOCK_SIZE - blk_offset;
+                    uint32_t to_read = len - bytes_read;
+                    if (to_read > blk_remain) to_read = blk_remain;
+                    uint32_t sector_start = blk * 64 + blk_offset / MC_SECTOR_SIZE;
+                    uint32_t sec_offset = blk_offset % MC_SECTOR_SIZE;
+                    for (uint32_t i = 0; i < to_read; ) {
+                        uint8_t mc_sec_buf[MC_SECTOR_SIZE];
+                        uint32_t sec = sector_start + (sec_offset + i) / MC_SECTOR_SIZE;
+                        mc_read_sector(mc_slot, sec, mc_sec_buf);
+                        uint32_t off_in_sec = (sec_offset + i) % MC_SECTOR_SIZE;
+                        uint32_t chunk = MC_SECTOR_SIZE - off_in_sec;
+                        if (chunk > to_read - i) chunk = to_read - i;
+                        memcpy(&g_ram[buf + bytes_read + i], &mc_sec_buf[off_in_sec], chunk);
+                        i += chunk;
+                    }
+                    bytes_read += to_read;
+                    pos += to_read;
+                    if (pos % MC_BLOCK_SIZE == 0) {
+                        /* Move to next linked block */
+                        uint8_t *de = mc_dir_entry(mc_slot, blk);
+                        uint16_t next = de[8] | (de[9] << 8);
+                        blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
+                    }
+                }
+                s_mc_fds[fdi].pos = pos;
+                cpu->v0 = bytes_read;
+                mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
+                return;
             }
             case 0x35: {  /* write(fd, buf, len) → bytes written */
-                int fd = (int)cpu->a0;
+                int fdi = (int)cpu->a0 - MC_FD_BASE;
                 uint32_t buf = cpu->a1 & 0x1FFFFFFFu;
                 uint32_t len = cpu->a2;
-                /* stdout (fd=1) writes — only if fd=1 is NOT an open memcard file */
-                if (fd == 1 && (fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp)) {
+                /* stdout (fd=1) passthrough */
+                if (cpu->a0 == 1) {
                     if (buf < sizeof(g_ram) && len > 0) fwrite(&g_ram[buf], 1, len, stdout);
                     cpu->v0 = len; return;
                 }
-                printf("[MEMCARD write] fd=%d buf=0x%08X len=%u ra=0x%08X\n", fd, cpu->a1, len, cpu->ra);
-                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
-                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
-                size_t n = fwrite(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
-                fflush(s_mc_fds[fd].fp);
-                cpu->v0 = (uint32_t)n; return;
+                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active || !s_mc_fds[fdi].writable) {
+                    cpu->v0 = (uint32_t)-1;
+                    mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
+                    return;
+                }
+                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len); return; }
+                /* Write to card sectors */
+                uint32_t bytes_written = 0;
+                int mc_slot = s_mc_fds[fdi].slot;
+                int blk = s_mc_fds[fdi].block;
+                uint32_t pos = s_mc_fds[fdi].pos;
+                /* Walk linked blocks to find current position's block */
+                uint32_t skip_blocks = pos / MC_BLOCK_SIZE;
+                for (uint32_t i = 0; i < skip_blocks && blk >= 1 && blk <= 15; i++) {
+                    uint8_t *de = mc_dir_entry(mc_slot, blk);
+                    uint16_t next = de[8] | (de[9] << 8);
+                    blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
+                }
+                while (bytes_written < len && blk >= 1 && blk <= 15) {
+                    uint32_t blk_offset = pos % MC_BLOCK_SIZE;
+                    uint32_t blk_remain = MC_BLOCK_SIZE - blk_offset;
+                    uint32_t to_write = len - bytes_written;
+                    if (to_write > blk_remain) to_write = blk_remain;
+                    /* Write sector by sector */
+                    uint32_t base_sector = blk * 64;
+                    for (uint32_t i = 0; i < to_write; ) {
+                        uint32_t off_in_blk = (blk_offset + i);
+                        uint32_t sec = base_sector + off_in_blk / MC_SECTOR_SIZE;
+                        uint32_t off_in_sec = off_in_blk % MC_SECTOR_SIZE;
+                        uint8_t mc_sec_buf[MC_SECTOR_SIZE];
+                        mc_read_sector(mc_slot, sec, mc_sec_buf);
+                        uint32_t chunk = MC_SECTOR_SIZE - off_in_sec;
+                        if (chunk > to_write - i) chunk = to_write - i;
+                        memcpy(&mc_sec_buf[off_in_sec], &g_ram[buf + bytes_written + i], chunk);
+                        mc_write_sector(mc_slot, sec, mc_sec_buf);
+                        i += chunk;
+                    }
+                    bytes_written += to_write;
+                    pos += to_write;
+                    if (pos % MC_BLOCK_SIZE == 0) {
+                        uint8_t *de = mc_dir_entry(mc_slot, blk);
+                        uint16_t next = de[8] | (de[9] << 8);
+                        blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
+                    }
+                }
+                s_mc_fds[fdi].pos = pos;
+                cpu->v0 = bytes_written;
+                mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
+                return;
             }
             case 0x36: {  /* close(fd) → 0 */
                 int fd = (int)cpu->a0;
@@ -4295,13 +4699,14 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     }
                     cpu->v0 = 0; return;
                 }
-                printf("[MEMCARD close] fd=%d ra=0x%08X\n", fd, cpu->ra);
-                if (fd >= 0 && fd < MEMCARD_MAX_FD && s_mc_fds[fd].fp) {
-                    fclose(s_mc_fds[fd].fp);
-                    s_mc_fds[fd].fp = NULL;
-                    s_mc_fds[fd].path[0] = '\0';
+                /* Memcard close */
+                int fdi = fd - MC_FD_BASE;
+                if (fdi >= 0 && fdi < MC_MAX_FD && s_mc_fds[fdi].active) {
+                    s_mc_fds[fdi].active = 0;
                 }
-                cpu->v0 = 0; return;
+                cpu->v0 = 0;
+                mc_log_push(0x36, cpu, cpu->v0, 0, 0);
+                return;
             }
             case 0x3D: {  /* putchar */
                 /* Suppress CD timeout character output */
@@ -4328,40 +4733,126 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x17: return;  /* ReturnFromException — no-op in recompiler */
             case 0x18: return;  /* SetDefaultExitFromException — no-op */
             case 0x19: return;  /* SetCustomExitFromException — no-op */
-            case 0x42: printf("[BIOS B(0x42)] firstfile a0=0x%08X a1=0x%08X ra=0x%08X\n", cpu->a0, cpu->a1, cpu->ra); fflush(stdout); cpu->v0 = 0; return; /* firstfile — NULL = no files found */
-            case 0x43: /* nextfile — simulate 3-block chain: return a0 for remain>0, then 0.
-                         * Update attr and name for blocks 2/3 (remain=2→0xA1, remain=1→0xA2). */
-                if (cpu->a0 != 0 && s_nextfile_remain > 0) {
-                    --s_nextfile_remain;
-                    cpu->v0 = cpu->a0;
-                    if (cpu->a0 >= 0x80000000u) {
-                        uint32_t _s = cpu->a0 - 0x80000000u;
-                        uint32_t attr = (s_nextfile_remain > 0) ? 0xA1u : 0xA2u;
-                        *(uint32_t*)&g_ram[_s + 0x14] = attr;
-                        *(uint32_t*)&g_ram[_s + 0x1C] = 0u;
-                        /* Update name suffix: block2="-01", block3="-02" */
-                        if (s_last_mc_name[0]) {
-                            strncpy((char*)&g_ram[_s], s_last_mc_name, 20);
-                            int nlen = (int)strlen(s_last_mc_name);
-                            if (nlen >= 2) {
-                                int blk = (s_nextfile_remain > 0) ? 1 : 2;
-                                g_ram[_s + nlen - 2] = '0' + (blk / 10);
-                                g_ram[_s + nlen - 1] = '0' + (blk % 10);
-                            }
-                        }
-                    }
-                } else {
-                    s_nextfile_remain = 0;
-                    cpu->v0 = 0;
+            case 0x42: {  /* firstfile(pattern, direntry) → direntry ptr or 0 */
+                uint32_t pat_addr = cpu->a0 & 0x1FFFFFFFu;
+                uint32_t de_addr  = cpu->a1 & 0x1FFFFFFFu;
+                const char *pattern = (pat_addr < sizeof(g_ram)) ? (const char*)&g_ram[pat_addr] : "";
+                int slot = 0;
+                const char *file_pat = pattern;
+                if (strncmp(pattern, "bu", 2) == 0) {
+                    slot = (pattern[2] == '1') ? 1 : 0;
+                    const char *colon = strchr(pattern, ':');
+                    if (colon) file_pat = colon + 1;
                 }
-                printf("[BIOS B(0x43)] nextfile a0=0x%08X -> v0=0x%08X remain=%d\n",
-                       cpu->a0, cpu->v0, s_nextfile_remain);
+                while (*file_pat == '\\' || *file_pat == '/') file_pat++;
+                mc_load_card(slot);
+                s_ff_slot = slot;
+                s_ff_block = 1;
+                strncpy(s_ff_pattern, file_pat, sizeof(s_ff_pattern) - 1);
+                /* Search directory for first matching file */
+                for (; s_ff_block <= 15; s_ff_block++) {
+                    uint8_t *de = mc_dir_entry(slot, s_ff_block);
+                    uint32_t state = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
+                    if (state != 0x51) continue;
+                    const char *fname = (const char*)&de[0x0A];
+                    /* Pattern match: "*" matches all, "PREFIX*" matches prefix */
+                    int match = 0;
+                    if (s_ff_pattern[0] == '*') match = 1;
+                    else {
+                        const char *star = strchr(s_ff_pattern, '*');
+                        int plen = star ? (int)(star - s_ff_pattern) : (int)strlen(s_ff_pattern);
+                        match = (strncmp(fname, s_ff_pattern, plen) == 0);
+                    }
+                    if (match) {
+                        /* Fill DIRENTRY in game RAM */
+                        if (de_addr + 0x2C <= sizeof(g_ram)) {
+                            memset(&g_ram[de_addr], 0, 0x2C);
+                            strncpy((char*)&g_ram[de_addr], fname, 20);
+                            uint32_t fsize = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
+                            *(uint32_t*)&g_ram[de_addr + 0x14] = state;
+                            *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
+                        }
+                        s_ff_block++;  /* next search starts here */
+                        cpu->v0 = cpu->a1;
+                        mc_log_push(0x42, cpu, cpu->v0, 0, 0);
+                        return;
+                    }
+                }
+                cpu->v0 = 0;  /* no files found */
+                mc_log_push(0x42, cpu, 0, 0, 0);
                 return;
+            }
+            case 0x43: {  /* nextfile(direntry) → direntry ptr or 0 */
+                uint32_t de_addr = cpu->a0 & 0x1FFFFFFFu;
+                int slot = s_ff_slot;
+                for (; s_ff_block <= 15; s_ff_block++) {
+                    uint8_t *de = mc_dir_entry(slot, s_ff_block);
+                    uint32_t state = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
+                    if (state != 0x51 && state != 0xA1 && state != 0xA2) continue;
+                    const char *fname = (const char*)&de[0x0A];
+                    int match = 0;
+                    if (s_ff_pattern[0] == '*') match = 1;
+                    else {
+                        const char *star = strchr(s_ff_pattern, '*');
+                        int plen = star ? (int)(star - s_ff_pattern) : (int)strlen(s_ff_pattern);
+                        match = (strncmp(fname, s_ff_pattern, plen) == 0);
+                    }
+                    if (match) {
+                        if (de_addr + 0x2C <= sizeof(g_ram)) {
+                            memset(&g_ram[de_addr], 0, 0x2C);
+                            /* For continuation blocks, name is in the first block's dir entry */
+                            if (state == 0x51) strncpy((char*)&g_ram[de_addr], fname, 20);
+                            else {
+                                /* Copy name from the DIRENTRY the game already has (it tracks it) */
+                                /* Just write the state/size, name stays from firstfile */
+                            }
+                            uint32_t fsize = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
+                            *(uint32_t*)&g_ram[de_addr + 0x14] = state;
+                            *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
+                        }
+                        s_ff_block++;
+                        cpu->v0 = cpu->a0;
+                        return;
+                    }
+                }
+                cpu->v0 = 0;
+                return;
+            }
             case 0x47: return;  /* AddCDRomDevice — no-op */
-            case 0x4E: printf("[BIOS B(0x4E)] card_write a0=0x%08X a1=0x%08X a2=0x%08X ra=0x%08X\n", cpu->a0, cpu->a1, cpu->a2, cpu->ra); cpu->v0 = (uint32_t)-1; return; /* card_write — not yet implemented */
-            case 0x4A: cpu->v0 = 1; return;  /* InitCard — stub success */
-            case 0x4B: cpu->v0 = 1; return;  /* StartCard — stub success */
-            case 0x4C: cpu->v0 = 1; return;  /* StopCard — stub success */
+            case 0x4E: {  /* _card_write(channel, sector, buffer) → 1=ok, 0=fail */
+                uint32_t channel = cpu->a0;
+                uint32_t sector  = cpu->a1;
+                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
+                int slot = (channel >= 0x10) ? 1 : 0;
+                if (sector >= MC_SECTORS || buf + MC_SECTOR_SIZE > sizeof(g_ram)) {
+                    cpu->v0 = 0; return;
+                }
+                mc_write_sector(slot, sector, &g_ram[buf]);
+                cpu->v0 = 1;
+                mc_log_push(0x4E, cpu, 1, cpu->a2, MC_SECTOR_SIZE);
+                return;
+            }
+            case 0x4F: {  /* _card_read(channel, sector, buffer) → 1=ok, 0=fail */
+                uint32_t channel = cpu->a0;
+                uint32_t sector  = cpu->a1;
+                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
+                int slot = (channel >= 0x10) ? 1 : 0;
+                if (sector >= MC_SECTORS || buf + MC_SECTOR_SIZE > sizeof(g_ram)) {
+                    cpu->v0 = 0; return;
+                }
+                mc_read_sector(slot, sector, &g_ram[buf]);
+                cpu->v0 = 1;
+                mc_log_push(0x4F, cpu, 1, cpu->a2, MC_SECTOR_SIZE);
+                return;
+            }
+            case 0x4A: { /* InitCard */
+                mc_load_card(0);
+                mc_load_card(1);
+                cpu->v0 = 1;
+                return;
+            }
+            case 0x4B: cpu->v0 = 1; return;  /* StartCard — success */
+            case 0x4C: cpu->v0 = 1; return;  /* StopCard — success */
             case 0x56: /* GetC0Table — return pointer to dummy table in RAM */
                 cpu->v0 = 0x80000100u; /* point to zero-filled area near bottom of RAM */
                 return;
@@ -4735,13 +5226,29 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
 
     /* --- Unknown call --- */
     {
-        static uint32_t s_unk_count = 0;
-        ++s_unk_count;
+        ++s_dispatch_miss_count;
         /* Suppress log after first 50 to avoid flooding; print summary every 1000 */
-        if (s_unk_count <= 50 || s_unk_count % 1000 == 0) {
+        if (s_dispatch_miss_count <= 50 || s_dispatch_miss_count % 1000 == 0) {
             printf("[UNKNOWN CALL] #%u 0x%08X  (t1=0x%08X  a0=0x%08X  ra=0x%08X  sp=0x%08X)\n",
-                   s_unk_count, addr, cpu->t1, cpu->a0, cpu->ra, cpu->sp);
+                   s_dispatch_miss_count, addr, cpu->t1, cpu->a0, cpu->ra, cpu->sp);
             fflush(stdout);
+        }
+
+        /* Track unique dispatch misses and log to file */
+        {
+            int found = -1;
+            for (int i = 0; i < s_dispatch_miss_unique_count; i++) {
+                if (s_dispatch_miss_addrs[i] == addr) { found = i; break; }
+            }
+            if (found < 0 && s_dispatch_miss_unique_count < MAX_DISPATCH_MISS_UNIQUE) {
+                found = s_dispatch_miss_unique_count++;
+                s_dispatch_miss_addrs[found] = addr;
+                FILE *mf = fopen("dispatch_misses.log", "a");
+                if (mf) {
+                    fprintf(mf, "0x%08X  ra=0x%08X  frame=%u\n", addr, cpu->ra, g_ps1_frame);
+                    fclose(mf);
+                }
+            }
         }
     }
     return;
@@ -6368,14 +6875,11 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
 
         case 0x80016C54u: {
             /* VSync — DRA.BIN's MainGame loop calls this every frame.
-             * Present the frame + pump window events so the window stays
-             * responsive while the interpreter runs the game loop. */
+             * If running inside the game fiber, yield back to the pump loop.
+             * Otherwise (boot or non-fiber context), present + continue. */
             extern void psx_present_frame(void);
             static uint32_t s_vsync_calls = 0;
             if (++s_vsync_calls <= 20 || (s_vsync_calls % 240u) == 0u) {
-                /* Dump the 5 game state conditions that gate the rendering function
-                 * call at 0x800E3D8C (jal 0x80106670). All must pass:
-                 * C0F8==0, 73EC==0, C734==2, D1C0!=0, 62B0!=0 */
                 uint32_t c0f8 = 0, c73ec = 0, c734 = 0, d1c0 = 0, b62b0 = 0;
                 memcpy(&c0f8, &g_ram[0x3C0F8], 4);
                 memcpy(&c73ec, &g_ram[0x973EC], 4);
@@ -6387,18 +6891,24 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                        c0f8, c73ec, c734, d1c0, b62b0);
                 fflush(stdout);
             }
-            /* FIX: Clear 73EC (loading-busy flag) every frame.
-             * 0x800973EC is in SLUS_000.67's data section and gets set to
-             * garbage by compiled code (bypasses interpreter write traps).
-             * When non-zero it blocks gate condition 2, preventing the
-             * "prepare-for-render" functions (0x800ECE58, 0x800EBBAC) from
-             * running.  Clearing it lets the game advance naturally. */
+            /* Clear 73EC (loading-busy flag) every frame */
             {
                 uint32_t val = 0;
                 memcpy(&g_ram[0x973EC], &val, 4);
             }
+            /* If running in game fiber, yield back to pump loop.
+             * The fiber preserves the entire interpreter host stack, so
+             * MainGame resumes exactly at the next instruction after VSync. */
+            if (g_fiber_game && GetCurrentFiber() == g_fiber_game) {
+                memcpy(g_game_saved, cpu, MIPS_GP_REGS * sizeof(uint32_t));
+                SwitchToFiber(g_fiber_main);
+                /* Pump switched back — resume MainGame */
+                memcpy(cpu, g_game_saved, MIPS_GP_REGS * sizeof(uint32_t));
+                return 1;  /* handled — don't run compiled VSync */
+            }
+            /* Non-game-fiber context (boot, scheduler): present + run normally */
             psx_present_frame();
-            return 0;  /* then run compiled VSync normally */
+            return 0;
         }
 
         case 0x8001A110u: {
@@ -7089,34 +7599,8 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             cpu->t1 = 0x43; call_by_address(cpu, 0xB0); return 1;
         case 0x8005B4ACu: /* B(0x45) delete */
             cpu->t1 = 0x45; call_by_address(cpu, 0xB0); return 1;
-        case 0x8005B4CCu: /* FUN_8005B4CC: MC file-exists check — searches BIOS dir table at
-                           * g_ram[0x150] which we never populate; return a1 (the info-struct ptr)
-                           * as a non-zero "file found" result so game proceeds to O_WRONLY.
-                           * Set s_nextfile_remain=2 so nextfile pretends 3 linked blocks exist.
-                           * Fill in DIRENTRY struct with valid MC data so game logic passes. */
-            cpu->v0 = cpu->a1 ? cpu->a1 : 1u;
-            s_nextfile_remain = 2;
-            if (cpu->a1 >= 0x80000000u) {
-                uint32_t _s = cpu->a1 - 0x80000000u;
-                /* Populate full DIRENTRY struct as firstfile() would:
-                 * name[0x00-0x13]: 20-byte PS1 filename (from last O_CREAT)
-                 * attr[0x14]: 0x51 = first linked block
-                 * size[0x18]: 0x6000 = 3×8KB
-                 * next[0x1C]: 0 (nextfile handles traversal)
-                 * count[0x20]: 0 */
-                memset(&g_ram[_s], 0, 0x24);
-                strncpy((char*)&g_ram[_s], s_last_mc_name, 20);
-                *(uint32_t*)&g_ram[_s + 0x14] = 0x51u;
-                *(uint32_t*)&g_ram[_s + 0x18] = 0x6000u;
-                *(uint32_t*)&g_ram[_s + 0x1C] = 0u;
-                *(uint32_t*)&g_ram[_s + 0x20] = 0u;
-                printf("[MEMCARD FUN_B4CC] a0='%s' -> name='%s' attr=0x51 size=0x6000\n",
-                       (cpu->a0 >= 0x80000000u) ? (char*)&g_ram[cpu->a0 - 0x80000000u] : "?",
-                       s_last_mc_name);
-            } else {
-                printf("[MEMCARD FUN_B4CC] a0=0x%08X a1=0x%08X -> v0=0x%08X\n", cpu->a0, cpu->a1, cpu->v0);
-            }
-            return 1;
+        case 0x8005B4CCu: /* FUN_8005B4CC: MC file-exists check — route to firstfile (B(0x42)) */
+            cpu->t1 = 0x42; call_by_address(cpu, 0xB0); return 1;
         case 0x8005CCACu: /* B(0x4E) card_write */
             cpu->t1 = 0x4E; call_by_address(cpu, 0xB0); return 1;
         case 0x8005CCBCu: /* B(0x50) */
@@ -7883,6 +8367,7 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
  * We write ~buttons (active-low) to g_ram[0x9eb5a] so FUN_80028D70 returns
  * the correct active-high bitmask after inversion. */
 void psx_set_pad1(uint16_t buttons) {
+    g_pad1_state = buttons;
     /* Arm INTERP-CALL trace window on Circle (0x2000) or Square (0x8000) press */
     static uint16_t s_prev_buttons = 0;
     uint16_t newly_pressed = buttons & ~s_prev_buttons;
@@ -8276,6 +8761,41 @@ void cv_display_pump_frame(CPUState* cpu) {
     uint32_t save_s6 = cpu->s6, save_s7 = cpu->s7;
     uint32_t save_fp = cpu->fp;
 
+    /* ---- MainGame fiber: run one frame of DRA.BIN game logic ----
+     * MainGame (0x800E3988) is an infinite loop that does:
+     *   UpdateGame → Render → AddPrim → DrawOTag → VSync
+     * VSync yields the fiber, returning control here. The fiber preserves
+     * the interpreter's entire host stack, so MainGame resumes at the next
+     * instruction after VSync on the subsequent pump frame. */
+    {
+        static int s_game_fiber_created = 0;
+        if (!s_game_fiber_created) {
+            s_game_fiber_created = 1;
+            if (!g_fiber_main)
+                g_fiber_main = ConvertThreadToFiber(NULL);
+            /* Initialize game regs: use a separate MIPS stack region */
+            memcpy(g_game_saved, cpu, MIPS_GP_REGS * sizeof(uint32_t));
+            g_game_saved[29] = 0x801FF800u;  /* sp — below main/display regions */
+            g_game_saved[31] = 0x80010EA4u;  /* ra — safe return address */
+            g_fiber_game = CreateFiber(4 * 1024 * 1024, fiber_game_func, (PVOID)cpu);
+            printf("[CV-PUMP] Created game fiber for MainGame (sp=0x801FF800)\n");
+            fflush(stdout);
+        }
+        if (g_fiber_game) {
+            /* Switch to game fiber — it resumes MainGame where VSync yielded,
+             * or starts fresh if this is the first frame */
+            SwitchToFiber(g_fiber_game);
+            /* Game fiber yielded at VSync — game regs saved in g_game_saved.
+             * Increment frame counter since one game frame completed. */
+            static uint32_t s_game_frames = 0;
+            if (++s_game_frames <= 20u || (s_game_frames % 240u) == 0u) {
+                printf("[CV-GAME] f%u game_frame=%u addPrim=%u\n",
+                       g_ps1_frame, s_game_frames, g_addprim_count);
+                fflush(stdout);
+            }
+        }
+    }
+
     if (s_pump_call_sched_mode & 1) {
         static uint32_t s_pump_sched_before = 0;
         ++s_pump_sched_before;
@@ -8333,6 +8853,28 @@ void cv_display_pump_frame(CPUState* cpu) {
              printf("[CV-TBL] f%u 2ac5=0x%02X 2d80=0x%02X 2d81=0x%02X 2d82=0x%02X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X ta0=0x%08X ta1=0x%08X\n",
                  g_ps1_frame, b2ac5, b2d80, b2d81, b2d82, t0, t1, t2, t3, ta0, ta1);
             fflush(stdout);
+        }
+    }
+
+    /* A664 scheduler gate fix: RAM[0x32CE8 + (slot*4)] is the task-pending table.
+     * When slot 0xA4 (our VSync slot) has a non-zero entry, A664 takes the early
+     * exit path (A6C8→A6E8→A6F0→AA74) instead of calling A110 which processes
+     * callbacks and triggers rendering. On a real PS1, this entry is cleared by
+     * the interrupt handler after the task is dispatched. In our recompiler,
+     * interrupts don't fire, so clear it to allow A110 to be reached. */
+    {
+        uint32_t task_entry = 0;
+        uint32_t task_phys = 0x32CE8u + 0xA4u * 4u;  /* = 0x32F78 */
+        memcpy(&task_entry, &g_ram[task_phys], 4);
+        if (task_entry != 0) {
+            static uint32_t s_task_clears = 0;
+            if (++s_task_clears <= 5u) {
+                printf("[CV-TASK] f%u clearing task[0xA4] = 0x%08X → 0 (enable A110 path)\n",
+                       g_ps1_frame, task_entry);
+                fflush(stdout);
+            }
+            uint32_t zero = 0;
+            memcpy(&g_ram[task_phys], &zero, 4);
         }
     }
 

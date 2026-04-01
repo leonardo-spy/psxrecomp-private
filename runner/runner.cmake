@@ -20,6 +20,9 @@ set(PSXRECOMP_RUNNER_SOURCES
     ${PSXRECOMP_ROOT}/runner/src/spu.cpp
     ${PSXRECOMP_ROOT}/runner/src/input_script.cpp
     ${PSXRECOMP_ROOT}/runner/src/savestate.cpp
+    ${PSXRECOMP_ROOT}/runner/src/debug_server.c
+    ${PSXRECOMP_ROOT}/runner/src/func_logger.c
+    ${PSXRECOMP_ROOT}/runner/src/interp_stub.c
 )
 
 set(PSXRECOMP_RUNNER_INCLUDE_DIRS

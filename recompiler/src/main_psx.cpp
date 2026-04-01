@@ -19,12 +19,19 @@ int main(int argc, char** argv) {
     fmt::print("============================================\n\n");
 
     if (argc < 2) {
-        fmt::print("Usage: {} <PS1-EXE file> [forced_entries.txt]\n", argv[0]);
-        fmt::print("Example: {} SLUS_006.30\n\n", argv[0]);
+        fmt::print("Usage: {} <PS1-EXE file> [--extra-funcs <file>]\n", argv[0]);
+        fmt::print("Example: {} SLUS_006.30\n", argv[0]);
+        fmt::print("         {} SLUS_006.30 --extra-funcs discovered_functions.log\n\n", argv[0]);
         return 0;
     }
 
     std::filesystem::path exe_path = argv[1];
+    const char* extra_funcs_path = nullptr;
+    for (int i = 2; i < argc; i++) {
+        if (std::string(argv[i]) == "--extra-funcs" && i + 1 < argc) {
+            extra_funcs_path = argv[++i];
+        }
+    }
 
     // Parse the PS1-EXE file
     std::string error_msg;
@@ -146,42 +153,30 @@ int main(int argc, char** argv) {
 
     PSXRecomp::FunctionAnalyzer analyzer(*exe);
 
-    // Forced entry points: functions called from runtime but not automatically
-    // detected by the heuristic-based function analysis.
-    // Read from file if provided as second argument, or auto-detect from
-    // "forced_entries.txt" next to the EXE.
-    std::filesystem::path entries_path;
-    if (argc >= 3) {
-        entries_path = argv[2];
-    } else {
-        entries_path = exe_path.parent_path() / "forced_entries.txt";
-    }
+    // Forced entry points: functions called from the dispatch table but not
+    // automatically detected by the heuristic-based function analysis.
+    // These are typically functions without standard prologues or epilogues.
+    // 0x8006B58C: game entrypoint (main boot sequence, called from test harness
+    //             and dispatch table; absorbed into func_8006B4EC without this).
+    analyzer.add_forced_entry(0x8006B58Cu);
 
-    if (std::filesystem::exists(entries_path)) {
-        std::ifstream entries_file(entries_path);
-        std::string line;
-        int count = 0;
-        while (std::getline(entries_file, line)) {
-            // Skip empty lines and comments
-            if (line.empty() || line[0] == '#') continue;
-            // Parse hex address (with or without 0x prefix)
-            uint32_t addr = 0;
-            try {
-                size_t pos = 0;
-                if (line.find("0x") == 0 || line.find("0X") == 0)
-                    addr = static_cast<uint32_t>(std::stoul(line.substr(2), &pos, 16));
-                else
-                    addr = static_cast<uint32_t>(std::stoul(line, &pos, 16));
-            } catch (...) {
-                continue;
+    /* Load extra function addresses from discovered_functions.log */
+    if (extra_funcs_path) {
+        std::ifstream ef(extra_funcs_path);
+        if (ef.is_open()) {
+            std::string line;
+            int extra_count = 0;
+            while (std::getline(ef, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                uint32_t addr = (uint32_t)std::strtoul(line.c_str(), nullptr, 16);
+                if (addr >= 0x80010000u && addr < 0x80200000u) {
+                    analyzer.add_forced_entry(addr);
+                    extra_count++;
+                }
             }
-            if (addr != 0) {
-                analyzer.add_forced_entry(addr);
-                count++;
-            }
-        }
-        if (count > 0) {
-            fmt::print("✓ Loaded {} forced entry points from {}\n", count, entries_path.filename().string());
+            fmt::print("Loaded {} extra function addresses from {}\n", extra_count, extra_funcs_path);
+        } else {
+            fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
         }
     }
 

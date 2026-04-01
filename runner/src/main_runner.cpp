@@ -15,6 +15,8 @@
 #include "opengl_renderer.h"
 #include "gpu_interpreter.h"
 #include "automation.h"
+#include "debug_server.h"
+#include "func_logger.h"
 #include "spu.h"
 #include <GLFW/glfw3.h>
 
@@ -23,10 +25,10 @@ using namespace PS1;
 /* ---------------------------------------------------------------------------
  * Automation globals (declared in automation.h)
  * --------------------------------------------------------------------------- */
-int      g_debug_mode = 0;
-int      g_turbo    = 0;
-uint32_t g_ps1_frame = 0;
-int      g_snap_inject_requested = 0;
+extern "C" int      g_debug_mode = 0;
+extern "C" int      g_turbo    = 0;
+extern "C" uint32_t g_ps1_frame = 0;
+extern "C" int      g_snap_inject_requested = 0;
 static const char* s_script_path  = NULL;
 static const char* s_record_path  = NULL;
 static FILE*       s_record_file  = NULL;
@@ -112,8 +114,9 @@ static void record_tick(uint32_t frame, uint16_t pad, int turbo) {
 }
 
 /* ---------------------------------------------------------------------------
- * Game entry point — dispatched via the compiled function table.
+ * Generated entry point (in generated/tomba_full.c)
  * --------------------------------------------------------------------------- */
+extern "C" void func_8006B58C(CPUState* cpu);
 
 /* ---------------------------------------------------------------------------
  * GPU hook — called by runtime when DMA submits GPU packets.
@@ -123,9 +126,7 @@ static OpenGLRenderer* g_renderer = nullptr;
 static GPUInterpreter* g_gpu      = nullptr;
 
 /* Set to 1 while inside the DrawOTag (FUN_80060B70) OT walker. */
-extern "C" {
-int g_in_drawtag = 0;
-}
+extern "C" int g_in_drawtag = 0;
 
 /* FMV decoder hook — uploads decoded RGB555 frame to VRAM */
 extern "C" void fmv_vram_upload(int x, int y, int w, int h, const uint16_t* data) {
@@ -149,10 +150,7 @@ extern "C" void fmv_force_display_area(int x, int y, int w, int h) {
 extern "C" void gpu_submit_word(uint32_t word) {
     static uint32_t s_word_count = 0;
     ++s_word_count;
-    if (s_word_count <= 12 || (s_word_count % 10000u) == 0u) {
-        printf("[GP0-HIT] count=%u word=0x%08X\n", s_word_count, word);
-        fflush(stdout);
-    }
+    /* [GP0] first 40 — re-enable when investigating GPU command stream */
     if (g_gpu) g_gpu->WriteGP0(word);
 }
 
@@ -171,6 +169,53 @@ extern "C" void gpu_write_gp1(uint32_t cmd) {
     /* [GP1] first 30 — re-enable: if (s_gp1_count <= 30) printf("[GP1] #%u 0x%08X\n", ...); */
     diag_track_gp1(cmd);
     if (g_gpu) g_gpu->WriteGP1(cmd);
+}
+
+/* ---------------------------------------------------------------------------
+ * Debug server GPU state accessors — extern "C" for debug_server.c
+ * --------------------------------------------------------------------------- */
+extern "C" void psx_debug_get_display_area(uint16_t *x, uint16_t *y) {
+    if (!g_gpu) { *x = *y = 0; return; }
+    /* Access through the GPUSTAT and renderer state.
+     * The GPUInterpreter owns the GPUState but it's private.
+     * We use the renderer's cached display area instead. */
+    if (g_renderer) {
+        /* Read the renderer's display_area fields set by SetDisplayArea() */
+        *x = (uint16_t)g_renderer->GetDisplayAreaX();
+        *y = (uint16_t)g_renderer->GetDisplayAreaY();
+    } else {
+        *x = *y = 0;
+    }
+}
+
+extern "C" void psx_debug_get_draw_offset(int16_t *x, int16_t *y) {
+    if (g_renderer) {
+        *x = (int16_t)g_renderer->GetDrawOffsetX();
+        *y = (int16_t)g_renderer->GetDrawOffsetY();
+    } else {
+        *x = *y = 0;
+    }
+}
+
+extern "C" void psx_debug_get_display_mode(uint8_t *h_res, uint8_t *v_res, uint8_t *enable) {
+    /* Defaults */
+    *h_res = 1;   /* 320 */
+    *v_res = 0;   /* 240 */
+    *enable = 0;  /* on */
+}
+
+extern "C" uint32_t psx_debug_get_gpustat(void) {
+    if (g_gpu) return g_gpu->ReadGPUSTAT();
+    return 0;
+}
+
+extern "C" int psx_debug_read_vram(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                    uint16_t *out, int max_pixels) {
+    if (!g_renderer) return 0;
+    int total = (int)w * (int)h;
+    if (total > max_pixels) total = max_pixels;
+    g_renderer->DownloadFromVRAM(x, y, w, h, out);
+    return total;
 }
 
 /* ---------------------------------------------------------------------------
@@ -302,11 +347,19 @@ static void LoadKeyConfig(const char* path) {
 extern "C" void psx_set_pad1(uint16_t buttons);
 
 extern "C" void psx_watchdog_reset(void);
+extern "C" uint32_t g_pre_shot_flush;
 
 extern "C" void psx_present_frame(void) {
     ++g_ps1_frame;
     psx_watchdog_reset();
     static char s_pending_shot[512] = {};
+
+    /* Debug server per-frame integration */
+    debug_server_poll();
+    debug_server_record_frame();
+    debug_server_check_watchpoints();
+    game_post_frame(g_ps1_frame);
+    debug_server_wait_if_paused();
 
     if (!g_renderer) return;
     GLFWwindow* win = (GLFWwindow*)g_renderer->GetWindow();
@@ -353,6 +406,7 @@ extern "C" void psx_present_frame(void) {
                 fflush(stdout);
             }
             xa_audio_shutdown();
+            debug_server_shutdown();
             g_renderer->Shutdown();
             exit(0);
         }
@@ -418,7 +472,6 @@ extern "C" void psx_present_frame(void) {
             char shot[512];
             if (script_wants_screenshot(shot, sizeof(shot)) && g_renderer) {
                 /* Flush pending vertices to VRAM now so Present() blits the full frame. */
-                extern uint32_t g_pre_shot_flush;
                 g_pre_shot_flush = 1;
                 g_renderer->FlushPrimitives();
                 g_pre_shot_flush = 0;
@@ -456,6 +509,12 @@ extern "C" void psx_present_frame(void) {
                     exit(ec);
                 }
             }
+        }
+
+        /* Debug server input override */
+        {
+            int dbg_input = debug_server_get_input_override();
+            if (dbg_input >= 0) pad = (uint16_t)dbg_input;
         }
 
         psx_set_pad1(pad);
@@ -690,6 +749,7 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     const char* exe_path = NULL;
     const char* cue_path = NULL;
     int mmio_trace = 0;
+    int debug_port = 0;  /* 0 = use default (4370) */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--script") && i + 1 < argc) {
             s_script_path = argv[++i];
@@ -703,6 +763,8 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
             s_snap_load_path = argv[++i];
         } else if (!strcmp(argv[i], "--mmio-trace")) {
             mmio_trace = 1;
+        } else if (!strcmp(argv[i], "--debug-port") && i + 1 < argc) {
+            debug_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--debug")) {
             g_debug_mode = 1;
         } else if (!exe_path) {
@@ -790,6 +852,10 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     }
     printf("Renderer ready\n\n");
 
+    /* Initialize debug server */
+    debug_server_init(debug_port);
+    debug_server_set_glfw_window(renderer.GetWindow());
+
     /* Snapshot load — just validate the file exists and is valid; F7 applies it on demand. */
     if (s_snap_load_path) {
         FILE* sf = fopen(s_snap_load_path, "rb");
@@ -826,214 +892,27 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     cpu.sp = 0x801FFF00u;  /* Stack near top of RAM */
     cpu.gp = 0x0u;         /* GP set by game init */
 
-    /* -----------------------------------------------------------------------
-     * SOTN boot: run func_80010EB8 (boot function) via interpreter.
-     *
-     * The interpreter correctly handles BIOS wrappers (jr $t2 → 0xB0),
-     * so file I/O through sim: paths works with our CDROM VFD layer.
-     * func_8001930C (scheduler init) is overridden to return immediately
-     * in psx_override_dispatch, preventing the blocking scheduler loop.
-     *
-     * Boot sequence:
-     *   1. InitHeap, init functions
-     *   2. func_8001930C → returns immediately (overridden)
-     *   3. Open+Read DRA.BIN via BIOS B(0x32/0x34) → CDROM VFD
-     *   4. Open+Read F_MAP.BIN via BIOS B(0x32/0x34) → CDROM VFD
-     *   5. jalr to DRA.BIN entry point
-     *   6. Return
-     * ----------------------------------------------------------------------- */
-    {
-        printf("[BOOT] Running func_80010EB8 via interpreter...\n");
-        fflush(stdout);
-        psx_interpret_from(&cpu, 0x80010EB8u);
-        printf("[BOOT] func_80010EB8 returned.\n");
-        fflush(stdout);
-
-        /* Dump key RAM state after boot */
-        uint8_t* ram = psx_get_ram();
-        uint32_t cb_32ab0 = 0, tbl0_32a24 = 0, mode_32ab4 = 0;
-        memcpy(&cb_32ab0, ram + 0x32AB0, 4);
-        memcpy(&tbl0_32a24, ram + 0x32A24, 4);
-        memcpy(&mode_32ab4, ram + 0x32AB4, 4);
-        printf("[BOOT-STATE] cb=0x%08X tbl0=0x%08X mode=0x%08X\n",
-               cb_32ab0, tbl0_32a24, mode_32ab4);
-
-        /* Check what's at DRA.BIN load address */
-        uint32_t dra_entry = 0;
-        memcpy(&dra_entry, ram + 0x000A0000, 4);
-        printf("[BOOT-STATE] DRA.BIN entry=0x%08X loaded=%s\n",
-               dra_entry, (dra_entry != 0) ? "yes" : "no");
-
-        for (int off = 0; off < 16; off += 4) {
-            uint32_t addr;
-            memcpy(&addr, ram + 0x32A24 + off, 4);
-            printf("[BOOT-STATE] tbl[%d]=0x%08X\n", off/4, addr);
-        }
-        fflush(stdout);
-    }
-
-    {
-        static int s_cv_bootstrap_10dfc = -1;
-        static int s_cv_bootstrap_10dfc_interp = -1;
-        static int s_cv_bootstrap_10eb8 = -1;
-        static int s_cv_bootstrap_10eb8_interp = -1;
-        static int s_cv_bootstrap_10eb8_force_interp = -1;
-        if (s_cv_bootstrap_10dfc < 0) {
-            const char* env = getenv("PSX_CV_BOOTSTRAP_10DFC");
-            s_cv_bootstrap_10dfc = (env && env[0] && env[0] != '0') ? 1 : 0;
-            if (s_cv_bootstrap_10dfc) {
-                printf("[CV-BOOT] bootstrap 0x80010DFC=%d (PSX_CV_BOOTSTRAP_10DFC)\n", s_cv_bootstrap_10dfc);
-                fflush(stdout);
-            }
-        }
-        if (s_cv_bootstrap_10dfc_interp < 0) {
-            const char* env = getenv("PSX_CV_BOOTSTRAP_10DFC_INTERP");
-            s_cv_bootstrap_10dfc_interp = (env && env[0] && env[0] != '0') ? 1 : 0;
-            if (s_cv_bootstrap_10dfc_interp) {
-                printf("[CV-BOOT] bootstrap 0x80010DFC via interpreter=%d (PSX_CV_BOOTSTRAP_10DFC_INTERP)\n", s_cv_bootstrap_10dfc_interp);
-                fflush(stdout);
-            }
-        }
-        if (s_cv_bootstrap_10eb8 < 0) {
-            const char* env = getenv("PSX_CV_BOOTSTRAP_10EB8");
-            s_cv_bootstrap_10eb8 = (env && env[0] && env[0] != '0') ? 1 : 0;
-            if (s_cv_bootstrap_10eb8) {
-                printf("[CV-BOOT] bootstrap 0x80010EB8=%d (PSX_CV_BOOTSTRAP_10EB8)\n", s_cv_bootstrap_10eb8);
-                fflush(stdout);
-            }
-        }
-        if (s_cv_bootstrap_10eb8_interp < 0) {
-            const char* env = getenv("PSX_CV_BOOTSTRAP_10EB8_INTERP");
-            s_cv_bootstrap_10eb8_interp = (env && env[0] && env[0] != '0') ? 1 : 0;
-            if (s_cv_bootstrap_10eb8_interp) {
-                printf("[CV-BOOT] bootstrap 0x80010EB8 via interpreter=%d (PSX_CV_BOOTSTRAP_10EB8_INTERP)\n", s_cv_bootstrap_10eb8_interp);
-                fflush(stdout);
-            }
-        }
-        if (s_cv_bootstrap_10eb8_force_interp < 0) {
-            const char* env = getenv("PSX_CV_BOOTSTRAP_10EB8_FORCE_INTERP");
-            s_cv_bootstrap_10eb8_force_interp = (env && env[0] && env[0] != '0') ? 1 : 0;
-            if (s_cv_bootstrap_10eb8_force_interp) {
-                printf("[CV-BOOT] bootstrap 0x80010EB8 force interpreter=%d (PSX_CV_BOOTSTRAP_10EB8_FORCE_INTERP)\n",
-                       s_cv_bootstrap_10eb8_force_interp);
-                fflush(stdout);
-            }
-        }
-        if (s_cv_bootstrap_10dfc) {
-            printf("[CV-BOOT] Calling bootstrap entry 0x80010DFC...\n");
-            fflush(stdout);
-            if (!psx_dispatch_compiled(&cpu, 0x80010DFCu)) {
-                if (s_cv_bootstrap_10dfc_interp) {
-                    printf("[CV-BOOT] dispatch miss for 0x80010DFC; forcing interpreter fallback\n");
-                    fflush(stdout);
-                    psx_interpret_from(&cpu, 0x80010DFCu);
-                    printf("[CV-BOOT] interpreter fallback 0x80010DFC returned\n");
-                    fflush(stdout);
-                } else {
-                    printf("[CV-BOOT] dispatch miss for 0x80010DFC; trying 0x80010DF4 fallback\n");
-                    fflush(stdout);
-                    if (!psx_dispatch_compiled(&cpu, 0x80010DF4u)) {
-                        printf("[CV-BOOT] fallback dispatch miss for 0x80010DF4; trying interpreter from 0x80010DFC\n");
-                        fflush(stdout);
-                        psx_interpret_from(&cpu, 0x80010DFCu);
-                        printf("[CV-BOOT] interpreter fallback 0x80010DFC returned\n");
-                        fflush(stdout);
-                    } else {
-                        printf("[CV-BOOT] fallback 0x80010DF4 returned\n");
-                        fflush(stdout);
-                    }
-                }
-            }
-            printf("[CV-BOOT] Bootstrap 0x80010DFC returned.\n");
-            fflush(stdout);
-        }
-        if (s_cv_bootstrap_10eb8) {
-            printf("[CV-BOOT] Calling bootstrap entry 0x80010EB8...\n");
-            fflush(stdout);
-            if (s_cv_bootstrap_10eb8_force_interp) {
-                psx_interpret_from(&cpu, 0x80010EB8u);
-                printf("[CV-BOOT] forced interpreter bootstrap 0x80010EB8 returned\n");
-                fflush(stdout);
-            } else if (!psx_dispatch_compiled(&cpu, 0x80010EB8u)) {
-                if (s_cv_bootstrap_10eb8_interp) {
-                    printf("[CV-BOOT] dispatch miss for 0x80010EB8; forcing interpreter fallback\n");
-                    fflush(stdout);
-                    psx_interpret_from(&cpu, 0x80010EB8u);
-                    printf("[CV-BOOT] interpreter fallback 0x80010EB8 returned\n");
-                    fflush(stdout);
-                } else {
-                    printf("[CV-BOOT] dispatch miss for 0x80010EB8; skipping (set PSX_CV_BOOTSTRAP_10EB8_INTERP=1 for fallback)\n");
-                    fflush(stdout);
-                }
-            }
-            printf("[CV-BOOT] Bootstrap 0x80010EB8 returned.\n");
-            fflush(stdout);
-        }
-    }
-
-    /* After boot: CD callbacks are NOT needed because our CD reads are synchronous.
-     * On real PS1, CD-ROM interrupts fire when data is ready, but in our emulation
-     * the data is already loaded to RAM before the callback would run.
-     * 
-     * DRA.BIN sets mode=0x02 (CD loading) during init. Since loading is complete,
-     * force mode=0 (display path) and let the pump loop handle rendering.
-     *
-     * Dump comprehensive state for debugging. */
-    {
-        uint8_t* ram = psx_get_ram();
-        uint32_t cd_cb_aa8 = 0, cd_cb_aa4 = 0;
-        memcpy(&cd_cb_aa8, ram + 0x32AA8, 4);
-        memcpy(&cd_cb_aa4, ram + 0x32AA4, 4);
-
-        printf("[POST-BOOT] State after boot (CD reads were synchronous):\n");
-        printf("  mode=0x%02X tbl[0]=0x%08X AA4=0x%08X AA8=0x%08X\n",
-               ram[0x32D80], *(uint32_t*)(ram + 0x32A24), cd_cb_aa4, cd_cb_aa8);
-        printf("  DispTbl: ");
-        for (int i = 0; i < 8; i++)
-            printf("[%d]=0x%08X ", i, *(uint32_t*)(ram + 0x32A24 + i*4));
-        printf("\n");
-        printf("  CB-Area 32AA0: ");
-        for (int i = 0; i < 8; i++)
-            printf("[%d]=0x%08X ", i, *(uint32_t*)(ram + 0x32AA0 + i*4));
-        printf("\n");
-        printf("  CB-32AB0: 0x%08X  mode_byte: 0x%02X 0x%02X 0x%02X\n",
-               *(uint32_t*)(ram + 0x32AB0), ram[0x32D80], ram[0x32D81], ram[0x32D82]);
-        printf("  OT: 39278=0x%08X 3927C=0x%08X 39280=0x%08X\n",
-               *(uint32_t*)(ram + 0x39278),
-               *(uint32_t*)(ram + 0x3927C),
-               *(uint32_t*)(ram + 0x39280));
-        printf("  RAM[80080000] (F_TITLE0 first 8): ");
-        for (int i = 0; i < 8; i++)
-            printf("%08X ", *(uint32_t*)(ram + 0x80000 + i*4));
-        printf("\n");
-        printf("  DRA.BIN entry (800A0000): 0x%08X\n",
-               *(uint32_t*)(ram + 0xA0000));
-
-        /* Force mode=0 (display path) — CD loading is already complete */
-        if (ram[0x32D80] != 0) {
-            printf("[POST-BOOT] Forcing mode from 0x%02X to 0x00 (display path)\n",
-                   ram[0x32D80]);
-            ram[0x32D80] = 0;
-        }
-
-        /* Skip CD callbacks — data is already in memory, calling them causes
-         * A110 re-entry loops that hang. The pump loop handles rendering. */
-        printf("[POST-BOOT] Skipping CD callbacks (sync reads = data already loaded)\n");
-        fflush(stdout);
-    }
+    /* Run game entry point */
+    printf("Calling func_8006B58C (entry point)...\n");
+    fflush(stdout);
+    func_8006B58C(&cpu);
+    printf("Entry point returned.\n");
+    fflush(stdout);
 
     /* Minimal render loop — present frames until window closed */
     GLFWwindow* win = (GLFWwindow*)renderer.GetWindow();
-
-    /* Castlevania display pump: the recompiled entry (func_80010DF4) exits
-     * immediately because the JAL to func_80019844 was dropped.  Drive the
-     * display callback each frame ourselves so GPU commands are submitted. */
-    printf("[CV-PUMP] Entering display pump loop\n");
-    fflush(stdout);
+    int frame = 0;
     while (win && !glfwWindowShouldClose(win)) {
-        cv_display_pump_frame(&cpu);
-        psx_present_frame();
+        renderer.Present();
+        renderer.VSync();
+        frame++;
+        if (frame <= 5 || frame % 60 == 0) {
+            printf("[frame %d]\n", frame);
+            fflush(stdout);
+        }
     }
 
+    debug_server_shutdown();
     renderer.Shutdown();
+    printf("\nDone. Frames: %d\n", frame);
 }
