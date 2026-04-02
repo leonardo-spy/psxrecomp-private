@@ -114,9 +114,11 @@ static void record_tick(uint32_t frame, uint16_t pad, int turbo) {
 }
 
 /* ---------------------------------------------------------------------------
- * Generated entry point (in generated/tomba_full.c)
+ * Forward declarations for runtime functions used in boot flow
  * --------------------------------------------------------------------------- */
-extern "C" void func_8006B58C(CPUState* cpu);
+extern "C" void psx_interpret_from(CPUState* cpu, uint32_t start_pc);
+extern "C" void cv_display_pump_frame(CPUState* cpu);
+extern "C" uint8_t* psx_get_ram(void);
 
 /* ---------------------------------------------------------------------------
  * GPU hook — called by runtime when DMA submits GPU packets.
@@ -892,24 +894,45 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
     cpu.sp = 0x801FFF00u;  /* Stack near top of RAM */
     cpu.gp = 0x0u;         /* GP set by game init */
 
-    /* Run game entry point */
-    printf("Calling func_8006B58C (entry point)...\n");
-    fflush(stdout);
-    func_8006B58C(&cpu);
-    printf("Entry point returned.\n");
-    fflush(stdout);
+    /* -----------------------------------------------------------------------
+     * SOTN boot: run func_80010EB8 (boot function) via interpreter.
+     *
+     * The interpreter handles BIOS wrappers (jr $t2 → 0xB0),
+     * so file I/O through sim: paths works with our CDROM VFD layer.
+     * Boot loads DRA.BIN, F_MAP.BIN, then jalrs to DRA.BIN entry.
+     * ----------------------------------------------------------------------- */
+    {
+        printf("[BOOT] Running func_80010EB8 via interpreter...\n");
+        fflush(stdout);
+        psx_interpret_from(&cpu, 0x80010EB8u);
+        printf("[BOOT] func_80010EB8 returned.\n");
+        fflush(stdout);
 
-    /* Minimal render loop — present frames until window closed */
+        /* Dump key RAM state after boot */
+        uint8_t* ram = psx_get_ram();
+        uint32_t dra_entry = 0;
+        memcpy(&dra_entry, ram + 0x000A0000, 4);
+        printf("[BOOT-STATE] DRA.BIN entry=0x%08X loaded=%s\n",
+               dra_entry, (dra_entry != 0) ? "yes" : "no");
+
+        /* Force mode=0 (display path) — CD loading is already complete */
+        if (ram[0x32D80] != 0) {
+            printf("[POST-BOOT] Forcing mode from 0x%02X to 0x00 (display path)\n",
+                   ram[0x32D80]);
+            ram[0x32D80] = 0;
+        }
+        fflush(stdout);
+    }
+
+    /* Castlevania display pump loop */
     GLFWwindow* win = (GLFWwindow*)renderer.GetWindow();
+    printf("[CV-PUMP] Entering display pump loop\n");
+    fflush(stdout);
     int frame = 0;
     while (win && !glfwWindowShouldClose(win)) {
-        renderer.Present();
-        renderer.VSync();
+        cv_display_pump_frame(&cpu);
+        psx_present_frame();
         frame++;
-        if (frame <= 5 || frame % 60 == 0) {
-            printf("[frame %d]\n", frame);
-            fflush(stdout);
-        }
     }
 
     debug_server_shutdown();

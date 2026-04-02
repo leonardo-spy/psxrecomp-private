@@ -34,6 +34,9 @@ uint32_t game_get_expected_crc32(void);
  * Used by interpreter-only mode to start execution. */
 uint32_t game_get_entry_point(void);
 
+/* Alias for game_get_entry_point (backward compat) */
+uint32_t game_get_entry_addr(void);
+
 /* Fill game-specific data in the debug frame record.
  * Called each frame from debug_server_record_frame().
  * Cast record to PSXFrameRecord* and write up to 32 bytes into game_data[]. */

@@ -2335,6 +2335,44 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                    g_ps1_frame, s_upd_calls, game_state, sub_state, cpu->ra);
             fflush(stdout);
         }
+        /* Dump the jump table entry for the current game_state to verify dispatch */
+        if (game_state == 8u && sub_state == 6u) {
+            static uint32_t s_jt_dump = 0;
+            if (++s_jt_dump <= 5u) {
+                /* UpdateGame jump table at 0x800DB828 + gs*4 (g_ram offset 0xDB828) */
+                uint32_t jt_base = 0xDB828u; /* 0x800DB828 - 0x80000000 */
+                uint32_t jt_addr = jt_base + game_state * 4;
+                uint32_t jt_val = 0;
+                if (jt_addr + 4 <= 0x200000u) {
+                    memcpy(&jt_val, &g_ram[jt_addr], 4);
+                }
+                /* Also read the gs=8 handler's sub_state switch table */
+                uint32_t sub_jt = 0;
+                uint32_t sub_state_ram = 0;
+                memcpy(&sub_state_ram, &g_ram[0x73060], 4);
+                printf("[UG-JT] f%u gs=%u sub=%u jt_entry[%u]=0x%08X (table@0x800DB828)\n",
+                       g_ps1_frame, game_state, sub_state_ram, game_state, jt_val);
+                fflush(stdout);
+            }
+        }
+        /* Track sub_state changes frame-to-frame for gs=8 */
+        if (game_state == 8u) {
+            static uint32_t s_prev_sub = 0xFFFFFFFF;
+            static uint32_t s_gs8_stuck_count = 0;
+            if (sub_state != s_prev_sub) {
+                printf("[GS8-SUB-CHANGE] f%u sub: %u → %u\n", g_ps1_frame, s_prev_sub, sub_state);
+                fflush(stdout);
+                s_gs8_stuck_count = 0;
+            } else {
+                s_gs8_stuck_count++;
+                if (s_gs8_stuck_count <= 5u || s_gs8_stuck_count == 20u) {
+                    printf("[GS8-SUB-STUCK] f%u sub=%u stuck for %u frames\n",
+                           g_ps1_frame, sub_state, s_gs8_stuck_count);
+                    fflush(stdout);
+                }
+            }
+            s_prev_sub = sub_state;
+        }
         /* When sub_state >= 5, log key values for loading debugging */
         if (sub_state >= 5u && s_upd_calls <= 80u) {
             uint32_t v_978AC = 0, v_6C3B0 = 0, v_3C9A4 = 0, v_bafc_diag = 0, v_c398_diag = 0;
@@ -2588,6 +2626,20 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                     fprintf(stderr, "[OVL-LOAD] done: ok=%d preload=%d\n", ok, is_preload);
 
+                    /* Dump key BSS data that C774 needs */
+                    if (ok) {
+                        uint32_t clut_ptr = 0;
+                        memcpy(&clut_ptr, &g_ram[0x1C1688], 4);
+                        fprintf(stderr, "[OVL-LOAD] After load: RAM[0x801C1688]=0x%08X (CLUT list ptr)\n", clut_ptr);
+                        /* Also check what's at the end of the loaded data (BSS boundary) */
+                        fprintf(stderr, "[OVL-LOAD] overlay end at 0x%08X (0x80180000 + 0x%X)\n",
+                                0x80180000u + e->ovl_size, e->ovl_size);
+                        /* Check if 0x801C1688 is within loaded range */
+                        uint32_t off_1688 = 0x1C1688u - 0x180000u;
+                        fprintf(stderr, "[OVL-LOAD] 0x801C1688 is at ovl offset 0x%X (%s loaded range 0x%X)\n",
+                                off_1688, off_1688 < e->ovl_size ? "WITHIN" : "BEYOND", e->ovl_size);
+                    }
+
                     if (ok && !is_preload) {
                         /* Full overlay switch: update C774/C778/C780 from overlay header */
                         uint32_t hdr[8];
@@ -2617,8 +2669,51 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                             if ((dd & 3) == 3) fprintf(stderr, " ");
                         }
                         fprintf(stderr, "\n");
+
+                        /* Dump first 8 instructions at each overlay function */
+                        uint32_t fn_addrs[3];
+                        memcpy(&fn_addrs[0], &g_ram[0x3C778], 4);
+                        memcpy(&fn_addrs[1], &g_ram[0x3C780], 4);
+                        memcpy(&fn_addrs[2], &g_ram[0x3C774], 4);
+                        const char* fn_names[] = {"C778(init)", "C780(update)", "C774(draw)"};
+                        for (int fi = 0; fi < 3; fi++) {
+                            uint32_t fa = fn_addrs[fi] & 0x1FFFFFFFu;
+                            if (fa >= 0x180000u && fa < 0x200000u) {
+                                fprintf(stderr, "[OVL-CODE] %s at 0x%08X:", fn_names[fi], fn_addrs[fi]);
+                                for (int ii = 0; ii < 8; ii++) {
+                                    uint32_t w = 0;
+                                    memcpy(&w, &g_ram[fa + ii * 4], 4);
+                                    fprintf(stderr, " %08X", w);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
                     }
                     fflush(stderr);
+
+                    /* After loading room overlay, the CLUT list pointer at
+                     * 0x801C1688 (overlay BSS) is zero because room CLUT/tileset
+                     * data isn't loaded from CD (clut_sec/sec3).  C774's search
+                     * function loops forever on a null list.
+                     * Fix: if the CLUT list ptr is NULL, point it at a small
+                     * terminator buffer so the search exits immediately. */
+                    if (ok && !is_preload) {
+                        uint32_t clut_ptr = 0;
+                        memcpy(&clut_ptr, &g_ram[0x1C1688], 4);
+                        if (clut_ptr == 0u) {
+                            /* Place a {0xFFFE, 0xFFFF} terminator at a safe
+                             * address past the overlay end (0x801C4000). */
+                            uint32_t term_addr_phys = 0x1C4000u;
+                            uint16_t term_val = 0xFFFEu;
+                            memcpy(&g_ram[term_addr_phys], &term_val, 2);
+                            term_val = 0xFFFFu;
+                            memcpy(&g_ram[term_addr_phys + 2], &term_val, 2);
+                            uint32_t term_ptr = 0x801C4000u;
+                            memcpy(&g_ram[0x1C1688], &term_ptr, 4);
+                            fprintf(stderr, "[OVL-LOAD] CLUT-FIX: set 0x801C1688 → 0x%08X (terminator)\n",
+                                    term_ptr);
+                        }
+                    }
                 }
 
                 uint32_t zero = 0;
@@ -2697,13 +2792,16 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 fflush(stdout);
             }
             /* Trace prologue C780 key state when gs=8, sub=6 */
-            if (game_state == 8u && s_ug6_log <= 20u) {
+            if (game_state == 8u && s_ug6_log <= 40u) {
                 uint16_t v73414 = 0;
                 memcpy(&v73414, &g_ram[0x73414], 2);
                 uint32_t v733d8 = 0;
                 memcpy(&v733d8, &g_ram[0x733D8], 4);
-                printf("[C780-STATE] f%u RAM[73414]=%04X RAM[733D8]=%08X C9A4=%u\n",
-                       g_ps1_frame, v73414, v733d8, c9a4);
+                /* Also read sub_state from RAM[0x80073060] to see if UpdateGame gs=8 sub is advancing */
+                uint32_t gs8_sub = 0;
+                memcpy(&gs8_sub, &g_ram[0x73060], 4);
+                printf("[C780-STATE] f%u RAM[73060]=%u RAM[73414]=%04X RAM[733D8]=%08X C9A4=%u\n",
+                       g_ps1_frame, gs8_sub, v73414, v733d8, c9a4);
                 fflush(stdout);
             }
         }
@@ -2722,14 +2820,24 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         printf("  0x%08X: %08X\n", 0x800E768Cu + _i*4, instr);
                     }
                 }
-                /* Dump the specific area around the NULL-JALR at 0x800E7664 */
-                printf("[MIPS-DUMP] gs8_case6 0x800E7620 (32 instrs):\n");
-                for (int _i = 0; _i < 32; _i++) {
-                    uint32_t addr = 0xE7620u + _i * 4;
+                /* Dump gs=8 case 6 target at 0x800E7998 (64 instrs) */
+                printf("[MIPS-DUMP] gs8_case6_target 0x800E7998 (64 instrs):\n");
+                for (int _i = 0; _i < 64; _i++) {
+                    uint32_t addr = 0xE7998u + _i * 4;
                     uint32_t instr = 0;
                     if (addr + 4 <= 0x200000u) {
                         memcpy(&instr, &g_ram[addr], 4);
-                        printf("  0x%08X: %08X\n", 0x800E7620u + _i*4, instr);
+                        printf("  0x%08X: %08X\n", 0x800E7998u + _i*4, instr);
+                    }
+                }
+                /* Also dump C774 JALR area at 0x800E7658 (16 instrs) */
+                printf("[MIPS-DUMP] c774_jalr_area 0x800E7658 (16 instrs):\n");
+                for (int _i = 0; _i < 16; _i++) {
+                    uint32_t addr = 0xE7658u + _i * 4;
+                    uint32_t instr = 0;
+                    if (addr + 4 <= 0x200000u) {
+                        memcpy(&instr, &g_ram[addr], 4);
+                        printf("  0x%08X: %08X\n", 0x800E7658u + _i*4, instr);
                     }
                 }
                 /* Dump RAM values that could be function pointers */
@@ -2826,6 +2934,78 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             printf("[UG-SUBCALL] f%u #%u target=0x%08X ra=0x%08X a0=0x%08X\n",
                    g_ps1_frame, s_ugcalls, start_pc, cpu->ra, cpu->a0);
             fflush(stdout);
+        }
+    }
+
+    /* Trace gs=8 handler entry at 0x800E7458 */
+    if (start_pc == 0x800E7458u) {
+        static uint32_t s_gs8h = 0;
+        static int s_c778_called = 0;
+        uint32_t gs8_sub = 0;
+        memcpy(&gs8_sub, &g_ram[0x73060], 4);
+        if (++s_gs8h <= 40u) {
+            printf("[GS8-HANDLER] f%u #%u entry=0x800E7458 sub=%u ra=0x%08X a0=0x%08X\n",
+                   g_ps1_frame, s_gs8h, gs8_sub, cpu->ra, cpu->a0);
+            fflush(stdout);
+            /* One-time dump of the gs=8 handler (64 instructions) */
+            if (s_gs8h == 1u) {
+                printf("[MIPS-DUMP] gs8_real_handler 0x800E7458 (128 instrs):\n");
+                for (int _i = 0; _i < 128; _i++) {
+                    uint32_t addr = 0xE7458u + _i * 4;
+                    uint32_t instr = 0;
+                    if (addr + 4 <= 0x200000u) {
+                        memcpy(&instr, &g_ram[addr], 4);
+                        printf("  0x%08X: %08X\n", 0x800E7458u + _i*4, instr);
+                    }
+                }
+                fflush(stdout);
+            }
+        }
+
+        /* When sub=6, the handler just calls C774 (draw).  But C774 depends on
+         * data initialized by C778 (overlay init) and updated by C780 (overlay
+         * update).  In the original game these are called from the entity system
+         * in MainGame, but our MainGame's guard fires before that code runs.
+         * Inject C778 (once) and C780 (every frame) before the handler proceeds. */
+        if (gs8_sub == 6u) {
+            uint32_t c778 = 0, c780 = 0;
+            memcpy(&c778, &g_ram[0x3C778], 4);
+            memcpy(&c780, &g_ram[0x3C780], 4);
+
+            if (!s_c778_called && c778 != 0u && c778 >= 0x80100000u) {
+                s_c778_called = 1;
+                uint32_t ptr_before = 0;
+                memcpy(&ptr_before, &g_ram[0x1C1688], 4);
+                printf("[GS8-FIX] f%u Calling C778(init) = 0x%08X before C774 draw (0x801C1688=0x%08X)\n",
+                       g_ps1_frame, c778, ptr_before);
+                fflush(stdout);
+                uint32_t save_ra = cpu->ra;
+                uint32_t save_a0 = cpu->a0;
+                mips_interpret(cpu, c778);
+                cpu->ra = save_ra;
+                cpu->a0 = save_a0;
+                uint32_t ptr_after = 0;
+                memcpy(&ptr_after, &g_ram[0x1C1688], 4);
+                printf("[GS8-FIX] f%u C778 done. 0x801C1688: 0x%08X → 0x%08X\n",
+                       g_ps1_frame, ptr_before, ptr_after);
+                fflush(stdout);
+            }
+
+            if (c780 != 0u && c780 >= 0x80100000u) {
+                static uint32_t s_c780_calls = 0;
+                if (++s_c780_calls <= 5u) {
+                    uint32_t ptr_val = 0;
+                    memcpy(&ptr_val, &g_ram[0x1C1688], 4);
+                    printf("[GS8-FIX] f%u Calling C780(update) = 0x%08X (#%u) (0x801C1688=0x%08X)\n",
+                           g_ps1_frame, c780, s_c780_calls, ptr_val);
+                    fflush(stdout);
+                }
+                uint32_t save_ra = cpu->ra;
+                uint32_t save_a0 = cpu->a0;
+                mips_interpret(cpu, c780);
+                cpu->ra = save_ra;
+                cpu->a0 = save_a0;
+            }
         }
     }
 
@@ -3015,9 +3195,23 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
      * in case VSync doesn't fire immediately. 10M instructions is plenty.
      * UpdateGame (0x800E7AEC) is the core per-frame game logic (state machine,
      * entity updates, rendering). Its entity init loops alone need 25K+ compiled
-     * calls, so it also needs a generous guard limit. */
-    if (start_pc == 0x800E3988u || start_pc == 0x800E7AECu) {
+     * calls, so it also needs a generous guard limit.
+     * MainGame runs in a fiber that yields on VSync.  The guard counter is
+     * cumulative across yields (mips_interpret doesn't restart), so it needs
+     * to be essentially unlimited for long play sessions. */
+    if (start_pc == 0x800E3988u) {
+        guard_limit = (uint32_t)INT32_MAX;
+    }
+    if (start_pc == 0x800E7AECu) {
         guard_limit = 10000000u;
+    }
+    /* All DRA.BIN / stage overlay code (≥0x800A0000) dispatched via start_pc
+     * intercept needs a generous guard.  Overlay draw functions (C774) contain
+     * data-scan loops that easily exceed the default 10K iterations.
+     * Exclude MainGame/UpdateGame (already set above). */
+    if (start_pc >= 0x800A0000u && start_pc <= 0x801FFFFFu
+        && start_pc != 0x800E3988u && start_pc != 0x800E7AECu) {
+        guard_limit = 100000u;
     }
     /* DRA.BIN overlay code (≥0x800A0000): the main game function at 0x800E3988
      * is an infinite loop (init + while(1) { frame... }).  The default 10K guard
@@ -3295,10 +3489,21 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         }
                     }
                 }
-                /* Trace JAL calls from UpdateGame (0x800E7AEC) to understand Game_Init path */
+                /* Trace JAL calls from UpdateGame (0x800E7AEC) during gs=8 */
                 if (start_pc == 0x800E7AECu) {
+                    uint32_t gs_jal = 0;
+                    memcpy(&gs_jal, &g_ram[0x3C734], 4);
                     static uint32_t s_ug_jal = 0;
-                    if (++s_ug_jal <= 60u || (s_ug_jal % 480u) == 0u) {
+                    static uint32_t s_ug_jal_gs8 = 0;
+                    ++s_ug_jal;
+                    if (gs_jal == 8u && (++s_ug_jal_gs8 <= 40u)) {
+                        uint32_t sub_jal = 0;
+                        memcpy(&sub_jal, &g_ram[0x73060], 4);
+                        printf("[UG-JAL-GS8] f%u #%u pc=0x%08X → 0x%08X sub=%u depth=%d\n",
+                               g_ps1_frame, s_ug_jal_gs8, pc, target, sub_jal,
+                               interp_call_top - interp_call_base);
+                        fflush(stdout);
+                    } else if (s_ug_jal <= 60u || (s_ug_jal % 480u) == 0u) {
                         printf("[UG-JAL] f%u #%u pc=0x%08X → 0x%08X a0=0x%08X a1=0x%08X\n",
                                g_ps1_frame, s_ug_jal, pc, target, cpu->a0, cpu->a1);
                         fflush(stdout);
@@ -3312,8 +3517,18 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 int needs_start_pc_intercept =
                     target == 0x800E2F34u ||  /* DebugUpdate: force v0=1 */
                     target == 0x800E7AECu ||  /* UpdateGame: overlay loading */
+                    target == 0x800E7458u ||  /* gs=8 handler: trace entry/exit */
                     target == 0x801073C0u ||  /* CD sector loader */
                     target == 0x801073E8u;    /* CD status check */
+                /* Trace overlay function calls (0x80180000+) from any context */
+                if (target >= 0x80180000u && target <= 0x801FFFFFu) {
+                    static uint32_t s_ovl_nc = 0;
+                    if (++s_ovl_nc <= 50u || (s_ovl_nc % 500u) == 0u) {
+                        printf("[OVL-CALL] f%u #%u from=0x%08X → 0x%08X a0=0x%08X ra=0x%08X entry=0x%08X\n",
+                               g_ps1_frame, s_ovl_nc, pc, target, cpu->a0, cpu->ra, start_pc);
+                        fflush(stdout);
+                    }
+                }
                 if (needs_start_pc_intercept) {
                     mips_interpret(cpu, target);
                 } else if (interp_call_top < INTERP_CALL_STACK_MAX) {
@@ -3328,6 +3543,20 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             pc = ret_pc;
         } else {
             /* J / JR $tx — unconditional jump (or fall-through to pc+8) */
+            /* Trace jumps within UpdateGame context during gs=8 */
+            if (start_pc == 0x800E7AECu && target != pc + 8) {
+                static uint32_t s_ug_jr = 0;
+                uint32_t gs_now = 0;
+                memcpy(&gs_now, &g_ram[0x3C734], 4);
+                if (gs_now == 8u && (++s_ug_jr <= 30u)) {
+                    uint32_t sub_now = 0;
+                    memcpy(&sub_now, &g_ram[0x73060], 4);
+                    printf("[UG-JUMP] f%u #%u pc=0x%08X → 0x%08X sub=%u depth=%d\n",
+                           g_ps1_frame, s_ug_jr, pc, target, sub_now,
+                           interp_call_top - interp_call_base);
+                    fflush(stdout);
+                }
+            }
             if (target == pc + 8) {
                 /* Branch not taken (BEQ/BNE etc.) — fall through after delay slot */
                 pc = target;
@@ -3440,15 +3669,20 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     if (start_pc >= 0x800A0000u && start_pc <= 0x801FFFFFu) {
         static uint32_t s_ovl_guard_hit = 0;
         if (++s_ovl_guard_hit <= 20u) {
-            printf("[OVL-GUARD-HIT] #%u entry=0x%08X stuck_pc=0x%08X f%u guard=%u ra=0x%08X v0=0x%08X\n",
-                   s_ovl_guard_hit, start_pc, pc, g_ps1_frame, guard_limit, cpu->ra, cpu->v0);
-            /* Dump 8 instructions at stuck PC */
-            for (int dd = -4; dd < 8; dd++) {
-                uint32_t dpc = pc + (uint32_t)(dd * 4);
-                uint8_t* dp = addr_ptr(dpc);
-                uint32_t di = 0;
-                if (dp) memcpy(&di, dp, 4);
-                printf("  %s 0x%08X: %08X\n", (dd == 0) ? ">>" : "  ", dpc, di);
+            printf("[OVL-GUARD-HIT] #%u entry=0x%08X stuck_pc=0x%08X f%u guard=%u ra=0x%08X v0=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
+                   s_ovl_guard_hit, start_pc, pc, g_ps1_frame, guard_limit, cpu->ra, cpu->v0,
+                   cpu->a0, cpu->a1, cpu->a2, cpu->a3);
+            /* Dump 64 instructions around stuck PC */
+            if (s_ovl_guard_hit <= 3u) {
+                printf("[LOOP-DUMP] 64 instrs starting at 0x%08X:\n", pc - 16);
+                for (int dd = -4; dd < 60; dd++) {
+                    uint32_t dpc = pc + (uint32_t)(dd * 4);
+                    uint8_t* dp = addr_ptr(dpc);
+                    uint32_t di = 0;
+                    if (dp) memcpy(&di, dp, 4);
+                    printf("  %s 0x%08X: %08X\n", (dd == 0) ? ">>" : "  ", dpc, di);
+                }
+                fflush(stdout);
             }
             fflush(stdout);
         }
@@ -4710,7 +4944,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             }
             case 0x3D: {  /* putchar */
                 /* Suppress CD timeout character output */
-                static char s_putchar_buf[32];
+                static char s_putchar_buf[64];
                 static int s_putchar_idx = 0;
                 char c = cpu->a0 & 0xFF;
                 if (c == '\n' || c == '\r') {

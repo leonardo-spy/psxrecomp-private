@@ -14,6 +14,10 @@ uint32_t game_get_entry_addr(void) {
     return (uint32_t)GAME_ENTRY_ADDR;
 }
 
+uint32_t game_get_entry_point(void) {
+    return (uint32_t)GAME_ENTRY_ADDR;
+}
+
 const char *game_get_exe_filename(void) {
     return GAME_EXE_FILENAME;
 }
@@ -37,6 +41,19 @@ int game_handle_arg(const char *key, const char *val) {
 
 const char *game_arg_usage(void) {
     return "";
+}
+
+void game_fill_frame_record(void *record) {
+    (void)record;
+}
+
+int game_handle_debug_cmd(const char *cmd, int id, const char *json) {
+    (void)cmd; (void)id; (void)json;
+    return 0;
+}
+
+void game_post_frame(uint32_t frame_count) {
+    (void)frame_count;
 }
 
 }

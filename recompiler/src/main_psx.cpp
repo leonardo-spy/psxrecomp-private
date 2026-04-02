@@ -156,13 +156,20 @@ int main(int argc, char** argv) {
     // Forced entry points: functions called from the dispatch table but not
     // automatically detected by the heuristic-based function analysis.
     // These are typically functions without standard prologues or epilogues.
-    // 0x8006B58C: game entrypoint (main boot sequence, called from test harness
+    // 0x8006B58C: Tomba game entrypoint (main boot sequence, called from test harness
     //             and dispatch table; absorbed into func_8006B4EC without this).
     analyzer.add_forced_entry(0x8006B58Cu);
 
-    /* Load extra function addresses from discovered_functions.log */
-    if (extra_funcs_path) {
-        std::ifstream ef(extra_funcs_path);
+    /* Load extra function addresses from --extra-funcs or auto-detect forced_entries.txt */
+    const char* funcs_file = extra_funcs_path;
+    std::filesystem::path auto_entries;
+    if (!funcs_file) {
+        auto_entries = exe_path.parent_path() / "forced_entries.txt";
+        if (std::filesystem::exists(auto_entries))
+            funcs_file = auto_entries.string().c_str();
+    }
+    if (funcs_file) {
+        std::ifstream ef(funcs_file);
         if (ef.is_open()) {
             std::string line;
             int extra_count = 0;
@@ -174,9 +181,9 @@ int main(int argc, char** argv) {
                     extra_count++;
                 }
             }
-            fmt::print("Loaded {} extra function addresses from {}\n", extra_count, extra_funcs_path);
+            fmt::print("Loaded {} forced entry points from {}\n", extra_count, funcs_file);
         } else {
-            fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
+            fmt::print("WARNING: Cannot open extra-funcs file: {}\n", funcs_file);
         }
     }
 
