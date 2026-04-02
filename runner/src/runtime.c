@@ -348,6 +348,46 @@ static int is_cdrom_path(const char* path) {
     return 0;
 }
 
+/* Load F_GAME.BIN entity CLUTs from ISO to VRAM left CLUT rect (0,240,256,16).
+ * F_GAME.BIN is 0x42000 bytes; its last 0x2000 bytes are the entity CLUT block.
+ * 0x2000 bytes = 256px × 16 rows × 2 bytes/pixel = perfect fit for (0,240,256,16).
+ * Called once during overlay load. */
+static int s_fgame_cluts_loaded = 0;
+static void cv_load_fgame_cluts(void) {
+    if (s_fgame_cluts_loaded) return;
+    extern void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data);
+
+    uint32_t start_lba = 0, file_size = 0;
+    /* Try BIN/F_GAME.BIN first, then just F_GAME.BIN */
+    int found = psx_cdrom_find_file("BIN/F_GAME.BIN", &start_lba, &file_size);
+    if (!found)
+        found = psx_cdrom_find_file("F_GAME.BIN", &start_lba, &file_size);
+    if (!found) {
+        fprintf(stderr, "[CLUT-FGAME] F_GAME.BIN not found on ISO\n");
+        return;
+    }
+    if (file_size < 0x42000u) {
+        fprintf(stderr, "[CLUT-FGAME] F_GAME.BIN too small: %u bytes (need 0x42000)\n", file_size);
+        return;
+    }
+
+    /* Read the last 0x2000 bytes (4 sectors starting at offset 0x40000) */
+    uint32_t clut_offset = 0x40000u;
+    uint32_t clut_sector = start_lba + (clut_offset / 2048u);
+    uint8_t clut_buf[0x2000];
+    for (int i = 0; i < 4; i++) {
+        if (!psx_cdrom_read_sector(clut_sector + i, clut_buf + i * 2048u)) {
+            fprintf(stderr, "[CLUT-FGAME] Failed to read sector %u\n", clut_sector + i);
+            return;
+        }
+    }
+
+    /* Upload to VRAM left CLUT rect: (0, 240, 256, 16) */
+    psx_vram_upload(0, 240, 256, 16, (const uint16_t *)clut_buf);
+    s_fgame_cluts_loaded = 1;
+    fprintf(stderr, "[CLUT-FGAME] Uploaded F_GAME.BIN entity CLUTs to (0,240,256,16)\n");
+}
+
 /* ---------------------------------------------------------------------------
  * Frame-gated diagnostic logging— fires only during DIAG_FRAME_START..END
  * --------------------------------------------------------------------------- */
@@ -3012,6 +3052,9 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                     fprintf(stderr, "[CLUT-IDS] Initialized D_8003C104 (256 entries)\n");
                 }
+
+                /* Load F_GAME.BIN entity CLUTs to left CLUT rect (0,240,256,16) */
+                cv_load_fgame_cluts();
 
                 /* Upload DRA.BIN default CLUTs to VRAM as FALLBACK only.
                  * Skip if tile CLUT extraction already uploaded stage-accurate
