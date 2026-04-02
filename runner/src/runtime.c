@@ -2553,39 +2553,94 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     fflush(stdout);
                 }
 
-                /* Overlay table structure (from DRA.BIN data at 0x800A3C10):
-                 * Each entry = 0x2C bytes. Entry N at base + N * 0x2C.
-                 * +00: CLUT sector, +04: overlay sector, +08: overlay size,
-                 * +0C: ?, +10: VRAM pos, +14: ?, +18: flags,
-                 * +1C: init, +20: update, +24: cleanup, +28: misc
-                 * Table base = 0xA3C10 (entry 0) verified from entry 0x45 at 0xA481C.
-                 * Table gets cleared by BSS init on frame 1.
-                 * Hardcoded entries from frame-0 dump: */
+                /* Overlay table — full 70-entry table read from DRA.BIN at
+                 * file offset 0x3C40 (runtime 0x800A3C40). Each entry = 0x2C bytes.
+                 * Verified against known entries: ID 3 (prologue), 13 (room), 69 (F_TITLE0). */
                 typedef struct {
-                    uint32_t clut_sec;   /* +00 */
-                    uint32_t ovl_sec;    /* +04 */
-                    uint32_t ovl_size;   /* +08 */
-                    uint32_t sec3;       /* +0C */
-                    uint32_t vram_pos;   /* +10 */
+                    uint32_t clut_sec;   /* +00 CLUT sector on disc */
+                    uint32_t ovl_sec;    /* +04 overlay code start sector */
+                    uint32_t ovl_size;   /* +08 overlay size in bytes */
+                    uint32_t sec3;       /* +0C secondary sector (tileset/room) */
+                    uint32_t vram_pos;   /* +10 VRAM destination */
                     uint32_t unk14;      /* +14 */
                     uint32_t flags;      /* +18 */
-                    uint32_t init;       /* +1C */
-                    uint32_t update;     /* +20 */
-                    uint32_t cleanup;    /* +24 */
+                    uint32_t init;       /* +1C init function pointer */
+                    uint32_t update;     /* +20 update function pointer */
+                    uint32_t cleanup;    /* +24 cleanup function pointer */
                     uint32_t misc;       /* +28 */
                 } OvlEntry;
 
                 static const OvlEntry s_ovl_table[] = {
-                    /* ID 3 (prologue - Richter vs Dracula) */
-                    [3] = { .ovl_sec=0x7766, .ovl_size=0x585C0,
-                            .init=0x800DD150, .update=0x800DD14C, .cleanup=0x800DD148 },
-                    /* ID 0x0D (13, room overlay for prologue) */
-                    [0x0D] = { .clut_sec=0x9415, .ovl_sec=0x94CE, .ovl_size=0x42340,
-                               .sec3=0x9495, .vram_pos=0x1C20,
-                               .init=0x800DD0A0, .update=0x800DD09C, .cleanup=0x800DD094 },
-                    /* ID 0x45 (69, F_TITLE0 - stage select / menu) */
-                    [0x45] = { .ovl_sec=0x754F, .ovl_size=0x56B28,
-                               .init=0x800DCDF4, .update=0x800DCDF0, .cleanup=0x800DD178 },
+                    [0]  = { .clut_sec=0x7E5D, .ovl_sec=0x7F16, .ovl_size=0x5F58C, .sec3=0x7EDD, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x30D, .init=0x800DD180, .update=0x800DD17C, .cleanup=0x800DD178 },
+                    [1]  = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x313, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD168 },
+                    [2]  = { .clut_sec=0x7C0E, .ovl_sec=0x7CBF, .ovl_size=0x552CC, .sec3=0x7C8E, .vram_pos=0x1A20, .unk14=0x16250, .flags=0x309, .init=0x800DD160, .update=0x800DD15C, .cleanup=0x800DD158 },
+                    [3]  = { .clut_sec=0x7849, .ovl_sec=0x7766, .ovl_size=0x585C0, .sec3=0x7817, .vram_pos=0x1A20, .unk14=0x16960, .flags=0x307, .init=0x800DD150, .update=0x800DD14C, .cleanup=0x800DD148 },
+                    [4]  = { .clut_sec=0x813E, .ovl_sec=0x81F6, .ovl_size=0x4FDBC, .sec3=0x81BE, .vram_pos=0x1C20, .unk14=0x19D00, .flags=0x317, .init=0x800DD140, .update=0x800DD13C, .cleanup=0x800DD134 },
+                    [5]  = { .clut_sec=0x7A34, .ovl_sec=0x79BF, .ovl_size=0x2F428, .sec3=0x7A1E, .vram_pos=0x1420, .unk14=0x9420,  .flags=0x319, .init=0x800DD12C, .update=0x800DD128, .cleanup=0x800DD124 },
+                    [6]  = { .clut_sec=0x7B8C, .ovl_sec=0x7AB5, .ovl_size=0x5B404, .sec3=0x7B6C, .vram_pos=0x1A20, .unk14=0xDF10,  .flags=0x305, .init=0x800DD11C, .update=0x800DD118, .cleanup=0x800DD114 },
+                    [7]  = { .clut_sec=0x917F, .ovl_sec=0x9235, .ovl_size=0x53434, .sec3=0x91FF, .vram_pos=0x1C20, .unk14=0x18D10, .flags=0x30F, .init=0x800DD10C, .update=0x800DD108, .cleanup=0x800DD100 },
+                    [8]  = { .clut_sec=0x793E, .ovl_sec=0x78CA, .ovl_size=0x1D46C, .sec3=0x7905, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x325, .init=0x800DD0F8, .update=0x800DD0F4, .cleanup=0x800DD178 },
+                    [9]  = { .clut_sec=0x8400, .ovl_sec=0x84AF, .ovl_size=0x5F85C, .sec3=0x8480, .vram_pos=0x1A20, .unk14=0x151C0, .flags=0x30B, .init=0x800DD0EC, .update=0x800DD0E8, .cleanup=0x800DD0E0 },
+                    [10] = { .clut_sec=0x76E5, .ovl_sec=0x7600, .ovl_size=0x5617C, .sec3=0x76AD, .vram_pos=0x1C20, .unk14=0x19FD0, .flags=0x323, .init=0x800DD0D8, .update=0x800DD0D4, .cleanup=0x800DD0CC },
+                    [11] = { .clut_sec=0x9554, .ovl_sec=0x95DE, .ovl_size=0x3C55C, .sec3=0x95D4, .vram_pos=0x1A20, .unk14=0x28C0,  .flags=0x31B, .init=0x800DD0C4, .update=0x800DD0C0, .cleanup=0x800DD0BC },
+                    [12] = { .clut_sec=0x92DD, .ovl_sec=0x937D, .ovl_size=0x4B780, .sec3=0x935D, .vram_pos=0x1820, .unk14=0xDE90,  .flags=0x32E, .init=0x800DD0B4, .update=0x800DD0B0, .cleanup=0x800DD0A8 },
+                    [13] = { .clut_sec=0x9415, .ovl_sec=0x94CE, .ovl_size=0x42340, .sec3=0x9495, .vram_pos=0x1C20, .unk14=0x1A060, .flags=0x311, .init=0x800DD0A0, .update=0x800DD09C, .cleanup=0x800DD094 },
+                    [14] = { .clut_sec=0x996C, .ovl_sec=0x9A25, .ovl_size=0x14768, .sec3=0x99EC, .vram_pos=0x1C20, .unk14=0x1A060, .flags=0x2FF, .init=0x800DD08C, .update=0x800DD088, .cleanup=0x800DD094 },
+                    [15] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x30D, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [16] = { .clut_sec=0x7E5D, .ovl_sec=0x7F16, .ovl_size=0x5F58C, .sec3=0x7EDD, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x30D, .init=0x800DD180, .update=0x800DD17C, .cleanup=0x800DD178 },
+                    [17] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x30D, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [18] = { .clut_sec=0x9DAA, .ovl_sec=0x9E62, .ovl_size=0x23FCC, .sec3=0x9E2A, .vram_pos=0x1620, .unk14=0x1A610, .flags=0x2FF, .init=0x800DD080, .update=0x800DD07C, .cleanup=0x800DD074 },
+                    [19] = { .clut_sec=0x92DD, .ovl_sec=0x937D, .ovl_size=0x4B780, .sec3=0x935D, .vram_pos=0x1820, .unk14=0xDE90,  .flags=0x32E, .init=0x800DD0B4, .update=0x800DD0B0, .cleanup=0x800DD0A8 },
+                    [20] = { .clut_sec=0x9415, .ovl_sec=0x94CE, .ovl_size=0x42340, .sec3=0x9495, .vram_pos=0x1C20, .unk14=0x1A060, .flags=0x311, .init=0x800DD0A0, .update=0x800DD09C, .cleanup=0x800DD094 },
+                    [21] = { .clut_sec=0x7C0E, .ovl_sec=0x7CBF, .ovl_size=0x552CC, .sec3=0x7C8E, .vram_pos=0x1A20, .unk14=0x16250, .flags=0x309, .init=0x800DD160, .update=0x800DD15C, .cleanup=0x800DD158 },
+                    [22] = { .clut_sec=0xB23A, .ovl_sec=0xB2DA, .ovl_size=0x23460, .sec3=0xB2BA, .vram_pos=0x1A20, .unk14=0xDCE0,  .flags=0x2FF, .init=0x800DD12C, .update=0x800DD070, .cleanup=0x800DD068 },
+                    [23] = { .clut_sec=0xAF3A, .ovl_sec=0xAFF3, .ovl_size=0x1AF70, .sec3=0x7EDD, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x2FF, .init=0x800DD180, .update=0x800DD064, .cleanup=0x800DD178 },
+                    [24] = { .clut_sec=0xACDD, .ovl_sec=0xAD91, .ovl_size=0x516E8, .sec3=0xAD5D, .vram_pos=0x1820, .unk14=0x17AB0, .flags=0x2FF, .init=0x800DD0C4, .update=0x800DD060, .cleanup=0x800DD058 },
+                    [25] = { .clut_sec=0xABD1, .ovl_sec=0xAC71, .ovl_size=0x35630, .sec3=0xAC51, .vram_pos=0x1A20, .unk14=0xDF10,  .flags=0x2FF, .init=0x800DD11C, .update=0x800DD054, .cleanup=0x800DD114 },
+                    [26] = { .clut_sec=0xAA76, .ovl_sec=0xAB26, .ovl_size=0x54E38, .sec3=0xAAF6, .vram_pos=0x1420, .unk14=0x162F0, .flags=0x2FF, .init=0x800DD170, .update=0x800DD050, .cleanup=0x800DD048 },
+                    [27] = { .clut_sec=0xA956, .ovl_sec=0xAA0E, .ovl_size=0x33530, .sec3=0xA9D6, .vram_pos=0x1A20, .unk14=0x19850, .flags=0x2FF, .init=0x800DD0EC, .update=0x800DD044, .cleanup=0x800DD03C },
+                    [28] = { .clut_sec=0xA854, .ovl_sec=0xA8E7, .ovl_size=0x36934, .sec3=0xA8D4, .vram_pos=0x1A20, .unk14=0x70F0,  .flags=0x2FF, .init=0x800DD0D8, .update=0x800DD038, .cleanup=0x800DD030 },
+                    [29] = { .clut_sec=0xA737, .ovl_sec=0xA7EE, .ovl_size=0x323BC, .sec3=0xA7B7, .vram_pos=0x1020, .unk14=0x19E70, .flags=0x2FF, .init=0x800DD150, .update=0x800DD02C, .cleanup=0x800DD024 },
+                    [30] = { .clut_sec=0xA5E2, .ovl_sec=0xA699, .ovl_size=0x4E5B4, .sec3=0xA662, .vram_pos=0x1420, .unk14=0x19D50, .flags=0x2FF, .init=0x800DD140, .update=0x800DD020, .cleanup=0x800DD018 },
+                    [31] = { .clut_sec=0x9044, .ovl_sec=0x90F9, .ovl_size=0x425C4, .sec3=0x90C4, .vram_pos=0x1220, .unk14=0x18BC0, .flags=0x321, .init=0x800DD010, .update=0x800DD00C, .cleanup=0x800DD004 },
+                    [32] = { .clut_sec=0x89C4, .ovl_sec=0x8A7B, .ovl_size=0x54B8C, .sec3=0x8A44, .vram_pos=0x1C20, .unk14=0x19170, .flags=0x338, .init=0x800DCFFC, .update=0x800DCFF4, .cleanup=0x800DCFEC },
+                    [33] = { .clut_sec=0x8B26, .ovl_sec=0x8BDC, .ovl_size=0x380E0, .sec3=0x8BA6, .vram_pos=0x1A20, .unk14=0x18E40, .flags=0x338, .init=0x800DCFE4, .update=0x800DCFDC, .cleanup=0x800DCFD4 },
+                    [34] = { .clut_sec=0x88BE, .ovl_sec=0x8960, .ovl_size=0x31430, .sec3=0x893E, .vram_pos=0x1A20, .unk14=0xEE70,  .flags=0x301, .init=0x800DCFCC, .update=0x800DCFC4, .cleanup=0x800DCFBC },
+                    [35] = { .clut_sec=0x8570, .ovl_sec=0x860E, .ovl_size=0x43EAC, .sec3=0x85F0, .vram_pos=0x1A20, .unk14=0xCA30,  .flags=0x303, .init=0x800DCFB4, .update=0x800DCFAC, .cleanup=0x800DCFA4 },
+                    [36] = { .clut_sec=0x8C4E, .ovl_sec=0x8D01, .ovl_size=0x4C9D8, .sec3=0x8CCE, .vram_pos=0x1C20, .unk14=0x170E0, .flags=0x338, .init=0x800DCF9C, .update=0x800DCF94, .cleanup=0x800DCF8C },
+                    [37] = { .clut_sec=0x8697, .ovl_sec=0x8737, .ovl_size=0x2AB20, .sec3=0x8717, .vram_pos=0x1620, .unk14=0xE020,  .flags=0x319, .init=0x800DCF84, .update=0x800DCF7C, .cleanup=0x800DCF74 },
+                    [38] = { .clut_sec=0x878E, .ovl_sec=0x882C, .ovl_size=0x48338, .sec3=0x880E, .vram_pos=0x1820, .unk14=0xC820,  .flags=0x301, .init=0x800DCF6C, .update=0x800DCF64, .cleanup=0x800DCF5C },
+                    [39] = { .clut_sec=0x8D9C, .ovl_sec=0x8E3C, .ovl_size=0x4A52C, .sec3=0x8E1C, .vram_pos=0x1A20, .unk14=0xDF40,  .flags=0x338, .init=0x800DCF54, .update=0x800DCF4C, .cleanup=0x800DCF44 },
+                    [40] = { .clut_sec=0x9658, .ovl_sec=0x970F, .ovl_size=0x2D3D4, .sec3=0x96D8, .vram_pos=0x1420, .unk14=0x19E50, .flags=0x325, .init=0x800DCF3C, .update=0x800DCF34, .cleanup=0x800DCF2C },
+                    [41] = { .clut_sec=0x8ED2, .ovl_sec=0x8F87, .ovl_size=0x5DC14, .sec3=0x8F52, .vram_pos=0x1A20, .unk14=0x185D0, .flags=0x301, .init=0x800DCF24, .update=0x800DCF1C, .cleanup=0x800DCF14 },
+                    [42] = { .clut_sec=0x976B, .ovl_sec=0x980F, .ovl_size=0x39390, .sec3=0x97EB, .vram_pos=0x1A20, .unk14=0xF9C0,  .flags=0x315, .init=0x800DCF0C, .update=0x800DCF04, .cleanup=0x800DCEFC },
+                    [43] = { .clut_sec=0x9883, .ovl_sec=0x9908, .ovl_size=0x3111C, .sec3=0x9903, .vram_pos=0x1A20, .unk14=0x6F0,   .flags=0x31B, .init=0x800DCEF4, .update=0x800DCEEC, .cleanup=0x800DCEE4 },
+                    [44] = { .clut_sec=0x9A4F, .ovl_sec=0x9B02, .ovl_size=0x44BA8, .sec3=0x9ACF, .vram_pos=0x1C20, .unk14=0x17430, .flags=0x338, .init=0x800DCEDC, .update=0x800DCED4, .cleanup=0x800DCECC },
+                    [45] = { .clut_sec=0x9B8D, .ovl_sec=0x9C44, .ovl_size=0x3FB60, .sec3=0x9C0D, .vram_pos=0x1C20, .unk14=0x19350, .flags=0x338, .init=0x800DCEC4, .update=0x800DCEBC, .cleanup=0x800DCEB4 },
+                    [46] = { .clut_sec=0x9CC5, .ovl_sec=0x9D7C, .ovl_size=0x166E8, .sec3=0x9D45, .vram_pos=0x1C20, .unk14=0x19350, .flags=0x2FF, .init=0x800DCEAC, .update=0x800DCEA4, .cleanup=0x800DCEB4 },
+                    [47] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [48] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [49] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [50] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [51] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [52] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [53] = { .clut_sec=0x9B8D, .ovl_sec=0x9C44, .ovl_size=0x3FB60, .sec3=0x9C0D, .vram_pos=0x1C20, .unk14=0x19350, .flags=0x338, .init=0x800DCEC4, .update=0x800DCEBC, .cleanup=0x800DCEB4 },
+                    [54] = { .clut_sec=0xB88F, .ovl_sec=0xB93F, .ovl_size=0x275BC, .sec3=0xB90F, .vram_pos=0x1420, .unk14=0x16750, .flags=0x2FF, .init=0x800DCFB4, .update=0x800DCE9C, .cleanup=0x800DCE94 },
+                    [55] = { .clut_sec=0xB791, .ovl_sec=0xB848, .ovl_size=0x22CEC, .sec3=0xB811, .vram_pos=0x1020, .unk14=0x19F60, .flags=0x2FF, .init=0x800DCF9C, .update=0x800DCE8C, .cleanup=0x800DCE84 },
+                    [56] = { .clut_sec=0xB671, .ovl_sec=0xB727, .ovl_size=0x34044, .sec3=0xB6F1, .vram_pos=0x1820, .unk14=0x18910, .flags=0x2FF, .init=0x800DCF3C, .update=0x800DCE7C, .cleanup=0x800DCE74 },
+                    [57] = { .clut_sec=0xB517, .ovl_sec=0xB5C7, .ovl_size=0x54408, .sec3=0xB597, .vram_pos=0x1420, .unk14=0x162F0, .flags=0x2FF, .init=0x800DCF24, .update=0x800DCE6C, .cleanup=0x800DD048 },
+                    [58] = { .clut_sec=0xB415, .ovl_sec=0xB4CA, .ovl_size=0x25C24, .sec3=0xB495, .vram_pos=0x1420, .unk14=0x18C30, .flags=0x2FF, .init=0x800DCFE4, .update=0x800DCE64, .cleanup=0x800DCE5C },
+                    [59] = { .clut_sec=0xB322, .ovl_sec=0xB3D3, .ovl_size=0x20630, .sec3=0xB3A2, .vram_pos=0x1220, .unk14=0x16E90, .flags=0x2FF, .init=0x800DCF6C, .update=0x800DCE54, .cleanup=0x800DCE4C },
+                    [60] = { .clut_sec=0xB125, .ovl_sec=0xB1DB, .ovl_size=0x2E948, .sec3=0xB1A5, .vram_pos=0x1420, .unk14=0x191E0, .flags=0x2FF, .init=0x800DCF84, .update=0x800DCE44, .cleanup=0x800DCE3C },
+                    [61] = { .clut_sec=0xB02A, .ovl_sec=0xB0E0, .ovl_size=0x21F60, .sec3=0xB0AA, .vram_pos=0x1020, .unk14=0x193E0, .flags=0x2FF, .init=0x800DCEDC, .update=0x800DCE34, .cleanup=0x800DCE2C },
+                    [62] = { .clut_sec=0xAE35, .ovl_sec=0xAEEA, .ovl_size=0x274DC, .sec3=0xAEB5, .vram_pos=0x1420, .unk14=0x18D60, .flags=0x2FF, .init=0x800DCF0C, .update=0x800DCE24, .cleanup=0x800DCE1C },
+                    [63] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
+                    [64] = { .clut_sec=0x7D6F, .ovl_sec=0x7E28, .ovl_size=0x19E94, .sec3=0x7DEF, .vram_pos=0x1820, .unk14=0x1A700, .flags=0x34B, .init=0x800DCE14, .update=0x800DCE10, .cleanup=0x800DD178 },
+                    [65] = { .clut_sec=0x8297, .ovl_sec=0x834F, .ovl_size=0x57E18, .sec3=0x8317, .vram_pos=0x1C20, .unk14=0x19AD0, .flags=0x30F, .init=0x800DCE08, .update=0x800DCE04, .cleanup=0x800DCDFC },
+                    [66] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD11C, .update=0x800DD118, .cleanup=0x800DD168 },
+                    [67] = { .clut_sec=0x7C0E, .ovl_sec=0x7CBF, .ovl_size=0x552CC, .sec3=0x7C8E, .vram_pos=0x1A20, .unk14=0x16250, .flags=0x338, .init=0x800DD160, .update=0x800DD15C, .cleanup=0x800DD158 },
+                    [68] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD168 },
+                    [69] = { .clut_sec=0x74B6, .ovl_sec=0x754F, .ovl_size=0x56B28, .sec3=0x7516, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x0,   .init=0x800DCDF4, .update=0x800DCDF0, .cleanup=0x800DD178 },
                 };
 
                 /* If BAFC looks like an overlay ID (low byte), try loading.
@@ -3005,6 +3060,23 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 mips_interpret(cpu, c780);
                 cpu->ra = save_ra;
                 cpu->a0 = save_a0;
+
+                /* After C778 init + several C780 update frames, the entity
+                 * system should have initialized enough state.  In the real
+                 * game, C9A4 reaches 5+ which causes sub_state to advance
+                 * 6→7.  Our interpreter can't run enough iterations for that,
+                 * so force the transition after a warmup period. */
+                if (s_c780_calls >= 8u) {
+                    uint32_t sub_now = 0;
+                    memcpy(&sub_now, &g_ram[0x73060], 4);
+                    if (sub_now == 6u) {
+                        uint32_t new_sub = 7u;
+                        memcpy(&g_ram[0x73060], &new_sub, 4);
+                        printf("[GS8-FIX] f%u Forced sub_state 6→7 (after %u C780 calls)\n",
+                               g_ps1_frame, s_c780_calls);
+                        fflush(stdout);
+                    }
+                }
             }
         }
     }
@@ -3295,6 +3367,19 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 fflush(stdout);
             }
         }
+        /* Bail out if PC is outside valid PS1 RAM (2MB physical) */
+        {
+            uint32_t pc_phys = pc & 0x1FFFFFFFu;
+            if (pc_phys >= 0x200000u) {
+                static uint32_t s_bad_pc_hits = 0;
+                if (++s_bad_pc_hits <= 10u) {
+                    printf("[BAD-PC] #%u entry=0x%08X pc=0x%08X f%u guard=%d ra=0x%08X\n",
+                           s_bad_pc_hits, start_pc, pc, g_ps1_frame, guard, cpu->ra);
+                    fflush(stdout);
+                }
+                interp_call_top = interp_call_base; return;
+            }
+        }
         uint32_t instr = cpu->read_word(pc);
         int  is_link = 0, is_jr31 = 0;
         uint32_t target = 0;
@@ -3342,7 +3427,11 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             return;
         }
 
-        if (target == 0 || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)) {
+        /* Reject targets outside valid PS1 RAM (2MB physical) or null */
+        uint32_t tgt_phys = target & 0x1FFFFFFFu;
+        if (target == 0
+            || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)
+            || (target >= 0x80000000u && tgt_phys >= 0x200000u)) {
             if (trace_cv_interp) {
                 static uint32_t s_cv_null_target = 0;
                 if (++s_cv_null_target <= 30u) {
@@ -7061,6 +7150,26 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                        g_ps1_frame, s_timer_calls, cpu->v0, cpu->ra);
                 fflush(stdout);
             }
+            return 1;
+        }
+
+        /* func_8001930C — CD init retry loop.
+         * Calls func_80019464(1) up to 5 times; if it returns v0==1 (success),
+         * runs init functions and returns 1.  Each call to func_80019464 costs
+         * ~102K interpreter iterations because the underlying hardware-level
+         * CD controller init (CdInit / CdReset) spins waiting for PS1 CD-ROM
+         * register responses that our emulator does not produce.
+         *
+         * Our VFD layer already provides CD file I/O — the hardware-level init
+         * is unnecessary.  Override: skip the retry loop and return success. */
+        case 0x8001930Cu: {
+            static uint32_t s_930c_calls = 0;
+            if (++s_930c_calls <= 5u) {
+                printf("[CD-INIT-SKIP] f%u #%u func_8001930C → v0=1 (skip CD HW init)\n",
+                       g_ps1_frame, s_930c_calls);
+                fflush(stdout);
+            }
+            cpu->v0 = 1u;
             return 1;
         }
 
