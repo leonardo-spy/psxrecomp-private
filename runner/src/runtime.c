@@ -494,7 +494,7 @@ static void watchdog_check(uint32_t addr, int width) {
 #define DIAG_FRAME_END   4385
 /* DIAG window disabled — was freezing game at frame ~4382 during normal play.
  * Re-enable by restoring: (g_ps1_frame >= DIAG_FRAME_START && g_ps1_frame <= DIAG_FRAME_END) */
-#define DIAG_ENABLED() 0
+#define DIAG_ENABLED() (g_ps1_frame >= 95 && g_ps1_frame <= 100)
 
 /* Entity loop (FUN_8001dfd4) s0/s1 save — protects caller's registers */
 static uint32_t g_entity_saved_s0, g_entity_saved_s1;
@@ -1250,6 +1250,7 @@ static void write_word(uint32_t addr, uint32_t value) {
 
     /* ---- MMIO hardware intercepts (addr_ptr returned NULL) ---- */
     extern void gpu_submit_word(uint32_t w);
+    extern void gpu_abort_streaming(void);
     mmio_trace("W", addr, value, 32);
 
     /* Interrupt Status — writing 0 to a bit acknowledges it */
@@ -1371,6 +1372,11 @@ static void write_word(uint32_t addr, uint32_t value) {
                     uint8_t* pw = addr_ptr(ptr + 4u + wi * 4u);
                     if (pw) { uint32_t w; memcpy(&w, pw, 4); gpu_submit_word(w); gp0_total++; }
                 }
+                /* Abort any CPUToVRAM streaming between OT entries — on real
+                 * hardware each linked-list node is a separate DMA block, and
+                 * any CPUToVRAM data would arrive via block-mode DMA, not from
+                 * subsequent OT entries. */
+                gpu_abort_streaming();
                 uint32_t nxt = hdr & 0xFFFFFFu;
                 if (nxt == 0xFFFFFFu || nxt == 0u) break;
                 ptr = nxt | 0x80000000u;
@@ -1400,6 +1406,31 @@ static void write_word(uint32_t addr, uint32_t value) {
                     dptr = dnxt | 0x80000000u;
                 }
                 printf("\n");
+                fflush(stdout);
+            }
+            /* Dump OT contents for diagnostic frames (95-100) even for large OTs */
+            if (DIAG_ENABLED() && gp0_total > 32u) {
+                uint32_t dptr = s_dma2_madr | 0x80000000u;
+                printf("[GP0-DIAG] f%u OT=0x%08X gp0=%u links=%u:\n", g_ps1_frame, s_dma2_madr, gp0_total, ll_count);
+                int entry_i = 0;
+                for (int dl = 0; dl < 65536 && entry_i < 30; dl++) {
+                    uint8_t* dph = addr_ptr(dptr);
+                    if (!dph) break;
+                    uint32_t dhdr; memcpy(&dhdr, dph, 4);
+                    uint8_t dcnt = (uint8_t)(dhdr >> 24);
+                    if (dcnt > 0) {
+                        printf("  [%d] @0x%08X cnt=%u:", entry_i, dptr, dcnt);
+                        for (uint8_t dwi = 0; dwi < dcnt && dwi < 12; dwi++) {
+                            uint8_t* dpw = addr_ptr(dptr + 4u + dwi * 4u);
+                            if (dpw) { uint32_t dw; memcpy(&dw, dpw, 4); printf(" %08X", dw); }
+                        }
+                        printf("\n");
+                    }
+                    entry_i++;
+                    uint32_t dnxt = dhdr & 0xFFFFFFu;
+                    if (dnxt == 0xFFFFFFu || dnxt == 0u) break;
+                    dptr = dnxt | 0x80000000u;
+                }
                 fflush(stdout);
             }
         } else if ((value & 0x01000000u) && sync == 1u && dir == 0u) {
@@ -2547,6 +2578,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             memcpy(&v_c3b0, &g_ram[0x6C3B0], 4);
             if (v_c398 != 0u || v_bafc != 0u) {
                 static uint32_t s_autoclear = 0;
+                int tile_cluts_uploaded = 0; /* set when tile CLUT extraction succeeds */
                 if (++s_autoclear <= 40u) {
                     printf("[LOAD-AUTOCLEAR] f%u #%u gs=%u sub=%u BAFC=0x%08X C398=0x%08X C3B0=0x%08X -> clearing\n",
                            g_ps1_frame, s_autoclear, game_state, sub_state, v_bafc, v_c398, v_c3b0);
@@ -2746,6 +2778,200 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                     fflush(stderr);
 
+                    /* -------------------------------------------------------
+                     * CLUT / tile-graphics upload to VRAM
+                     *
+                     * The "clut_sec" sectors contain raw 16-bit pixel data
+                     * (4bpp tile graphics) that must be uploaded to the GPU
+                     * VRAM texture area.  On real hardware, the game's overlay
+                     * init function reads these sectors via CdRead and uploads
+                     * them with LoadImage.  Since our CD path is incomplete,
+                     * we do the upload directly here.
+                     *
+                     * VRAM layout (SOTN):
+                     *   Rows   0-239: Framebuffers (double-buffered 320/256×240)
+                     *   Row  240-255: CLUT palettes (16-color tables, 16bpp)
+                     *   Rows 256-511: Tile/sprite graphics (4bpp / 8bpp)
+                     *
+                     * All observed textured primitives reference tpage=(15,1)
+                     * = VRAM (960, 256) at 4-bit depth.
+                     *
+                     * Upload strategy:
+                     *   128 sectors = 262144 bytes = 131072 x 16-bit pixels
+                     *   → RECT {512, 256, 512, 256} covers right half of
+                     *     bottom VRAM area where tpage 8..15 reside.
+                     * ------------------------------------------------------- */
+                    if (ok && e->clut_sec != 0) {
+                        extern void gpu_submit_word(uint32_t w);
+
+                        /* Compute number of CLUT sectors.
+                         * When clut_sec < sec3:  data = clut_sec..sec3-1
+                         * When sec3 < clut_sec:  use 128 sectors (default) */
+                        uint32_t clut_sectors = 128u;
+                        if (e->clut_sec < e->sec3) {
+                            clut_sectors = e->sec3 - e->clut_sec;
+                        }
+                        if (clut_sectors > 256u) clut_sectors = 256u;
+
+                        /* Allocate a temp buffer for the raw pixel data */
+                        uint32_t clut_bytes = clut_sectors * 2048u;
+                        uint8_t *clut_buf = (uint8_t *)malloc(clut_bytes);
+                        if (clut_buf) {
+                            int clut_ok = 1;
+                            for (uint32_t ci = 0; ci < clut_sectors; ci++) {
+                                if (!psx_cdrom_read_sector(e->clut_sec + ci, clut_buf + ci * 2048u)) {
+                                    fprintf(stderr, "[VRAM-UPLOAD] FAILED reading CLUT sector %u\n",
+                                            e->clut_sec + ci);
+                                    clut_ok = 0; break;
+                                }
+                            }
+
+                            if (clut_ok) {
+                                /* Decode vram_pos: high byte / 2 = start tpage */
+                                uint16_t start_tpage = ((e->vram_pos >> 8) & 0xFF) / 2;
+                                uint16_t vram_x_base = start_tpage * 64;
+                                uint16_t tile_width  = 1024 - vram_x_base;
+                                if (tile_width > 512) tile_width = 512;
+                                fprintf(stderr, "[VRAM-POS] vram_pos=0x%04X → tpage=%u x=%u w=%u\n",
+                                        e->vram_pos, start_tpage, vram_x_base, tile_width);
+
+                                /* ----- SOTN Stage Graphics Upload -----
+                                 * Per SOTN decomp (47BB8.c LoadStageTileset + LoadFileSimToMem):
+                                 *
+                                 * The disc file at clut_sec is 0x42000 bytes (132 sectors):
+                                 *   - First 0x40000 bytes (128 sectors): 32 tile blocks
+                                 *     Each block is 32×128 VRAM pixels (0x2000 bytes).
+                                 *     Scatter-uploaded using D_800AC958 lookup table.
+                                 *   - Last 0x2000 bytes (4 sectors): CLUT palette data
+                                 *     Uploaded to VRAM (512, 240, 256, 16).
+                                 *
+                                 * The scatter pattern fills tpages 8-15 (X=512-1023):
+                                 *   Block i: X = 512 + (i/4)*64 + (i%2)*32
+                                 *            Y = base_y + ((i&2) ? 128 : 0)
+                                 */
+                                extern void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data);
+
+                                /* --- 1. Scatter-upload 32 tile blocks --- */
+                                uint16_t tile_base_y = 256;
+                                uint32_t tile_data_bytes = 32u * 0x2000u; /* 262144 bytes */
+                                int blocks_uploaded = 0;
+                                if (clut_bytes >= tile_data_bytes) {
+                                    for (int ti = 0; ti < 32; ti++) {
+                                        uint16_t tx = 512 + (ti / 4) * 64 + (ti % 2) * 32;
+                                        uint16_t ty = (ti & 2) ? tile_base_y + 128 : tile_base_y;
+                                        uint8_t *block = clut_buf + ti * 0x2000;
+                                        psx_vram_upload(tx, ty, 32, 128, (const uint16_t *)block);
+                                        blocks_uploaded++;
+                                    }
+                                } else {
+                                    /* Fewer than 128 sectors — upload as many full blocks as possible */
+                                    uint32_t avail_blocks = clut_bytes / 0x2000u;
+                                    for (uint32_t ti = 0; ti < avail_blocks && ti < 32; ti++) {
+                                        uint16_t tx = 512 + (ti / 4) * 64 + (ti % 2) * 32;
+                                        uint16_t ty = (ti & 2) ? tile_base_y + 128 : tile_base_y;
+                                        uint8_t *block = clut_buf + ti * 0x2000;
+                                        psx_vram_upload(tx, ty, 32, 128, (const uint16_t *)block);
+                                        blocks_uploaded++;
+                                    }
+                                }
+                                fprintf(stderr, "[TILE-SCATTER] f%u ovl=%u: %d blocks uploaded to tpages 8-15 (Y=%u)\n",
+                                        g_ps1_frame, ovl_id, blocks_uploaded, tile_base_y);
+
+                                /* --- 2. Extract embedded CLUT palettes from tile blocks ---
+                                 *
+                                 * Per SOTN decomp (47BB8.c LoadStageTileset):
+                                 * When tiles load to Y=0, blocks with (i&2) go to Y=128,
+                                 * covering VRAM rows 128-255. Rows 240-255 (the last 16
+                                 * rows of each block) ARE the CLUT palette data — they
+                                 * land directly in the VRAM CLUT area at Y=240.
+                                 *
+                                 * Since we upload tiles to Y=256 (for tpage compatibility),
+                                 * these CLUT rows end up at Y=496 instead of Y=240.
+                                 * Fix: extract rows 112-127 from each Y+128 block and
+                                 * upload them separately to VRAM (X, 240, 32, 16).
+                                 *
+                                 * Only blocks with X=512-736 contribute to the RIGHT CLUT
+                                 * rect at D_800ACDB8 (512, 240, 256, 16). That's blocks
+                                 * 2,3,6,7,10,11,14,15 — 8 blocks × 32px = 256px width.
+                                 */
+                                {
+                                    int clut_blocks = 0;
+                                    for (int ti = 0; ti < 32; ti++) {
+                                        if (!(ti & 2)) continue; /* only Y=base+128 blocks */
+                                        uint16_t tx = 512 + (ti / 4) * 64 + (ti % 2) * 32;
+                                        if (tx >= 768) continue; /* only RIGHT CLUT rect X range */
+                                        if ((uint32_t)(ti + 1) * 0x2000u > clut_bytes) break;
+
+                                        /* Row 112 of the 128-row block = where Y=240 starts */
+                                        uint8_t *block = clut_buf + ti * 0x2000;
+                                        uint8_t *clut_rows = block + 112 * 64; /* 64 B/row = 32px × 2B */
+                                        psx_vram_upload(tx, 240, 32, 16, (const uint16_t *)clut_rows);
+                                        clut_blocks++;
+                                    }
+                                    if (clut_blocks > 0) {
+                                        tile_cluts_uploaded = 1;
+                                        fprintf(stderr, "[CLUT-TILE] f%u ovl=%u: extracted CLUTs from %d tile blocks "
+                                                "to VRAM (512-736, 240-255)\n",
+                                                g_ps1_frame, ovl_id, clut_blocks);
+                                        /* Dump block[2] palette row 0 (X=512,Y=240) for verification */
+                                        if (clut_bytes >= 3 * 0x2000u) {
+                                            uint16_t *p0 = (uint16_t *)(clut_buf + 2 * 0x2000 + 112 * 64);
+                                            fprintf(stderr, "[CLUT-TILE-PAL0]: %04X %04X %04X %04X %04X %04X %04X %04X\n",
+                                                    p0[0], p0[1], p0[2], p0[3], p0[4], p0[5], p0[6], p0[7]);
+                                        }
+                                    } else {
+                                        fprintf(stderr, "[CLUT-TILE] f%u ovl=%u: no CLUT blocks extracted "
+                                                "(tile data too small?)\n", g_ps1_frame, ovl_id);
+                                    }
+                                }
+
+                                /* --- 3. Test palette injection ---
+                                 * When enabled, upload a vivid test palette to the CLUT
+                                 * positions that game primitives reference (544,240 = pal#2
+                                 * and 560,240 = pal#3). This helps verify whether missing
+                                 * CLUTs are the cause of invisible tile rendering. */
+                                if (getenv("PSX_CV_TEST_PALETTE")) {
+                                    uint16_t test_pal[16] = {
+                                        0x0000, /* 0: transparent */
+                                        0x801F, /* 1: red */
+                                        0x83E0, /* 2: green */
+                                        0xFC00, /* 3: blue */
+                                        0x83FF, /* 4: yellow */
+                                        0xFC1F, /* 5: magenta */
+                                        0xFFE0, /* 6: cyan */
+                                        0xFFFF, /* 7: white */
+                                        0x8421, /* 8: dark gray */
+                                        0x94A5, /* 9: medium gray */
+                                        0xAD6B, /* 10: light gray */
+                                        0xC631, /* 11: lighter gray */
+                                        0xD6B5, /* 12: near-white */
+                                        0x8C00, /* 13: dark blue */
+                                        0x801F, /* 14: red variant */
+                                        0xFBDE, /* 15: bright */
+                                    };
+                                    /* Upload to CLUT positions 0-15 (each palette = one 16-pixel row) */
+                                    for (int pi = 0; pi < 16; pi++) {
+                                        psx_vram_upload(512 + pi * 16, 240, 16, 1, test_pal);
+                                    }
+                                    /* Also fill rows 1-15 (Y=241-255) for CLUT references with Y>240 */
+                                    for (int row = 1; row < 16; row++) {
+                                        for (int pi = 0; pi < 16; pi++) {
+                                            psx_vram_upload(512 + pi * 16, 240 + row, 16, 1, test_pal);
+                                        }
+                                    }
+                                    fprintf(stderr, "[TEST-PAL] f%u: injected test palette to all CLUT positions\n",
+                                            g_ps1_frame);
+                                }
+
+                                fprintf(stderr, "[VRAM-UPLOAD] f%u ovl=%u complete\n",
+                                        g_ps1_frame, ovl_id);
+                            }
+                            free(clut_buf);
+                        } else {
+                            fprintf(stderr, "[VRAM-UPLOAD] malloc(%u) failed!\n", clut_bytes);
+                        }
+                    }
+
                     /* After loading room overlay, the CLUT list pointer at
                      * 0x801C1688 (overlay BSS) is zero because room CLUT/tileset
                      * data isn't loaded from CD (clut_sec/sec3).  C774's search
@@ -2767,6 +2993,48 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                             memcpy(&g_ram[0x1C1688], &term_ptr, 4);
                             fprintf(stderr, "[OVL-LOAD] CLUT-FIX: set 0x801C1688 → 0x%08X (terminator)\n",
                                     term_ptr);
+                        }
+                    }
+                }
+
+                /* Initialize g_ClutIds (D_8003C104): when SIM data isn't loaded,
+                 * this array defaults to 0 → entities reference CLUT(0,0) which
+                 * reads framebuffer as palette.  Fill with sequential CLUT
+                 * coordinates covering VRAM (512,240)-(767,255) = 256 palettes.
+                 * Layout: 16 palettes/row × 16 rows = 256 entries. */
+                {
+                    uint32_t clut_base = 0x3C104u; /* D_8003C104 physical */
+                    for (int ci = 0; ci < 256; ci++) {
+                        uint16_t cx = (uint16_t)(512 + (ci % 16) * 16);
+                        uint16_t cy = (uint16_t)(240 + (ci / 16));
+                        uint16_t clut_id = (uint16_t)((cy << 6) | (cx >> 4));
+                        memcpy(&g_ram[clut_base + ci * 2], &clut_id, 2);
+                    }
+                    fprintf(stderr, "[CLUT-IDS] Initialized D_8003C104 (256 entries)\n");
+                }
+
+                /* Upload DRA.BIN default CLUTs to VRAM as FALLBACK only.
+                 * Skip if tile CLUT extraction already uploaded stage-accurate
+                 * palettes from the loaded tile data blocks. */
+                if (!tile_cluts_uploaded) {
+                    extern void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data);
+                    uint32_t dra_clut_phys = 0xD8994u; /* 0x800D8994 physical */
+                    if (dra_clut_phys + 16 * 32 <= sizeof(g_ram)) {
+                        uint16_t pal_buf[16 * 16]; /* 16 palettes × 16 colors */
+                        memcpy(pal_buf, &g_ram[dra_clut_phys], 16 * 32);
+                        /* Verify first palette looks valid (entry[1] should have STP bit) */
+                        if (pal_buf[1] & 0x8000) {
+                            for (int row = 0; row < 16; row++) {
+                                for (int pi = 0; pi < 16; pi++) {
+                                    psx_vram_upload(512 + pi * 16, 240 + row, 16, 1,
+                                                    &pal_buf[pi * 16]);
+                                }
+                            }
+                            fprintf(stderr, "[CLUT-DRA] Uploaded 16 DRA.BIN default palettes "
+                                    "to VRAM (512,240)-(752,255)\n");
+                        } else {
+                            fprintf(stderr, "[CLUT-DRA] DRA.BIN palette data not valid "
+                                    "(pal[0][1]=0x%04X)\n", pal_buf[1]);
                         }
                     }
                 }
@@ -7794,7 +8062,62 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         }
         case 0x80016940u: { static uint32_t s_ff = 0; ++s_ff; /* [TRACE] FUN_80016940 (frame-flip) */ break; }
         case 0x80060C10u: { static uint32_t s_c10 = 0; ++s_c10; /* [GPU-Q] first 10 — re-enable printf when investigating GPU queue */ break; }
-        case 0x80060624u: { static uint32_t s_624 = 0; if (++s_624 <= 10) { printf("[TRACE] FUN_80060624 (LoadImage) call #%u a0=0x%08X a1=0x%08X\n", s_624, cpu->a0, cpu->a1); fflush(stdout); } break; }
+        case 0x80060624u: {
+            /* ---------------------------------------------------------------
+             * LoadImage override  (PS1 GPU library)
+             * a0 = pointer to RECT {x, y, w, h} (4 x int16)
+             * a1 = pointer to pixel data (16-bit pixels packed as 32-bit words)
+             *
+             * Sends GP0(A0h) CPU→VRAM copy command sequence.
+             * --------------------------------------------------------------- */
+            extern void gpu_submit_word(uint32_t w);
+            uint8_t* rect_ptr = addr_ptr(cpu->a0);
+            uint8_t* data_ptr = addr_ptr(cpu->a1);
+            if (!rect_ptr || !data_ptr) {
+                static uint32_t s_624_null = 0;
+                if (++s_624_null <= 5)
+                    printf("[LoadImage] NULL ptr a0=0x%08X a1=0x%08X\n", cpu->a0, cpu->a1);
+                cpu->v0 = 0;
+                return 1;
+            }
+            int16_t rx, ry, rw, rh;
+            memcpy(&rx, rect_ptr + 0, 2);
+            memcpy(&ry, rect_ptr + 2, 2);
+            memcpy(&rw, rect_ptr + 4, 2);
+            memcpy(&rh, rect_ptr + 6, 2);
+
+            static uint32_t s_624 = 0;
+            if (++s_624 <= 30) {
+                printf("[LoadImage] #%u f%u rect=(%d,%d,%d,%d) data=0x%08X\n",
+                       s_624, g_ps1_frame, rx, ry, rw, rh, cpu->a1);
+                fflush(stdout);
+            }
+
+            /* Clamp to valid VRAM range */
+            uint16_t dx = (uint16_t)rx & 0x3FF;
+            uint16_t dy = (uint16_t)ry & 0x1FF;
+            uint16_t dw = (uint16_t)rw; if (dw == 0) dw = 0x400;
+            uint16_t dh = (uint16_t)rh; if (dh == 0) dh = 0x200;
+            if (dx + dw > 1024) dw = 1024 - dx;
+            if (dy + dh > 512)  dh = 512 - dy;
+
+            /* GP0(A0h) — CPU to VRAM copy */
+            gpu_submit_word(0xA0000000u);
+            gpu_submit_word(((uint32_t)dy << 16) | (uint32_t)dx);
+            gpu_submit_word(((uint32_t)dh << 16) | (uint32_t)dw);
+
+            /* Send pixel data: each 32-bit word = 2 x 16-bit pixels */
+            uint32_t num_pixels = (uint32_t)dw * (uint32_t)dh;
+            uint32_t num_words = (num_pixels + 1) / 2;
+            for (uint32_t i = 0; i < num_words; i++) {
+                uint32_t w;
+                memcpy(&w, data_ptr + i * 4, 4);
+                gpu_submit_word(w);
+            }
+
+            cpu->v0 = 0; /* success */
+            return 1;
+        }
         case 0x80060EF0u: { static uint32_t s_ef0 = 0; if (++s_ef0 <= 5) { printf("[TRACE] FUN_80060EF0 (GPU dispatch) call #%u\n", s_ef0); fflush(stdout); } break; }
         case 0x80067E84u: break; /* [TRACE] FUN_80067E84 (IRQ disable B) */
         case 0x8005DFD8u: {

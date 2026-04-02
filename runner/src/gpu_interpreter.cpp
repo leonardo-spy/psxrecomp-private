@@ -456,6 +456,13 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
             // First vertex: CLUT info
             if (i == 0) {
                 ExtractCLUT(tex_word, verts[i].clut_x, verts[i].clut_y);
+                /* Remap CLUT(0,0) → CLUT(544,240): g_ClutIds (D_8003C104) defaults
+                 * to 0 when SIM data isn't loaded, causing entities to read
+                 * framebuffer origin as palette. Redirect to standard CLUT area. */
+                if (verts[i].clut_x == 0 && verts[i].clut_y == 0) {
+                    verts[i].clut_x = 544;
+                    verts[i].clut_y = 240;
+                }
                 verts[i].has_clut = true;
                 verts[i].has_texpage = false;
             }
@@ -479,6 +486,27 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
 
     // Build draw state
     DrawState draw_state = BuildDrawState(gouraud, textured, semi_transparent, raw_texture);
+
+    // DIAG: Log textured polygon texture page + CLUT references during peak rendering
+    if (textured && g_ps1_frame >= 95 && g_ps1_frame <= 100) {
+        static uint32_t s_tex_log = 0;
+        static uint32_t s_tex_log_frame = 0;
+        if (g_ps1_frame != s_tex_log_frame) { s_tex_log = 0; s_tex_log_frame = g_ps1_frame; }
+        if (++s_tex_log <= 30) {
+            printf("[TEX-REF] f%u #%u cmd=0x%02X quad=%d gouraud=%d",
+                   g_ps1_frame, s_tex_log, opcode, quad, gouraud);
+            if (verts[0].has_clut)
+                printf(" clut=(%d,%d)", verts[0].clut_x, verts[0].clut_y);
+            if (num_verts > 1 && verts[1].has_texpage)
+                printf(" tpage=(%d,%d,depth=%d)", verts[1].texpage_x, verts[1].texpage_y, verts[1].texpage_depth);
+            printf(" rgb=(%d,%d,%d) xy=(%d,%d)-(%d,%d)",
+                   verts[0].r, verts[0].g, verts[0].b,
+                   verts[0].x, verts[0].y, verts[1].x, verts[1].y);
+            for (int vi = 0; vi < num_verts; vi++)
+                printf(" uv%d=(%d,%d)", vi, verts[vi].u, verts[vi].v);
+            printf("\n"); fflush(stdout);
+        }
+    }
 
     // Log semi-transparent non-textured quads — catch the screen-darkening subtractive blend.
     // Only log the first 20 unique occurrences to avoid spam.
@@ -661,6 +689,7 @@ void GPUInterpreter::HandleGP0Rectangle(const uint32_t* params) {
         uint32_t tex_word = params[param_idx++];
         ExtractUV(tex_word, u, v);
         ExtractCLUT(tex_word, clut_x, clut_y);
+        if (clut_x == 0 && clut_y == 0) { clut_x = 544; clut_y = 240; }
     }
 
     // Extract width and height
@@ -863,6 +892,19 @@ void GPUInterpreter::HandleDrawMode(uint32_t cmd) {
     state.draw_mode.texture_disable = (cmd >> 12) & 1;
     state.draw_mode.h_flip = (cmd >> 13) & 1;
 
+    // DIAG: Log E1h draw mode during peak frames
+    if (g_ps1_frame >= 93 && g_ps1_frame <= 95) {
+        static uint32_t s_e1_log = 0;
+        if (++s_e1_log <= 40) {
+            int tpx = state.draw_mode.texpage_x_base * 64;
+            int tpy = (state.draw_mode.texpage_y_base | (state.draw_mode.texpage_y_base_bit1 << 1)) * 256;
+            printf("[E1] f%u tpage(%d,%d) depth=%d semi=%d cmd=0x%08X\n",
+                   g_ps1_frame, tpx, tpy, state.draw_mode.texture_depth,
+                   state.draw_mode.semi_transparency, cmd);
+            fflush(stdout);
+        }
+    }
+
     // Update renderer state
     if (renderer) {
         renderer->SetDrawMode(state.draw_mode);
@@ -886,6 +928,11 @@ void GPUInterpreter::HandleDrawingAreaTopLeft(uint32_t cmd) {
     state.drawing_area.x1 = cmd & 0x3FF;
     state.drawing_area.y1 = (cmd >> 10) & 0x3FF;
 
+    static uint32_t s_e3_count = 0; ++s_e3_count;
+    if (s_e3_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
+        printf("[GP0:E3] #%u f%u draw_area TL=(%d,%d)\n", s_e3_count, g_ps1_frame,
+               state.drawing_area.x1, state.drawing_area.y1);
+
     if (renderer) {
         renderer->SetDrawingArea(state.drawing_area);
     }
@@ -896,8 +943,10 @@ void GPUInterpreter::HandleDrawingAreaBottomRight(uint32_t cmd) {
     state.drawing_area.x2 = cmd & 0x3FF;
     state.drawing_area.y2 = (cmd >> 10) & 0x3FF;
 
-    static uint32_t s_da_count = 0; ++s_da_count;
-    /* [GP0:E3/E4] first 20 — re-enable: if (s_da_count <= 20) printf("[GP0:E3/E4] DrawArea TL...", ...); */
+    static uint32_t s_e4_count = 0; ++s_e4_count;
+    if (s_e4_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
+        printf("[GP0:E4] #%u f%u draw_area BR=(%d,%d)\n", s_e4_count, g_ps1_frame,
+               state.drawing_area.x2, state.drawing_area.y2);
 
     if (renderer) {
         renderer->SetDrawingArea(state.drawing_area);
@@ -914,6 +963,10 @@ void GPUInterpreter::HandleDrawingOffset(uint32_t cmd) {
 
     state.drawing_offset.x = x;
     state.drawing_offset.y = y;
+
+    static uint32_t s_e5_count = 0; ++s_e5_count;
+    if (s_e5_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
+        printf("[GP0:E5] #%u f%u draw_offset=(%d,%d)\n", s_e5_count, g_ps1_frame, x, y);
 
     if (renderer) {
         renderer->SetDrawingOffset(state.drawing_offset);
@@ -995,10 +1048,10 @@ void GPUInterpreter::HandleGP1DisplayAreaStart(uint32_t param) {
     state.display_control.display_area_y = (param >> 10) & 0x1FF;
 
     static uint32_t s_gp1_05_count = 0;
-    /* [GP1:05] first 20 + every 300 + frame window — re-enable when investigating display area:
-       if (++s_gp1_05_count <= 20 || s_gp1_05_count % 300 == 0 || (g_ps1_frame >= 1670 && g_ps1_frame <= 1690))
-           printf("[GP1:05] #%u f%u display_area=(%d,%d)\n", s_gp1_05_count, g_ps1_frame, ...); */
     ++s_gp1_05_count;
+    if (s_gp1_05_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
+        printf("[GP1:05] #%u f%u display_area=(%d,%d)\n", s_gp1_05_count, g_ps1_frame,
+               state.display_control.display_area_x, state.display_control.display_area_y);
 
     if (renderer) {
         renderer->SetDisplayArea(state.display_control.display_area_x,

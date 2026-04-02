@@ -731,6 +731,7 @@ void OpenGLRenderer::ClearTextureCache() {
 void OpenGLRenderer::SetDisplayArea(int x, int y) {
     display_area_x_ = x;
     display_area_y_ = y;
+    display_area_set_ = true;
 }
 
 void OpenGLRenderer::SetDisplayMode(int width, int height, bool is_24bit, bool interlace) {
@@ -828,10 +829,10 @@ void OpenGLRenderer::Present() {
     // Step 5: Render the active PS1 framebuffer to the window.
     // Samples only the visible_w × visible_h region from VRAM (overscan excluded).
     //
-    // If display_area_y_ is still 0 (GP1(05h) not yet received), fall back to
+    // If display area has never been set via GP1(05h), fall back to
     // showing the full VRAM so there's always something on screen.
     float u0, v0, u1, v1;
-    if (display_area_y_ == 0 && display_area_x_ == 0) {
+    if (!display_area_set_) {
         // Full VRAM fallback
         u0 = 0.0f; v0 = 0.0f; u1 = 1.0f; v1 = 1.0f;
     } else {
@@ -1749,14 +1750,33 @@ void OpenGLRenderer::FlushPrimitives() {
         glBindTexture(GL_TEXTURE_2D, 0);
         vram_read_dirty_ = false;
         /* DIAG: probe terrain CLUT positions at key frames */
-        if (g_ps1_frame == 4248 || g_ps1_frame == 4410) {
-            auto probe = [&](int cx, int cy) {
-                const uint16_t* p = vram_pixels_ + cy * 1024 + cx;
-                printf("[CLUT2] f%u (%d,%d): %04X %04X %04X %04X\n",
-                       g_ps1_frame, cx, cy, p[0], p[1], p[2], p[3]);
-                fflush(stdout);
-            };
-            probe(144, 492); probe(160, 481); probe(288, 484);
+        if (g_ps1_frame >= 95 && g_ps1_frame <= 100) {
+            static uint32_t s_clut_probe_frame = 0;
+            if (g_ps1_frame != s_clut_probe_frame) {
+                s_clut_probe_frame = g_ps1_frame;
+                auto probe = [&](int cx, int cy, const char* label) {
+                    const uint16_t* p = vram_pixels_ + cy * 1024 + cx;
+                    printf("[CLUT-PROBE] f%u %s (%d,%d): %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X\n",
+                           g_ps1_frame, label, cx, cy,
+                           p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                           p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+                    fflush(stdout);
+                };
+                probe(0, 0, "FB-origin");
+                probe(544, 240, "CLUT-544-240");
+                probe(560, 240, "CLUT-560-240");
+                probe(544, 246, "CLUT-544-246");
+                /* Also probe tile data at tpage 15 origin */
+                auto tile_probe = [&](int tx, int ty) {
+                    const uint16_t* p = vram_pixels_ + ty * 1024 + tx;
+                    printf("[TILE-PROBE] f%u (%d,%d): %04X %04X %04X %04X %04X %04X %04X %04X\n",
+                           g_ps1_frame, tx, ty,
+                           p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
+                    fflush(stdout);
+                };
+                tile_probe(960, 256);  /* tpage 15 origin */
+                tile_probe(960, 260);  /* a few rows in */
+            }
         }
     }
 
@@ -1946,17 +1966,14 @@ void OpenGLRenderer::SaveVRAMDumpBMP(const char* path) {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo_);
     glReadPixels(0, 0, 1024, 512, GL_RGB, GL_UNSIGNED_BYTE, buf);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    // Row flip + PNG encode + disk write on background thread.
-    std::string spath(path);
-    std::thread([buf, spath]() {
-        uint8_t* flipped = new uint8_t[1024 * 512 * 3];
-        for (int y = 0; y < 512; y++)
-            memcpy(flipped + y * 1024 * 3, buf + (511 - y) * 1024 * 3, 1024 * 3);
-        delete[] buf;
-        stbi_write_png(spath.c_str(), 1024, 512, 3, flipped, 1024 * 3);
-        delete[] flipped;
-        printf("[AutoVRAM] saved %s\n", spath.c_str());
-    }).detach();
+    // Row flip + PNG encode (synchronous to ensure file is saved before exit).
+    uint8_t* flipped = new uint8_t[1024 * 512 * 3];
+    for (int y = 0; y < 512; y++)
+        memcpy(flipped + y * 1024 * 3, buf + (511 - y) * 1024 * 3, 1024 * 3);
+    delete[] buf;
+    stbi_write_png(path, 1024, 512, 3, flipped, 1024 * 3);
+    delete[] flipped;
+    printf("[AutoVRAM] saved %s\n", path);
 }
 
 } // namespace PS1

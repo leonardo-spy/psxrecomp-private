@@ -160,6 +160,13 @@ extern "C" void gpu_abort_streaming(void) {
     if (g_gpu) g_gpu->AbortStreaming();
 }
 
+/* Direct VRAM upload — bypasses GP0 command pipeline entirely.
+ * Used for overlay tile/CLUT data that must not interfere with
+ * active GPU streaming state. */
+extern "C" void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data) {
+    if (g_renderer) g_renderer->UploadToVRAM(x, y, w, h, data);
+}
+
 
 extern "C" uint32_t gpu_read_word(void) {
     if (g_gpu) return g_gpu->ReadGPUREAD();
@@ -706,8 +713,19 @@ extern "C" void psx_present_frame(void) {
         s_f7_prev = f7;
     }
 
-    /* Auto-save diagnostic screenshots at two fixed points only (frame 300 and 900).
-     * Avoids repeating glReadPixels stalls that dropped FPS to 18-19 every 10 seconds. */
+    /* Auto-save diagnostic screenshots at key rendering milestones. */
+    if (g_ps1_frame == 95) {
+        g_renderer->SaveScreenshotBMP("C:/temp/game_shot_peak.png");
+        g_renderer->SaveVRAMDumpBMP("C:/temp/game_vram_peak.png");
+        printf("[DIAG] Saved peak-rendering screenshot at f95\n");
+        fflush(stdout);
+    }
+    if (g_ps1_frame == 135) {
+        g_renderer->SaveScreenshotBMP("C:/temp/game_shot_postdrop.png");
+        g_renderer->SaveVRAMDumpBMP("C:/temp/game_vram_postdrop.png");
+        printf("[DIAG] Saved post-drop screenshot at f135\n");
+        fflush(stdout);
+    }
     if (g_ps1_frame == 300) {
         g_renderer->SaveScreenshotBMP("C:/temp/game_shot_01.png");
         g_renderer->SaveVRAMDumpBMP("C:/temp/game_vram.png");
@@ -740,6 +758,16 @@ extern "C" void psx_present_frame(void) {
     if (g_ps1_frame == 5000) {
         g_renderer->SaveScreenshotBMP("C:/temp/game_shot_05.png");
         fflush(stdout);
+    }
+    /* TEMP: auto-exit after screenshots captured */
+    if (g_ps1_frame == 100) {
+        g_renderer->SaveScreenshotBMP("C:/temp/game_shot_f100.png");
+        g_renderer->SaveVRAMDumpBMP("C:/temp/game_vram_f100.png");
+        printf("[DIAG] Saved screenshots at f100\n");
+        printf("[DIAG] Auto-exit at frame 100\n");
+        fflush(stdout);
+        GLFWwindow* ew = (GLFWwindow*)g_renderer->GetWindow();
+        if (ew) glfwSetWindowShouldClose(ew, 1);
     }
 }
 
