@@ -564,15 +564,7 @@ extern "C" void psx_present_frame(void) {
     /* Window screenshot: taken AFTER Present() so the front buffer holds the
      * just-blitted frame.  SaveScreenshotBMP reads GL_FRONT explicitly. */
     if (s_pending_shot[0] != '\0') {
-        /* Route .ppm screenshots to synchronous SaveScreenshot() for reliability;
-         * SaveScreenshotBMP uses an async thread that can fail if the process
-         * exits/crashes shortly after the screenshot trigger. */
-        size_t len = strlen(s_pending_shot);
-        if (len > 4 && strcmp(s_pending_shot + len - 4, ".ppm") == 0) {
-            g_renderer->SaveScreenshot(s_pending_shot);
-        } else {
-            g_renderer->SaveScreenshotBMP(s_pending_shot);
-        }
+        g_renderer->SaveScreenshotBMP(s_pending_shot);
         s_pending_shot[0] = '\0';
     }
 

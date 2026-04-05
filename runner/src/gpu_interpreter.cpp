@@ -463,12 +463,6 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
                     verts[i].clut_x = 544;
                     verts[i].clut_y = 240;
                 }
-                /* Left→Right CLUT remap: primitives referencing left-side CLUTs
-                 * (x<256) with valid palette row (y=240..255) are shifted to the
-                 * right-side stage CLUT area by adding 512 to x. */
-                else if (verts[i].clut_x < 256 && verts[i].clut_y >= 240 && verts[i].clut_y <= 255) {
-                    verts[i].clut_x += 512;
-                }
                 verts[i].has_clut = true;
                 verts[i].has_texpage = false;
             }
@@ -696,8 +690,6 @@ void GPUInterpreter::HandleGP0Rectangle(const uint32_t* params) {
         ExtractUV(tex_word, u, v);
         ExtractCLUT(tex_word, clut_x, clut_y);
         if (clut_x == 0 && clut_y == 0) { clut_x = 544; clut_y = 240; }
-        /* Left→Right CLUT remap for rectangles */
-        else if (clut_x < 256 && clut_y >= 240 && clut_y <= 255) { clut_x += 512; }
     }
 
     // Extract width and height

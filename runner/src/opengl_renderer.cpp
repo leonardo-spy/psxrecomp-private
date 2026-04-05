@@ -583,6 +583,25 @@ void OpenGLRenderer::FillRectangle(int x, int y, int w, int h, uint16_t color) {
 
 void OpenGLRenderer::UploadToVRAM(int x, int y, int w, int h, const uint16_t* data) {
     if (!opengl_initialized_) {
+        // Capture pre-init CPU-to-VRAM transfers in the CPU mirror.
+        // When OpenGL initializes later, vram_texture_ is seeded from
+        // vram_pixels_, so any uploads missed here would leave the GPU
+        // texture zeroed and produce wrong rendered output.
+        bool wraps = ((x + w) > 1024) || ((y + h) > 512);
+        if (!wraps) {
+            for (int dy = 0; dy < h; dy++)
+                for (int dx = 0; dx < w; dx++)
+                    vram_pixels_[(y + dy) * 1024 + (x + dx)] = data[dy * w + dx];
+        } else {
+            for (int row = 0; row < h; row++) {
+                int vy = (y + row) & 511;
+                const uint16_t* row_data = data + row * w;
+                for (int col = 0; col < w; col++) {
+                    int vx = (x + col) & 1023;
+                    vram_pixels_[vy * 1024 + vx] = row_data[col];
+                }
+            }
+        }
         return;
     }
 
@@ -620,6 +639,13 @@ void OpenGLRenderer::UploadToVRAM(int x, int y, int w, int h, const uint16_t* da
 
 void OpenGLRenderer::DownloadFromVRAM(int x, int y, int w, int h, uint16_t* data) {
     if (!opengl_initialized_) {
+        // Fall back to CPU mirror when OpenGL is not yet ready.
+        if (x >= 1024 || y >= 512) return;
+        if (x + w > 1024) w = 1024 - x;
+        if (y + h > 512) h = 512 - y;
+        for (int dy = 0; dy < h; dy++)
+            for (int dx = 0; dx < w; dx++)
+                data[dy * w + dx] = vram_pixels_[(y + dy) * 1024 + (x + dx)];
         return;
     }
 
@@ -645,6 +671,15 @@ void OpenGLRenderer::DownloadFromVRAM(int x, int y, int w, int h, uint16_t* data
 
 void OpenGLRenderer::CopyVRAM(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
     if (!opengl_initialized_) {
+        // CPU-only copy with PS1 wrapping semantics.
+        if (w <= 0 || h <= 0) return;
+        std::vector<uint16_t> tmp(static_cast<size_t>(w) * h);
+        for (int dy = 0; dy < h; dy++)
+            for (int dx = 0; dx < w; dx++)
+                tmp[dy * w + dx] = vram_pixels_[((src_y + dy) & 511) * 1024 + ((src_x + dx) & 1023)];
+        for (int dy = 0; dy < h; dy++)
+            for (int dx = 0; dx < w; dx++)
+                vram_pixels_[((dst_y + dy) & 511) * 1024 + ((dst_x + dx) & 1023)] = tmp[dy * w + dx];
         return;
     }
 
@@ -1680,8 +1715,8 @@ void OpenGLRenderer::ApplyDrawingArea() {
     // OpenGL scissor uses bottom-left origin with y=gl_FragCoord.y. No flip needed.
     int x = drawing_area_.x1;
     int y = drawing_area_.y1;        // VRAM Y maps directly to gl_FragCoord.y
-    int width = drawing_area_.x2 - drawing_area_.x1;
-    int height = drawing_area_.y2 - drawing_area_.y1;
+    int width = drawing_area_.x2 - drawing_area_.x1 + 1;
+    int height = drawing_area_.y2 - drawing_area_.y1 + 1;
 
     // If the drawing area is zero-size (uninitialized or reset), use full VRAM.
     // The PS1 game may set area only once during setup; zero means "not set".
