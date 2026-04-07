@@ -1,5 +1,5 @@
 # Copilot Cloud Agent — Environment Setup
-# Installs the working Windows/MSYS2 toolchain for this repository so the agent 
+# Installs the working Windows/MSYS2 toolchain for this repository so the agent
 # can build the recompiler and warm the CastlevaniaRecomp configure step.
 #
 # Build targets:
