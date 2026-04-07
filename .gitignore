@@ -22,3 +22,7 @@ FFmpeg/
 *.bin
 *.cue
 *.iso
+
+sotn-decomp-master/
+checkpoints/
+psxrecomp_outro_agente/
