@@ -4,9 +4,12 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <vector>
 
 extern "C" int      g_debug_mode;
 extern "C" uint32_t g_ps1_frame;
+extern "C" uint8_t* psx_get_ram(void);
+extern "C" void psx_seed_gvram(void);
 extern "C" uint32_t g_pre_shot_flush = 0;
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -16,6 +19,82 @@ extern "C" uint32_t g_pre_shot_flush = 0;
 #include <GLFW/glfw3.h>
 
 namespace PS1 {
+
+namespace {
+struct DisplayCaptureRect {
+    int x;
+    int y;
+    int w;
+    int h;
+    bool used_fallback;
+};
+
+static int DisplayDotsPerPixel(int display_width) {
+    if (display_width <= 256)
+        return 10;
+    if (display_width <= 320)
+        return 8;
+    if (display_width <= 368)
+        return 7;
+    if (display_width <= 512)
+        return 5;
+    return 4;
+}
+
+static DisplayCaptureRect ResolveDisplayCaptureRect(
+    bool display_area_valid,
+    int display_area_x,
+    int display_area_y,
+    int display_width,
+    int display_height,
+    int v_display_range_y1,
+    int v_display_range_y2,
+    const DrawingArea& drawing_area) {
+    DisplayCaptureRect rect = {
+        display_area_valid ? display_area_x : 0,
+        display_area_valid ? display_area_y : 0,
+        (display_width > 0) ? display_width : 320,
+        (display_height > 0) ? display_height : 240,
+        false,
+    };
+
+    if (v_display_range_y2 > v_display_range_y1 && rect.h <= 240) {
+        int visible_h = v_display_range_y2 - v_display_range_y1;
+        if (visible_h >= 200 && visible_h < rect.h) {
+            rect.h = visible_h;
+        }
+    }
+
+    auto is_sane = [](const DisplayCaptureRect& r) {
+        return r.x >= 0 && r.y >= 0 &&
+               r.x < 1024 && r.y < 512 &&
+               r.w >= 64 && r.h >= 64 &&
+               r.w <= 1024 && r.h <= 512 &&
+               r.x + r.w <= 1024 &&
+               r.y + r.h <= 512;
+    };
+
+    if (display_area_valid && is_sane(rect)) {
+        return rect;
+    }
+
+    rect.x = drawing_area.x1;
+    rect.y = drawing_area.y1;
+    rect.w = drawing_area.x2 - drawing_area.x1 + 1;
+    rect.h = drawing_area.y2 - drawing_area.y1 + 1;
+    rect.used_fallback = true;
+    if (is_sane(rect)) {
+        return rect;
+    }
+
+    rect.x = 0;
+    rect.y = 0;
+    rect.w = 320;
+    rect.h = 240;
+    rect.used_fallback = true;
+    return rect;
+}
+}  // namespace
 
 //==============================================================================
 // Constructor / Destructor
@@ -191,6 +270,7 @@ void OpenGLRenderer::DrawTriangle(const Vertex v[3], const DrawState& state) {
         FlushPrimitives();
     }
 
+
     // For textured triangles, extract CLUT and texpage from first two vertices
     // (PS1 primitive format: CLUT in first vertex, texpage in second vertex)
     float clut_x = 0.0f, clut_y = 0.0f;
@@ -213,34 +293,12 @@ void OpenGLRenderer::DrawTriangle(const Vertex v[3], const DrawState& state) {
         }
     }
 
-    /* DIAG: log first 10 textured polys per frame at key frames to diagnose depth/tpage */
-    if (state.textured && (g_ps1_frame == 4248 || g_ps1_frame == 4410)) {
-        static uint32_t s_dbg_frame = 0xFFFFFFFFu;
-        static int s_dbg_cnt = 0;
-        if (g_ps1_frame != s_dbg_frame) {
-            s_dbg_cnt = 0; s_dbg_frame = g_ps1_frame;
-            /* On new frame, probe terrain CLUTs from vram_pixels_ */
-            auto probe = [&](int cx, int cy) {
-                const uint16_t* p = vram_pixels_ + cy * 1024 + cx;
-                printf("[CLUT2] f%u (%d,%d): %04X %04X %04X %04X\n",
-                       g_ps1_frame, cx, cy, p[0], p[1], p[2], p[3]);
-                fflush(stdout);
-            };
-            probe(144, 492); probe(160, 481); probe(288, 484);
-        }
-        if (s_dbg_cnt < 10) {
-            /* [TPDBG] printf("[TPDBG] f%u #%d: has_tp=%d tpX=%g tpY=%g ...\n", ...); */
-            fflush(stdout);
-            ++s_dbg_cnt;
-        }
-    }
 
     // Convert 3 PS1 vertices to OpenGL format
     for (int i = 0; i < 3; i++) {
         OpenGLVertex gl_vert = {};
 
-        // Position: PS1 coordinates (int16_t) to float
-        // Drawing offset is already applied in v[i].x, v[i].y
+        // GPUInterpreter already applied GP0(E5h) drawing offset.
         gl_vert.x = static_cast<float>(v[i].x);
         gl_vert.y = static_cast<float>(v[i].y);
 
@@ -250,10 +308,13 @@ void OpenGLRenderer::DrawTriangle(const Vertex v[3], const DrawState& state) {
         gl_vert.b = v[i].b / 255.0f;
         gl_vert.a = 1.0f;
 
-        // Texture coordinates: uint8_t (0-255) to float (0.0-1.0)
+        // Texture coordinates: map integer PS1 UVs to texel centres.
+        // Without the half-texel bias, a 1:1 textured quad split into triangles
+        // samples texel u+1/v+1 at the first covered fragment because GL evaluates
+        // interpolation at fragment centres.
         if (state.textured && v[i].has_texture) {
-            gl_vert.u = v[i].u / 255.0f;
-            gl_vert.v = v[i].v / 255.0f;
+            gl_vert.u = (v[i].u - 0.5f) / 255.0f;
+            gl_vert.v = (v[i].v - 0.5f) / 255.0f;
         } else {
             gl_vert.u = 0.0f;
             gl_vert.v = 0.0f;
@@ -279,8 +340,6 @@ void OpenGLRenderer::DrawTriangle(const Vertex v[3], const DrawState& state) {
     }
 
 
-    // TODO: Check if state changed -> trigger flush
-    // For now, we'll batch everything and flush manually in Present()
 }
 
 void OpenGLRenderer::DrawLine(const Vertex v[2], const DrawState& state) {
@@ -399,17 +458,28 @@ void OpenGLRenderer::DrawRectangle(int x, int y, int w, int h,
 
     static uint32_t s_rect_count = 0;
     ++s_rect_count;
-    /* [DrawRect] first 3 — re-enable when debugging rectangle rendering:
-    if (s_rect_count <= 3) {
-        printf("[DrawRect] #%u: pos=(%d,%d) size=%dx%d tex=%d semi=%d "
-               "clut=(%d,%d) tpg=(%d,%d) depth=%d uv=(%d,%d) rgb=(%d,%d,%d)\n",
-               s_rect_count, x, y, w, h, state.textured, state.semi_transparent,
-               (int)clut_x, (int)clut_y,
-               state.texpage_x_base * 64, state.texpage_y_base * 256,
-               state.texture_depth,
-               (int)u0, (int)v0, (int)r, (int)g, (int)b);
-        fflush(stdout);
-    } */
+
+    /* One-time diagnostic: dump vram_pixels_ at CLUT position for title 8-bit rects */
+    if (state.textured && state.texture_depth == 1 && clut_x == 512 &&
+        (clut_y == 240 || clut_y == 241) && vram_pixels_ &&
+        g_ps1_frame >= 100u && g_ps1_frame <= 400u) {
+        static uint32_t s_clut_cpu_log = 0;
+        if (s_clut_cpu_log < 4) {
+            int base = clut_y * 1024 + 512;
+            printf("[CLUT-CPU-AT-DRAW] f%u clut=(%u,%u) vram_pixels first16:",
+                   g_ps1_frame, clut_x, clut_y);
+            for (int ci = 0; ci < 16; ci++)
+                printf(" %04X", vram_pixels_[base + ci]);
+            printf("\n");
+            printf("[CLUT-CPU-AT-DRAW] f%u clut=(%u,%u) vram_pixels [32..47]:",
+                   g_ps1_frame, clut_x, clut_y);
+            for (int ci = 32; ci < 48; ci++)
+                printf(" %04X", vram_pixels_[base + ci]);
+            printf("\n");
+            fflush(stdout);
+            ++s_clut_cpu_log;
+        }
+    }
 
     // Rectangles are rendered as triangles
     if (!vertex_buffer_.empty() && primitive_type_ != GL_TRIANGLES) {
@@ -421,7 +491,11 @@ void OpenGLRenderer::DrawRectangle(int x, int y, int w, int h,
     if (!vertex_buffer_.empty()) {
         bool batch_textured = (vertex_buffer_[0].flags & (1 << 0)) != 0;
         bool batch_semi     = (vertex_buffer_[0].flags & (1 << 2)) != 0;
-        if (batch_textured != state.textured || batch_semi != state.semi_transparent) {
+        uint32_t batch_depth = (vertex_buffer_[0].flags >> 3) & 3u;
+        uint32_t rect_depth = (uint32_t)state.texture_depth & 3u;
+        if (batch_textured != state.textured ||
+            batch_semi != state.semi_transparent ||
+            (state.textured && batch_depth != rect_depth)) {
             FlushPrimitives();
         }
     }
@@ -438,10 +512,18 @@ void OpenGLRenderer::DrawRectangle(int x, int y, int w, int h,
 
     // Compute UV corners.  PS1 UV coords are 0-255 in texture-page space;
     // the shader multiplies them back by 255 internally, so we normalise here.
-    float u_l  = u0 / 255.0f;
-    float u_r  = (u0 + w) / 255.0f;
-    float v_t  = v0 / 255.0f;
-    float v_b  = (v0 + h) / 255.0f;
+    // Subtract 0.5/255 to compensate for GL's half-pixel fragment-centre offset:
+    // GL interpolates UV at fragment centre (0.5px from edge), so without the
+    // correction pixel_x = u0+1 instead of u0 at the first fragment of the rect.
+    float u_l  = (u0 - 0.5f) / 255.0f;
+    float u_r  = (u0 + w - 0.5f) / 255.0f;
+    float v_t  = (v0 - 0.5f) / 255.0f;
+    float v_b  = (v0 + h - 0.5f) / 255.0f;
+    if (state.textured && state.rectangle_x_flip) {
+        float u_tmp = u_l;
+        u_l = u_r;
+        u_r = u_tmp;
+    }
 
     // Texpage from draw mode: base unit (0-15) -> VRAM pixels (* 64 for X, * 256 for Y)
     float tpx  = static_cast<float>(state.texpage_x_base) * 64.0f;
@@ -516,6 +598,16 @@ void OpenGLRenderer::FillRectangle(int x, int y, int w, int h, uint16_t color) {
     if (x + w > 1024) w = 1024 - x;
     if (y + h > 512)  h = 512  - y;
 
+    /* Watchdog: detect FillRect touching CLUT rows at y=240..255 */
+    if (y <= 255 && (y + h) > 240 && x < 768 && (x + w) > 512) {
+        static uint32_t s_fill_clut_logs = 0;
+        if (++s_fill_clut_logs <= 30u) {
+            printf("[FILL-CLUT-HIT] f%u rect=(%d,%d,%dx%d) color=0x%04X — touches CLUT y=240 area!\n",
+                   g_ps1_frame, x, y, w, h, color);
+            fflush(stdout);
+        }
+    }
+
     vram_read_dirty_ = true;  // CPU wrote to VRAM — read texture needs resync
 
     // Update CPU-side VRAM copy
@@ -583,27 +675,41 @@ void OpenGLRenderer::FillRectangle(int x, int y, int w, int h, uint16_t color) {
 
 void OpenGLRenderer::UploadToVRAM(int x, int y, int w, int h, const uint16_t* data) {
     if (!opengl_initialized_) {
-        // Capture pre-init CPU-to-VRAM transfers in the CPU mirror.
-        // When OpenGL initializes later, vram_texture_ is seeded from
-        // vram_pixels_, so any uploads missed here would leave the GPU
-        // texture zeroed and produce wrong rendered output.
-        bool wraps = ((x + w) > 1024) || ((y + h) > 512);
-        if (!wraps) {
-            for (int dy = 0; dy < h; dy++)
-                for (int dx = 0; dx < w; dx++)
-                    vram_pixels_[(y + dy) * 1024 + (x + dx)] = data[dy * w + dx];
-        } else {
-            for (int row = 0; row < h; row++) {
-                int vy = (y + row) & 511;
-                const uint16_t* row_data = data + row * w;
-                for (int col = 0; col < w; col++) {
-                    int vx = (x + col) & 1023;
-                    vram_pixels_[vy * 1024 + vx] = row_data[col];
-                }
-            }
-        }
         return;
     }
+
+    /* Watchdog: detect uploads touching CLUT rows at y=240..255, x=512..767 */
+    if (y <= 255 && (y + h) > 240 && x < 768 && (x + w) > 512) {
+        static uint32_t s_upload_clut_logs = 0;
+        if (++s_upload_clut_logs <= 30u) {
+            /* Sample the first few words being written to the CLUT rows */
+            int clut_row_off = 240 - y;
+            if (clut_row_off < 0) clut_row_off = 0;
+            const uint16_t* row_start = data + clut_row_off * w;
+            int col_off = 512 - x;
+            if (col_off < 0) col_off = 0;
+            printf("[UPLOAD-CLUT-HIT] f%u rect=(%d,%d,%dx%d) clut_row_off=%d col_off=%d first4=0x%04X 0x%04X 0x%04X 0x%04X\n",
+                   g_ps1_frame, x, y, w, h, clut_row_off, col_off,
+                   (col_off < w) ? row_start[col_off] : 0xDEAD,
+                   (col_off+1 < w) ? row_start[col_off+1] : 0xDEAD,
+                   (col_off+2 < w) ? row_start[col_off+2] : 0xDEAD,
+                   (col_off+3 < w) ? row_start[col_off+3] : 0xDEAD);
+            fflush(stdout);
+        }
+    }
+
+    // GP0 command ordering matters: any pending draws must land in VRAM before a
+    // subsequent CPU->VRAM transfer mutates the same surface.
+    FlushPrimitives();
+
+    // CRITICAL: Unbind the FBO before modifying the attached texture via
+    // glTexSubImage2D.  On some GPU drivers, writing to a texture while it is
+    // still attached as an FBO color-attachment produces undefined behaviour —
+    // the upload may silently be discarded or overwritten by stale FBO state.
+    // This was the root cause of CLUT data loss during the title screen: tile
+    // block uploads wrote correct palette data to vram_pixels_ (CPU copy) but
+    // the GL texture retained stale (all-white) values.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     glBindTexture(GL_TEXTURE_2D, vram_texture_);
 
@@ -611,9 +717,8 @@ void OpenGLRenderer::UploadToVRAM(int x, int y, int w, int h, const uint16_t* da
     // Fast path for the common (non-wrapping) case.
     vram_read_dirty_ = true;  // CPU wrote to VRAM — read texture needs resync
 
-    /* [UL-DIAG] CLUT restore trace for (288,480,48,31) — commented out (re-enable to diagnose foliage CLUT) */
-
     bool wraps_inner = ((x + w) > 1024) || ((y + h) > 512);
+    bool wrap_dbg = wraps_inner && x == 8 && y == 480 && w == 1024 && h == 2;
     if (!wraps_inner) {
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
                         GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, data);
@@ -621,33 +726,77 @@ void OpenGLRenderer::UploadToVRAM(int x, int y, int w, int h, const uint16_t* da
             for (int dx = 0; dx < w; dx++)
                 vram_pixels_[(y + dy) * 1024 + (x + dx)] = data[dy * w + dx];
     } else {
-        // Wrapping path: write with modular addressing then re-upload full texture.
-        printf("[UPLOAD-WRAP] f%u (%d,%d) %dx%d — full vram_texture_ re-upload!\n",
+        // Wrapping path: upload each wrapped row in segments instead of redefining
+        // the whole texture, which is fragile while the VRAM texture is attached.
+        printf("[UPLOAD-WRAP] f%u (%d,%d) %dx%d — segmented wrapped upload\n",
                g_ps1_frame, x, y, w, h);
         fflush(stdout);
+        if (wrap_dbg) {
+            printf("[UPLOAD-WRAP-DBG] begin data=%p vram=%p\n", (const void*)data, (void*)vram_pixels_);
+            fflush(stdout);
+        }
         for (int row = 0; row < h; row++) {
             int vy = (y + row) & 511;
+            const uint16_t* row_data = data + row * w;
+            if (wrap_dbg) {
+                printf("[UPLOAD-WRAP-DBG] row=%d vy=%d row_data=%p first=%04X last=%04X\n",
+                       row, vy, (const void*)row_data, row_data[0], row_data[w - 1]);
+                fflush(stdout);
+            }
             for (int col = 0; col < w; col++) {
                 int vx = (x + col) & 1023;
-                vram_pixels_[vy * 1024 + vx] = data[row * w + col];
+                vram_pixels_[vy * 1024 + vx] = row_data[col];
+            }
+            if (wrap_dbg) {
+                printf("[UPLOAD-WRAP-DBG] row=%d cpu-copy-done\n", row);
+                fflush(stdout);
+            }
+
+            int remaining = w;
+            int src_x = 0;
+            int dst_x = x & 1023;
+            while (remaining > 0) {
+                int chunk = 1024 - dst_x;
+                if (chunk > remaining) {
+                    chunk = remaining;
+                }
+                if (wrap_dbg) {
+                    printf("[UPLOAD-WRAP-DBG] row=%d gl dst_x=%d chunk=%d src_x=%d ptr=%p\n",
+                           row, dst_x, chunk, src_x, (const void*)(row_data + src_x));
+                    fflush(stdout);
+                }
+                glTexSubImage2D(GL_TEXTURE_2D, 0, dst_x, vy, chunk, 1,
+                                GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV,
+                                row_data + src_x);
+                if (wrap_dbg) {
+                    printf("[UPLOAD-WRAP-DBG] row=%d gl-done dst_x=%d chunk=%d\n",
+                           row, dst_x, chunk);
+                    fflush(stdout);
+                }
+                remaining -= chunk;
+                src_x += chunk;
+                dst_x = 0;
             }
         }
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1024, 512, 0,
-                     GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, vram_pixels_);
     }
+
+    // Rebind the VRAM FBO now that the texture upload is complete.
+    glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo_);
+
+    // Invalidate cached GL state — FBO rebind may change scissor/blend context.
+    cached_state_.scissor_x = -1;
+    cached_state_.scissor_y = -1;
+    cached_state_.scissor_w = -1;
+    cached_state_.scissor_h = -1;
 }
 
 void OpenGLRenderer::DownloadFromVRAM(int x, int y, int w, int h, uint16_t* data) {
     if (!opengl_initialized_) {
-        // Fall back to CPU mirror when OpenGL is not yet ready.
-        if (x >= 1024 || y >= 512) return;
-        if (x + w > 1024) w = 1024 - x;
-        if (y + h > 512) h = 512 - y;
-        for (int dy = 0; dy < h; dy++)
-            for (int dx = 0; dx < w; dx++)
-                data[dy * w + dx] = vram_pixels_[(y + dy) * 1024 + (x + dx)];
         return;
     }
+
+    // GP0(C0h) must observe all prior drawing/copy commands before reading VRAM.
+    FlushPrimitives();
 
     // Clamp to VRAM bounds
     if (x >= 1024 || y >= 512) return;
@@ -671,43 +820,60 @@ void OpenGLRenderer::DownloadFromVRAM(int x, int y, int w, int h, uint16_t* data
 
 void OpenGLRenderer::CopyVRAM(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
     if (!opengl_initialized_) {
-        // CPU-only copy with PS1 wrapping semantics.
-        if (w <= 0 || h <= 0) return;
-        std::vector<uint16_t> tmp(static_cast<size_t>(w) * h);
-        for (int dy = 0; dy < h; dy++)
-            for (int dx = 0; dx < w; dx++)
-                tmp[dy * w + dx] = vram_pixels_[((src_y + dy) & 511) * 1024 + ((src_x + dx) & 1023)];
-        for (int dy = 0; dy < h; dy++)
-            for (int dx = 0; dx < w; dx++)
-                vram_pixels_[((dst_y + dy) & 511) * 1024 + ((dst_x + dx) & 1023)] = tmp[dy * w + dx];
         return;
     }
 
+    // Preserve GP0 ordering: VRAM copies happen after any earlier queued draws.
+    FlushPrimitives();
+
     vram_read_dirty_ = true;  // CPU wrote to VRAM — read texture needs resync
 
-    // Clamp to VRAM bounds
-    if (src_x >= 1024 || src_y >= 512 || dst_x >= 1024 || dst_y >= 512) return;
-    if (src_x + w > 1024) w = 1024 - src_x;
-    if (src_y + h > 512) h = 512 - src_y;
-    if (dst_x + w > 1024) w = 1024 - dst_x;
-    if (dst_y + h > 512) h = 512 - dst_y;
+    if (w <= 0 || h <= 0) {
+        return;
+    }
 
-    // Use glBlitFramebuffer for fast VRAM-to-VRAM copy
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo_);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, vram_fbo_);
-    glBlitFramebuffer(src_x, src_y, src_x + w, src_y + h,
-                      dst_x, dst_y, dst_x + w, dst_y + h,
-                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-
-    // Also update CPU-side VRAM copy
+    // Copy via a temporary buffer so overlap behaves like PS1 hardware, and
+    // wrap source/destination independently within 1024x512 VRAM.
+    std::vector<uint16_t> copied_pixels;
+    copied_pixels.reserve(static_cast<size_t>(w) * static_cast<size_t>(h));
     for (int dy = 0; dy < h; dy++) {
         for (int dx = 0; dx < w; dx++) {
-            vram_pixels_[(dst_y + dy) * 1024 + (dst_x + dx)] =
-                vram_pixels_[(src_y + dy) * 1024 + (src_x + dx)];
+            int sx = (src_x + dx) & 1023;
+            int sy = (src_y + dy) & 511;
+            copied_pixels.push_back(vram_pixels_[sy * 1024 + sx]);
         }
     }
+
+    glBindTexture(GL_TEXTURE_2D, vram_texture_);
+    size_t copied_index = 0;
+    for (int dy = 0; dy < h; dy++) {
+        const uint16_t* row_data = copied_pixels.data() + copied_index;
+        for (int dx = 0; dx < w; dx++) {
+            int vx = (dst_x + dx) & 1023;
+            int vy = (dst_y + dy) & 511;
+            vram_pixels_[vy * 1024 + vx] = row_data[dx];
+        }
+
+        int remaining = w;
+        int src_col = 0;
+        int dst_col = dst_x & 1023;
+        int vy = (dst_y + dy) & 511;
+        while (remaining > 0) {
+            int chunk = 1024 - dst_col;
+            if (chunk > remaining) {
+                chunk = remaining;
+            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, dst_col, vy, chunk, 1,
+                            GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV,
+                            row_data + src_col);
+            remaining -= chunk;
+            src_col += chunk;
+            dst_col = 0;
+        }
+        copied_index += static_cast<size_t>(w);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 //==============================================================================
@@ -719,7 +885,8 @@ void OpenGLRenderer::SetDrawMode(const DrawMode& mode) {
     // since these affect the shader dispatch path (uTextureDepth uniform) and blending.
     if (!vertex_buffer_.empty()) {
         if (mode.texture_depth != draw_mode_.texture_depth ||
-            mode.semi_transparency != draw_mode_.semi_transparency) {
+            mode.semi_transparency != draw_mode_.semi_transparency ||
+            mode.dithering != draw_mode_.dithering) {
             FlushPrimitives();
         }
     }
@@ -727,7 +894,13 @@ void OpenGLRenderer::SetDrawMode(const DrawMode& mode) {
 }
 
 void OpenGLRenderer::SetTextureWindow(const TextureWindow& window) {
-    // TODO: Update texture_window_, trigger flush if state changed
+    bool window_changed = window.mask_x != texture_window_.mask_x ||
+                          window.mask_y != texture_window_.mask_y ||
+                          window.offset_x != texture_window_.offset_x ||
+                          window.offset_y != texture_window_.offset_y;
+    if (!vertex_buffer_.empty() && window_changed) {
+        FlushPrimitives();
+    }
     texture_window_ = window;
 }
 
@@ -741,16 +914,37 @@ void OpenGLRenderer::SetDrawingArea(const DrawingArea& area) {
         FlushPrimitives();
     }
     drawing_area_ = area;
+    if ((g_ps1_frame >= 20u && g_ps1_frame <= 60u) ||
+        (g_ps1_frame >= 280u && g_ps1_frame <= 320u) ||
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) ||
+        (g_ps1_frame >= 2498u && g_ps1_frame <= 2502u)) {
+        printf("[DRAWAREA-WIN] f%u area=(%d,%d)-(%d,%d)\n",
+               g_ps1_frame, drawing_area_.x1, drawing_area_.y1,
+               drawing_area_.x2, drawing_area_.y2);
+        fflush(stdout);
+    }
 }
 
 void OpenGLRenderer::SetDrawingOffset(const DrawingOffset& offset) {
     drawing_offset_ = offset;
     static int s_offs_log = 0; ++s_offs_log;
+    if ((g_ps1_frame >= 20u && g_ps1_frame <= 60u) ||
+        (g_ps1_frame >= 280u && g_ps1_frame <= 320u) ||
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) ||
+        (g_ps1_frame >= 2498u && g_ps1_frame <= 2502u)) {
+        printf("[DRAWOFS-WIN] f%u offset=(%d,%d)\n",
+               g_ps1_frame, drawing_offset_.x, drawing_offset_.y);
+        fflush(stdout);
+    }
     /* [DrawOfs] first 20 — re-enable: if (s_offs_log <= 20) printf("[DrawOfs] #%d: (%d,%d)\n", ...); */
 }
 
 void OpenGLRenderer::SetMaskSettings(const MaskSettings& settings) {
-    // TODO: Update mask_settings_
+    bool settings_changed = settings.set_mask_bit != mask_settings_.set_mask_bit ||
+                            settings.check_mask_bit != mask_settings_.check_mask_bit;
+    if (!vertex_buffer_.empty() && settings_changed) {
+        FlushPrimitives();
+    }
     mask_settings_ = settings;
 }
 
@@ -766,7 +960,7 @@ void OpenGLRenderer::ClearTextureCache() {
 void OpenGLRenderer::SetDisplayArea(int x, int y) {
     display_area_x_ = x;
     display_area_y_ = y;
-    display_area_set_ = true;
+    display_area_valid_ = true;
 }
 
 void OpenGLRenderer::SetDisplayMode(int width, int height, bool is_24bit, bool interlace) {
@@ -813,13 +1007,11 @@ void OpenGLRenderer::Present() {
     // mode resolution), NOT visible_w/visible_h.  This preserves the 4:3 viewport
     // geometry that was correct before, while only the UV sampling changes.
     // H overscan: visible_w = (x2-x1)/dots_per_pixel.
-    //   256px→10, 320px→8, 512px→5, 640px→4  (53.693MHz / pixel-clock).
+    //   256px→10, 320px→8, 368px→7, 512px→5, 640px→4  (53.693MHz / pixel-clock).
     int visible_w = display_width_;
     int visible_h = display_height_;
     if (h_display_range_x2_ > h_display_range_x1_ && display_width_ > 0) {
-        int dpp = (display_width_ <= 256) ? 10 :
-                  (display_width_ <= 320) ? 8  :
-                  (display_width_ <= 512) ? 5  : 4;
+        int dpp = DisplayDotsPerPixel(display_width_);
         int hw = (h_display_range_x2_ - h_display_range_x1_) / dpp;
         if (hw > 0 && hw < display_width_)
             visible_w = hw;
@@ -833,11 +1025,28 @@ void OpenGLRenderer::Present() {
             visible_h = vh;
     }
 
+    DisplayCaptureRect capture_rect = ResolveDisplayCaptureRect(
+        display_area_valid_,
+        display_area_x_,
+        display_area_y_,
+        visible_w,
+        visible_h,
+        v_display_range_y1_,
+        v_display_range_y2_,
+        drawing_area_);
+
     {
         // Aspect ratio uses the full mode resolution so the viewport geometry is
         // unchanged from before this overscan fix.
-        float game_w      = (display_width_  > 0) ? (float)display_width_  : 320.0f;
-        float game_h      = (display_height_ > 0) ? (float)display_height_ : 240.0f;
+        float game_w;
+        float game_h;
+        if (capture_rect.used_fallback) {
+            game_w = (float)capture_rect.w;
+            game_h = (float)capture_rect.h;
+        } else {
+            game_w = (display_width_  > 0) ? (float)display_width_  : (float)capture_rect.w;
+            game_h = (display_height_ > 0) ? (float)display_height_ : (float)capture_rect.h;
+        }
         float game_aspect = game_w / game_h;
         float win_aspect  = (float)window_width_ / (float)window_height_;
         int vp_x, vp_y, vp_w, vp_h;
@@ -864,18 +1073,29 @@ void OpenGLRenderer::Present() {
     // Step 5: Render the active PS1 framebuffer to the window.
     // Samples only the visible_w × visible_h region from VRAM (overscan excluded).
     //
-    // If display area has never been set via GP1(05h), fall back to
+    // If GP1(05h) has not yet provided a display area, fall back to
     // showing the full VRAM so there's always something on screen.
-    float u0, v0, u1, v1;
-    if (!display_area_set_) {
-        // Full VRAM fallback
-        u0 = 0.0f; v0 = 0.0f; u1 = 1.0f; v1 = 1.0f;
-    } else {
-        u0 = display_area_x_ / 1024.0f;
-        v0 = display_area_y_ / 512.0f;
-        u1 = (display_area_x_ + visible_w) / 1024.0f;
-        v1 = (display_area_y_ + visible_h) / 512.0f;
+    {
+        static uint32_t s_present_capture_fallback_logs = 0;
+        if (capture_rect.used_fallback &&
+            (++s_present_capture_fallback_logs <= 16u ||
+             (g_ps1_frame % 120u) == 0u)) {
+            printf("[PRESENT-FIX] f%u disp=(%d,%d) vis=%dx%d draw=(%d,%d)-(%d,%d) -> capture=(%d,%d) %dx%d\n",
+                   g_ps1_frame,
+                   display_area_x_, display_area_y_, visible_w, visible_h,
+                   drawing_area_.x1, drawing_area_.y1, drawing_area_.x2, drawing_area_.y2,
+                   capture_rect.x, capture_rect.y, capture_rect.w, capture_rect.h);
+        }
     }
+
+    float u0 = capture_rect.x / 1024.0f;
+    float u1 = (capture_rect.x + capture_rect.w) / 1024.0f;
+    // The VRAM FBO stores PS1 Y=0 at the lower OpenGL rows because the draw/fill
+    // shaders render without flipping Y. Present must therefore sample the
+    // capture rect without an extra Y inversion; copy_shader_ already flips the
+    // final fullscreen quad for window presentation.
+    float v0 = capture_rect.y / 512.0f;
+    float v1 = (capture_rect.y + capture_rect.h) / 512.0f;
 
     OpenGLVertex quad[6] = {};
     // Triangle 1: TL, TR, BR
@@ -1164,113 +1384,125 @@ uniform bool uDithering;         // Dithering enabled?
 uniform bool uCheckMaskBit;      // Check mask bit before drawing?
 uniform bool uSetMaskBit;        // Set mask bit when drawing?
 
+int ApplyTextureWindowCoord(int coord, float mask_f, float offset_f) {
+    int mask = int(mask_f + 0.5);
+    int offset = int(offset_f + 0.5);
+    return (coord & ~mask) | (offset & mask);
+}
+
+vec2 VRAMTexelUV(int x, int y) {
+    return vec2((float(x) + 0.5) / 1024.0, (float(y) + 0.5) / 512.0);
+}
+
 // Sample 15-bit direct color texture
 vec4 SampleTexture15Bit(vec2 uv, vec2 texpage) {
-    // Calculate texture page base address
-    float texpage_x = texpage.x;  // Already in pixels (0-960 in 64-pixel steps)
-    float texpage_y = texpage.y;  // Already in pixels (0 or 256)
+    int texpage_x = int(texpage.x + 0.5);
+    int texpage_y = int(texpage.y + 0.5);
+    int pixel_x = int(uv.x * 255.0 + 0.5);
+    int pixel_y = int(uv.y * 255.0 + 0.5);
+    pixel_x &= 0xFF;
+    pixel_y &= 0xFF;
 
-    // Apply texture coordinates (0.0-1.0 maps to 0-255 pixels in PS1 space)
-    float tex_x = texpage_x + (uv.x * 255.0);
-    float tex_y = texpage_y + (uv.y * 255.0);
+    pixel_x = ApplyTextureWindowCoord(pixel_x, uTextureWindow.x, uTextureWindow.z);
+    pixel_y = ApplyTextureWindowCoord(pixel_y, uTextureWindow.y, uTextureWindow.w);
 
-    // Apply texture window (if enabled)
-    if (uTextureWindow.x > 0.0 || uTextureWindow.y > 0.0) {
-        // AND mask (wrapping)
-        tex_x = mod(tex_x, uTextureWindow.x) + uTextureWindow.z;
-        tex_y = mod(tex_y, uTextureWindow.y) + uTextureWindow.w;
-    }
+    int tex_x = texpage_x + pixel_x;
+    int tex_y = texpage_y + pixel_y;
+    vec2 vram_uv = VRAMTexelUV(tex_x, tex_y);
 
-    // Convert to VRAM texture coordinates (0.0-1.0)
-    vec2 vram_uv = vec2(tex_x / 1024.0, tex_y / 512.0);
-
-    // Sample from VRAM. No channel swizzle needed: GL_RGBA+1_5_5_5_REV maps
-    // PS1 R→texel.r, PS1 G→texel.g, PS1 B→texel.b directly.
+    // GL_RGBA + GL_UNSIGNED_SHORT_1_5_5_5_REV maps bits[4:0]→R, bits[9:5]→G,
+    // bits[14:10]→B, bit[15]→A. PS1 uses the same layout, so no channel swap needed.
     vec4 texel = texture(uVRAMTexture, vram_uv);
-    return texel;
+    vec4 color = texel;
+    // PS1 direct-color texels with value 0x0000 are transparent.
+    if (color.rgb == vec3(0.0, 0.0, 0.0) && color.a < 0.5) {
+        return vec4(0.0, 0.0, 0.0, 0.0);
+    }
+    return color;
 }
 
 // Sample 4-bit CLUT indexed texture
 vec4 SampleTexture4Bit(vec2 uv, vec2 texpage, vec2 clut) {
-    // texpage.x is already in VRAM pixels (0, 64, 128, ... up to 960).
-    // For 4-bit packing, 4 texels share one 16-bit VRAM word, so the
-    // VRAM X offset of a texel at index i is texpage.x + i/4.
-    float tex_x = texpage.x + (uv.x * 255.0) / 4.0;
-    float tex_y = texpage.y + (uv.y * 255.0);
+    int texpage_x = int(texpage.x + 0.5);
+    int texpage_y = int(texpage.y + 0.5);
+    int pixel_x_4 = int(uv.x * 255.0 + 0.5);
+    int pixel_y_4 = int(uv.y * 255.0 + 0.5);
+    pixel_x_4 &= 0xFF;
+    pixel_y_4 &= 0xFF;
 
-    // Apply texture window
-    if (uTextureWindow.x > 0.0 || uTextureWindow.y > 0.0) {
-        tex_x = mod(tex_x, uTextureWindow.x / 4.0) + uTextureWindow.z / 4.0;
-        tex_y = mod(tex_y, uTextureWindow.y) + uTextureWindow.w;
-    }
+    pixel_x_4 = ApplyTextureWindowCoord(pixel_x_4, uTextureWindow.x, uTextureWindow.z);
+    pixel_y_4 = ApplyTextureWindowCoord(pixel_y_4, uTextureWindow.y, uTextureWindow.w);
 
-    // Sample 16-bit value from VRAM (contains 4 indices, 4 bits each)
-    vec2 vram_uv = vec2(tex_x / 1024.0, tex_y / 512.0);
+    int tex_x = texpage_x + (pixel_x_4 >> 2);
+    int tex_y = texpage_y + pixel_y_4;
+    vec2 vram_uv = VRAMTexelUV(tex_x, tex_y);
     vec4 texel_raw = texture(uVRAMTexture, vram_uv);
 
-    // Convert to 16-bit RGB5A1 value using int arithmetic (NVIDIA 3.3 compat)
-    // Use +0.5 rounding to avoid float precision loss (n/31.0 * 31.0 can be n-epsilon)
+    // Reconstruct original PS1 16-bit value from GL channels.
+    // GL_RGBA + GL_UNSIGNED_SHORT_1_5_5_5_REV: R=bits[4:0], G=bits[9:5], B=bits[14:10], A=bit[15]
+    // PS1: R=bits[4:0], G=bits[9:5], B=bits[14:10], STP=bit[15] — same layout, no swap.
     int p16 = int(texel_raw.r * 31.0 + 0.5) |
               (int(texel_raw.g * 31.0 + 0.5) << 5) |
               (int(texel_raw.b * 31.0 + 0.5) << 10) |
               (int(texel_raw.a + 0.5) << 15);
 
     // Extract 4-bit index based on X coordinate (which nibble)
-    int pixel_x_4 = int(uv.x * 255.0);
     int nibble_index = pixel_x_4 & 3;  // 0-3
     int color_index = (p16 >> (nibble_index * 4)) & 0xF;  // Extract 4 bits
 
-    // Look up color in CLUT (CLUT is 16x1 pixels at clut position)
-    float clut_x = clut.x + float(color_index);
-    float clut_y = clut.y;
-    vec2 clut_uv = vec2(clut_x / 1024.0, clut_y / 512.0);
+    // Indexed texel 0 is transparent regardless of what CLUT[0] contains.
+    if (color_index == 0) {
+        return vec4(0.0, 0.0, 0.0, 0.0);
+    }
 
-    // Sample CLUT color. GL_RGBA+1_5_5_5_REV maps bits[4:0]→R, bits[9:5]→G,
-    // bits[14:10]→B, bit[15]→A — matching the PS1 pixel layout directly.
-    // No channel swizzle needed.
+    // Look up color in CLUT (CLUT is 16x1 pixels at clut position)
+    int clut_x = int(clut.x + 0.5) + color_index;
+    int clut_y = int(clut.y + 0.5);
+    vec2 clut_uv = VRAMTexelUV(clut_x, clut_y);
+
+    // No channel swap needed — GL channels already match PS1 layout.
     vec4 raw = texture(uVRAMTexture, clut_uv);
     return raw;
 }
 
 // Sample 8-bit CLUT indexed texture
 vec4 SampleTexture8Bit(vec2 uv, vec2 texpage, vec2 clut) {
-    // texpage.x is already in VRAM pixels. 8-bit packing: 2 texels per VRAM word.
-    float texpage_x = texpage.x;
-    float texpage_y = texpage.y;
+    int texpage_x = int(texpage.x + 0.5);
+    int texpage_y = int(texpage.y + 0.5);
+    int pixel_x_8 = int(uv.x * 255.0 + 0.5);
+    int pixel_y_8 = int(uv.y * 255.0 + 0.5);
+    pixel_x_8 &= 0xFF;
+    pixel_y_8 &= 0xFF;
 
-    // Apply texture coordinates
-    float tex_x = texpage_x + (uv.x * 255.0) / 2.0;  // Divide by 2 for packing
-    float tex_y = texpage_y + (uv.y * 255.0);
+    pixel_x_8 = ApplyTextureWindowCoord(pixel_x_8, uTextureWindow.x, uTextureWindow.z);
+    pixel_y_8 = ApplyTextureWindowCoord(pixel_y_8, uTextureWindow.y, uTextureWindow.w);
 
-    // Apply texture window
-    if (uTextureWindow.x > 0.0 || uTextureWindow.y > 0.0) {
-        tex_x = mod(tex_x, uTextureWindow.x / 2.0) + uTextureWindow.z / 2.0;
-        tex_y = mod(tex_y, uTextureWindow.y) + uTextureWindow.w;
-    }
-
-    // Sample 16-bit value from VRAM (contains 2 indices, 8 bits each)
-    vec2 vram_uv = vec2(tex_x / 1024.0, tex_y / 512.0);
+    int tex_x = texpage_x + (pixel_x_8 >> 1);
+    int tex_y = texpage_y + pixel_y_8;
+    vec2 vram_uv = VRAMTexelUV(tex_x, tex_y);
     vec4 texel_raw8 = texture(uVRAMTexture, vram_uv);
 
-    // Convert to 16-bit RGB5A1 value using int arithmetic (NVIDIA 3.3 compat)
-    // Use +0.5 rounding to avoid float precision loss
+    // Reconstruct original PS1 16-bit value — same layout, no channel swap.
     int p16b = int(texel_raw8.r * 31.0 + 0.5) |
                (int(texel_raw8.g * 31.0 + 0.5) << 5) |
                (int(texel_raw8.b * 31.0 + 0.5) << 10) |
                (int(texel_raw8.a + 0.5) << 15);
 
     // Extract 8-bit index based on X coordinate (low or high byte)
-    int pixel_x_8 = int(uv.x * 255.0);
     int byte_index = pixel_x_8 & 1;  // 0 or 1
     int color_index = (p16b >> (byte_index * 8)) & 0xFF;  // Extract 8 bits
 
-    // Look up color in CLUT (CLUT is 256x1 pixels at clut position)
-    float clut_x = clut.x + float(color_index);
-    float clut_y = clut.y;
-    vec2 clut_uv = vec2(clut_x / 1024.0, clut_y / 512.0);
+    // Indexed texel 0 is transparent regardless of what CLUT[0] contains.
+    if (color_index == 0) {
+        return vec4(0.0, 0.0, 0.0, 0.0);
+    }
 
-    // Sample CLUT color. No channel swizzle needed (GL_RGBA+1_5_5_5_REV maps
-    // PS1 R→texel.r, PS1 G→texel.g, PS1 B→texel.b directly).
+    // Look up color in CLUT (CLUT is 256x1 pixels at clut position)
+    int clut_x = int(clut.x + 0.5) + color_index;
+    int clut_y = int(clut.y + 0.5);
+    vec2 clut_uv = VRAMTexelUV(clut_x, clut_y);
+
+    // No channel swap needed — GL channels already match PS1 layout.
     vec4 raw8 = texture(uVRAMTexture, clut_uv);
     return raw8;
 }
@@ -1429,7 +1661,10 @@ out vec4 FragColor;
 uniform sampler2D uSourceTexture;
 
 void main() {
-    FragColor = texture(uSourceTexture, vTexCoord);
+    vec4 t = texture(uSourceTexture, vTexCoord);
+    FragColor = t;
+    // DEBUG: uncomment to verify channel mapping
+    // FragColor = vec4(1.0, 0.0, 0.0, 1.0); // force RED
 }
 )";
 
@@ -1715,8 +1950,8 @@ void OpenGLRenderer::ApplyDrawingArea() {
     // OpenGL scissor uses bottom-left origin with y=gl_FragCoord.y. No flip needed.
     int x = drawing_area_.x1;
     int y = drawing_area_.y1;        // VRAM Y maps directly to gl_FragCoord.y
-    int width = drawing_area_.x2 - drawing_area_.x1 + 1;
-    int height = drawing_area_.y2 - drawing_area_.y1 + 1;
+    int width = drawing_area_.x2 - drawing_area_.x1;
+    int height = drawing_area_.y2 - drawing_area_.y1;
 
     // If the drawing area is zero-size (uninitialized or reset), use full VRAM.
     // The PS1 game may set area only once during setup; zero means "not set".
@@ -1754,6 +1989,14 @@ void OpenGLRenderer::ApplyDrawingArea() {
 void OpenGLRenderer::FlushPrimitives() {
     static uint32_t s_flush_total = 0;
     static uint32_t s_flush_empty = 0;
+    static uint32_t s_frame_summary_frame = UINT32_MAX;
+    static uint32_t s_frame_summary_flushes = 0;
+    static uint32_t s_frame_summary_big = 0;
+    static uint32_t s_frame_summary_textured = 0;
+    static float s_frame_summary_min_x = 0.0f;
+    static float s_frame_summary_min_y = 0.0f;
+    static float s_frame_summary_max_x = 0.0f;
+    static float s_frame_summary_max_y = 0.0f;
     if (!opengl_initialized_ || vertex_buffer_.empty()) {
         ++s_flush_empty;
         /* [Flush] EMPTY — re-enable: if (s_flush_empty <= 3 || s_flush_empty % 300 == 0)
@@ -1770,50 +2013,100 @@ void OpenGLRenderer::FlushPrimitives() {
                vertex_buffer_[0].x, vertex_buffer_[0].y);
         fflush(stdout);
     }
+    float summary_min_x = vertex_buffer_[0].x;
+    float summary_min_y = vertex_buffer_[0].y;
+    float summary_max_x = vertex_buffer_[0].x;
+    float summary_max_y = vertex_buffer_[0].y;
+    for (const auto& v : vertex_buffer_) {
+        if (v.x < summary_min_x) summary_min_x = v.x;
+        if (v.y < summary_min_y) summary_min_y = v.y;
+        if (v.x > summary_max_x) summary_max_x = v.x;
+        if (v.y > summary_max_y) summary_max_y = v.y;
+    }
+    if (s_frame_summary_frame != g_ps1_frame) {
+        if (s_frame_summary_frame >= 2498u && s_frame_summary_frame <= 2502u) {
+            printf("[FRAME-FLUSH-SUM] f%u flushes=%u textured=%u big=%u bbox=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                   s_frame_summary_frame, s_frame_summary_flushes,
+                   s_frame_summary_textured, s_frame_summary_big,
+                   s_frame_summary_min_x, s_frame_summary_min_y,
+                   s_frame_summary_max_x, s_frame_summary_max_y);
+            fflush(stdout);
+        }
+        s_frame_summary_frame = g_ps1_frame;
+        s_frame_summary_flushes = 0;
+        s_frame_summary_big = 0;
+        s_frame_summary_textured = 0;
+        s_frame_summary_min_x = summary_min_x;
+        s_frame_summary_min_y = summary_min_y;
+        s_frame_summary_max_x = summary_max_x;
+        s_frame_summary_max_y = summary_max_y;
+    }
+    s_frame_summary_flushes++;
+    if ((vertex_buffer_[0].flags & (1u << 0)) != 0) {
+        s_frame_summary_textured++;
+    }
+    if ((summary_max_x - summary_min_x) * (summary_max_y - summary_min_y) >= 4096.0f) {
+        s_frame_summary_big++;
+    }
+    if (summary_min_x < s_frame_summary_min_x) s_frame_summary_min_x = summary_min_x;
+    if (summary_min_y < s_frame_summary_min_y) s_frame_summary_min_y = summary_min_y;
+    if (summary_max_x > s_frame_summary_max_x) s_frame_summary_max_x = summary_max_x;
+    if (summary_max_y > s_frame_summary_max_y) s_frame_summary_max_y = summary_max_y;
+    if ((g_ps1_frame >= 20u && g_ps1_frame <= 60u) ||
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) ||
+        (g_ps1_frame >= 2498u && g_ps1_frame <= 2502u)) {
+        static uint32_t s_bbox_frame = 0;
+        static uint32_t s_bbox_count = 0;
+        if (s_bbox_frame != g_ps1_frame) {
+            s_bbox_frame = g_ps1_frame;
+            s_bbox_count = 0;
+        }
+        if (s_bbox_count < 12u) {
+            bool is_textured = (vertex_buffer_[0].flags & (1u << 0)) != 0;
+            bool is_semi = (vertex_buffer_[0].flags & (1u << 2)) != 0;
+            uint32_t depth = (vertex_buffer_[0].flags >> 3) & 3u;
+            printf("[FLUSH-BBOX] f%u #%u verts=%zu prim=0x%X tex=%d semi=%d depth=%u bbox=(%.0f,%.0f)-(%.0f,%.0f) area=(%d,%d)-(%d,%d) ofs=(%d,%d) disp=(%d,%d %dx%d) bit10=%d mask=(%d,%d)\n",
+                   g_ps1_frame, ++s_bbox_count, vertex_buffer_.size(), primitive_type_,
+                   is_textured ? 1 : 0, is_semi ? 1 : 0, depth,
+                   summary_min_x, summary_min_y, summary_max_x, summary_max_y,
+                    drawing_area_.x1, drawing_area_.y1, drawing_area_.x2, drawing_area_.y2,
+                    drawing_offset_.x, drawing_offset_.y,
+                    display_area_x_, display_area_y_, display_width_, display_height_,
+                    draw_mode_.draw_to_display ? 1 : 0,
+                    mask_settings_.check_mask_bit ? 1 : 0,
+                    mask_settings_.set_mask_bit ? 1 : 0);
+            fflush(stdout);
+        }
+    }
     /* [Flush] — re-enable: if (s_flush_total <= 5 || s_flush_total % 300 == 0)
        printf("[Flush] #%u: %zu verts first_depth=%d last_depth=%d\n", ...); */
 
-    // Sync vram_read_texture_ from vram_pixels_ only when the CPU has written
-    // to VRAM since the last flush.  After initial texture loading this flag
-    // stays clear, so mid-frame flushes (texture-depth transitions etc.) incur
-    // zero upload overhead.  Using the CPU-side copy avoids the GPU pipeline
-    // stall that glCopyTexSubImage2D from the FBO would otherwise introduce.
-    if (vram_read_dirty_) {
+    // Sync read texture from the authoritative CPU-side VRAM.
+    // We previously used glCopyTexSubImage2D from the FBO, but on certain
+    // drivers glTexSubImage2D writes to the FBO-attached texture are not
+    // reflected through the FBO readback — the FBO copy returns stale data
+    // for CPU-uploaded regions (e.g. CLUT/tile blocks).  Using vram_pixels_
+    // exclusively avoids that coherency issue.
+    //
+    // FillRectangle / UploadToVRAM already maintain vram_pixels_ in sync, so
+    // the only content missing from vram_pixels_ is shader-rendered output
+    // (DrawTriangle / DrawRectangle).  For those we do a glReadPixels from
+    // the FBO into vram_pixels_ before uploading.
+    if (vram_pixels_) {
+        // Pull any shader-rendered changes from FBO back into the CPU copy
+        // so vram_pixels_ is fully up-to-date.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo_);
+        glReadPixels(0, 0, 1024, 512,
+                     GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, vram_pixels_);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+        // Upload the definitive CPU copy to the read texture.
         glBindTexture(GL_TEXTURE_2D, vram_read_texture_);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, 512,
                         GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, vram_pixels_);
         glBindTexture(GL_TEXTURE_2D, 0);
-        vram_read_dirty_ = false;
-        /* DIAG: probe terrain CLUT positions at key frames */
-        if (g_ps1_frame >= 95 && g_ps1_frame <= 100) {
-            static uint32_t s_clut_probe_frame = 0;
-            if (g_ps1_frame != s_clut_probe_frame) {
-                s_clut_probe_frame = g_ps1_frame;
-                auto probe = [&](int cx, int cy, const char* label) {
-                    const uint16_t* p = vram_pixels_ + cy * 1024 + cx;
-                    printf("[CLUT-PROBE] f%u %s (%d,%d): %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X\n",
-                           g_ps1_frame, label, cx, cy,
-                           p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
-                           p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
-                    fflush(stdout);
-                };
-                probe(0, 0, "FB-origin");
-                probe(544, 240, "CLUT-544-240");
-                probe(560, 240, "CLUT-560-240");
-                probe(544, 246, "CLUT-544-246");
-                /* Also probe tile data at tpage 15 origin */
-                auto tile_probe = [&](int tx, int ty) {
-                    const uint16_t* p = vram_pixels_ + ty * 1024 + tx;
-                    printf("[TILE-PROBE] f%u (%d,%d): %04X %04X %04X %04X %04X %04X %04X %04X\n",
-                           g_ps1_frame, tx, ty,
-                           p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
-                    fflush(stdout);
-                };
-                tile_probe(960, 256);  /* tpage 15 origin */
-                tile_probe(960, 260);  /* a few rows in */
-            }
-        }
     }
+    vram_read_dirty_ = false;
 
     // Bind VRAM framebuffer (render to VRAM texture)
     glBindFramebuffer(GL_FRAMEBUFFER, vram_fbo_);
@@ -1896,6 +2189,12 @@ void OpenGLRenderer::FlushPrimitives() {
     // Draw primitives using current primitive type (GL_TRIANGLES, GL_LINES, GL_LINE_STRIP)
     glDrawArrays(primitive_type_, 0, static_cast<GLsizei>(vertex_buffer_.size()));
 
+    // Keep the read-only VRAM sampler in sync with GPU-rendered output so later
+    // flushes in the same frame can sample freshly drawn texels/CLUTs.
+    glBindTexture(GL_TEXTURE_2D, vram_read_texture_);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 1024, 512);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
     // Unbind everything
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1937,6 +2236,20 @@ void OpenGLRenderer::SaveVRAMDump(const char* path) {
         fwrite(&buf[y * 1024 * 3], 3, 1024, f);
     fclose(f);
     delete[] buf;
+
+    /* Compare CPU vram_pixels_ vs FBO readback at CLUT position (512,240) */
+    if (vram_pixels_) {
+        printf("[VRAM-DUMP-CLUT-CPU] f%u first8_cpu:", g_ps1_frame);
+        for (int i = 0; i < 8; i++)
+            printf(" 0x%04X", vram_pixels_[240 * 1024 + 512 + i]);
+        printf("\n");
+        printf("[VRAM-DUMP-CLUT-CPU] f%u x544_cpu:", g_ps1_frame);
+        for (int i = 0; i < 8; i++)
+            printf(" 0x%04X", vram_pixels_[240 * 1024 + 544 + i]);
+        printf("\n");
+        fflush(stdout);
+    }
+
     printf("[SaveVRAMDump] saved %s  (display_area=%d,%d  draw_area=%d,%d-%d,%d)\n",
            path, display_area_x_, display_area_y_,
            drawing_area_.x1, drawing_area_.y1, drawing_area_.x2, drawing_area_.y2);
@@ -1947,6 +2260,7 @@ void OpenGLRenderer::SaveScreenshot(const char* path) {
 
     // Read the window's default framebuffer (the blit that Present() just drew)
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glReadBuffer(GL_FRONT);
     uint8_t* buf = new uint8_t[window_width_ * window_height_ * 3];
     glReadPixels(0, 0, window_width_, window_height_, GL_RGB, GL_UNSIGNED_BYTE, buf);
 
@@ -1968,24 +2282,31 @@ void OpenGLRenderer::SaveScreenshotBMP(const char* path) {
     // Uses the same display_area_x_/y_ + display_width_/height_ as Present().
     FlushPrimitives();
 
-    int dx = (display_area_x_ == 0 && display_area_y_ == 0) ? 0 : display_area_x_;
-    int dy = (display_area_x_ == 0 && display_area_y_ == 0) ? 0 : display_area_y_;
-    int dw = (display_width_  > 0) ? display_width_  : 320;
-    int dh = (display_height_ > 0) ? display_height_ : 240;
-    // Apply V display range crop (same as Present() — progressive only)
-    if (v_display_range_y2_ > v_display_range_y1_ && dh <= 240) {
-        int vh = v_display_range_y2_ - v_display_range_y1_;
-        if (vh > 0 && vh < dh) dh = vh;
-    }
+    DisplayCaptureRect capture_rect = ResolveDisplayCaptureRect(
+        display_area_valid_,
+        display_area_x_,
+        display_area_y_,
+        display_width_,
+        display_height_,
+        v_display_range_y1_,
+        v_display_range_y2_,
+        drawing_area_);
+    int dx = capture_rect.x;
+    int dy = capture_rect.y;
+    int dw = capture_rect.w;
+    int dh = capture_rect.h;
+    // Match Present(): PS1 Y=0 lives in the lower rows of the VRAM FBO, so read
+    // directly from dy without flipping. glReadPixels already returns those lower
+    // rows first, which matches the top-to-bottom order we want in the PNG.
+    int read_y = dy;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo_);
     uint8_t* buf = new uint8_t[dw * dh * 3];
-    // VRAM FBO: y=0 at bottom (OpenGL convention), VRAM y maps directly to FBO y.
-    // glReadPixels(dx, dy, dw, dh) reads rows dy..dy+dh-1; row 0 of buf = VRAM y=dy
-    // = top of PS1 framebuffer. No row flip needed for top-down PNG.
-    glReadPixels(dx, dy, dw, dh, GL_RGB, GL_UNSIGNED_BYTE, buf);
+    glReadPixels(dx, read_y, dw, dh, GL_RGB, GL_UNSIGNED_BYTE, buf);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-
+    printf("[AutoShot] capture (%d,%d) %dx%d  disp=(%d,%d) draw=(%d,%d)-(%d,%d)\n",
+           dx, dy, dw, dh, display_area_x_, display_area_y_,
+           drawing_area_.x1, drawing_area_.y1, drawing_area_.x2, drawing_area_.y2);
     std::string spath(path);
     std::thread([buf, dw, dh, spath]() {
         stbi_write_png(spath.c_str(), dw, dh, 3, buf, dw * 3);
@@ -2001,14 +2322,17 @@ void OpenGLRenderer::SaveVRAMDumpBMP(const char* path) {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, vram_fbo_);
     glReadPixels(0, 0, 1024, 512, GL_RGB, GL_UNSIGNED_BYTE, buf);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    // Row flip + PNG encode (synchronous to ensure file is saved before exit).
-    uint8_t* flipped = new uint8_t[1024 * 512 * 3];
-    for (int y = 0; y < 512; y++)
-        memcpy(flipped + y * 1024 * 3, buf + (511 - y) * 1024 * 3, 1024 * 3);
-    delete[] buf;
-    stbi_write_png(path, 1024, 512, 3, flipped, 1024 * 3);
-    delete[] flipped;
-    printf("[AutoVRAM] saved %s\n", path);
+    // Row flip + PNG encode + disk write on background thread.
+    std::string spath(path);
+    std::thread([buf, spath]() {
+        uint8_t* flipped = new uint8_t[1024 * 512 * 3];
+        for (int y = 0; y < 512; y++)
+            memcpy(flipped + y * 1024 * 3, buf + (511 - y) * 1024 * 3, 1024 * 3);
+        delete[] buf;
+        stbi_write_png(spath.c_str(), 1024, 512, 3, flipped, 1024 * 3);
+        delete[] flipped;
+        printf("[AutoVRAM] saved %s\n", spath.c_str());
+    }).detach();
 }
 
 } // namespace PS1

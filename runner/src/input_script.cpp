@@ -602,7 +602,7 @@ void script_tick(uint32_t ps1_frame, uint8_t* ram, uint8_t* scratch) {
 
         case CMD_PRESS:
             s_pad_mask |= (uint16_t)c.arg1;
-            s_press_frames = 2;
+            s_press_frames = 6;  /* hold for 6 VSync ticks (game runs UG every 2 ticks) */
             printf("[SCRIPT] press 0x%04X (frame %u)\n", c.arg1, ps1_frame);
             fflush(stdout);
             s_pc++;

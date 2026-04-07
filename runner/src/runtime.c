@@ -4,7 +4,6 @@
 #include "cdrom_stub.h"
 #include "spu.h"
 #include "automation.h"
-#include "func_logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,26 +34,13 @@ static uint8_t g_ram[2 * 1024 * 1024];   /* 2MB main RAM */
 static uint8_t g_scratch[1024];           /* 1KB scratchpad */
 
 /* Global CPU pointer for watchpoint diagnostics */
-CPUState* g_diag_cpu = NULL;
+static CPUState* g_diag_cpu = NULL;
 
-/* Current pad1 button state (active-high), exposed for debug_server.c */
-uint16_t g_pad1_state = 0;
-
-/* Scripting VM per-frame opcode counter(reset each VM entry, used to force yield) */
+/* Scripting VM per-frame opcode counter (reset each VM entry, used to force yield) */
 uint32_t g_vm_ops_this_frame = 0;
 
 /* Current CDROM seek position (LBA), set by CdlSeekL intercept */
 static uint32_t g_cdrom_lba = 0;
-
-/* Dispatch miss tracking */
-#define MAX_DISPATCH_MISS_UNIQUE 256
-static uint32_t s_dispatch_miss_count = 0;
-static uint32_t s_dispatch_miss_addrs[MAX_DISPATCH_MISS_UNIQUE];
-static int      s_dispatch_miss_unique_count = 0;
-
-uint32_t psx_get_dispatch_miss_count(void) {
-    return s_dispatch_miss_count;
-}
 
 /* ---------------------------------------------------------------------------
  * PS1 BIOS interrupt handler chains
@@ -75,281 +61,41 @@ uint32_t psx_get_dispatch_miss_count(void) {
 static uint32_t g_int_chains[4] = {0};
 
 /* ---------------------------------------------------------------------------
- * Memory card — proper 128KB raw card image with PS1 directory structure.
- *
- * Layout: 1024 sectors × 128 bytes = 128KB
- *   Block 0 (sectors 0-63):  Directory block
- *     Sector 0:    Header ("MC" + padding + XOR checksum)
- *     Sectors 1-15: Directory entries (one per data block 1-15)
- *       +0x00  uint32_t state  (0x51=first, 0xA1=mid, 0xA2=last, 0xA0=deleted, 0x00=free)
- *       +0x04  uint32_t size   (file size in bytes)
- *       +0x08  uint16_t next   (next block, 0xFFFF=last)
- *       +0x0A  char     name[21] (ASCII, null-terminated)
- *       +0x7F  uint8_t  xor    (XOR checksum of bytes 0-126)
- *     Sectors 16-35: Broken sector list (unused, zeroed)
- *     Sectors 36-62: Broken sector replacement (unused)
- *     Sector 63: Write test sector
- *   Blocks 1-15 (sectors 64-1023): Data blocks, 64 sectors (8KB) each
- *
- * Reference: nocash PSX specs — Memory Card I/O Ports
+ * Memory card file I/O — backs B(0x32-0x36) BIOS calls with flat files on disk.
+ * Save files are stored in C:/temp/memcard/ named by slot and game path.
  * --------------------------------------------------------------------------- */
-
-#define MC_SECTOR_SIZE  128
-#define MC_SECTORS      1024
-#define MC_CARD_SIZE    (MC_SECTOR_SIZE * MC_SECTORS)  /* 128KB */
-#define MC_BLOCK_SIZE   (MC_SECTOR_SIZE * 64)          /* 8KB */
-#define MC_NUM_BLOCKS   16  /* block 0 = directory, 1-15 = data */
-
-/* In-memory card images (loaded from disk on init) */
-static uint8_t s_card[2][MC_CARD_SIZE];  /* slot 0 and slot 1 */
-static int     s_card_loaded[2] = {0, 0};
-static char    s_card_path[2][256];
-
-static void mc_card_path(int slot, char *out, int max) {
-    snprintf(out, max, "memcard/slot%d.mcd", slot);
-}
+/* Real PS1 BIOS allows at most 2 simultaneously open memory card files.
+ * open() returns 0 or 1 on success, -1 if both slots are full.
+ * Repeated O_CREAT to the SAME file path returns the SAME fd (BIOS slot reuse).
+ * O_WRONLY to the same file allocates a second fd (separate write handle). */
+#define MEMCARD_MAX_FD 2
+typedef struct { FILE* fp; char path[256]; } mc_fd_t;
+static mc_fd_t s_mc_fds[MEMCARD_MAX_FD];  /* open file handles; path="" if free */
+static int     s_nextfile_remain = 0;    /* remaining blocks after firstfile; set by FUN_B4CC intercept */
+static char    s_last_mc_name[21] = {0}; /* last O_CREAT filename (PS1 name part, e.g. BASCUS-94236TOMBA-00) */
 
 static void mc_ensure_dir(void) {
-    CreateDirectoryA("memcard", NULL);
+    CreateDirectoryA("C:/temp/memcard", NULL);  /* no-op if exists */
 }
 
-/* Initialize a blank card with proper header */
-static void mc_format_card(uint8_t *card) {
-    memset(card, 0, MC_CARD_SIZE);
-    /* Sector 0: header */
-    card[0] = 'M'; card[1] = 'C';
-    /* XOR checksum of sector 0 */
-    uint8_t xor = 0;
-    for (int i = 0; i < 127; i++) xor ^= card[i];
-    card[127] = xor;
-    /* Sectors 1-15: directory entries — mark all as free (0xA0 = freshly formatted) */
-    for (int i = 1; i <= 15; i++) {
-        uint8_t *de = &card[i * MC_SECTOR_SIZE];
-        de[0] = 0xA0; de[1] = 0x00; de[2] = 0x00; de[3] = 0x00; /* state = free/formatted */
-        de[8] = 0xFF; de[9] = 0xFF; /* next = none */
-        xor = 0;
-        for (int j = 0; j < 127; j++) xor ^= de[j];
-        de[127] = xor;
-    }
-}
-
-static void mc_load_card(int slot) {
-    if (s_card_loaded[slot]) return;
-    mc_ensure_dir();
-    mc_card_path(slot, s_card_path[slot], sizeof(s_card_path[slot]));
-    FILE *f = fopen(s_card_path[slot], "rb");
-    if (f) {
-        fread(s_card[slot], 1, MC_CARD_SIZE, f);
-        fclose(f);
-    } else {
-        mc_format_card(s_card[slot]);
-    }
-    s_card_loaded[slot] = 1;
-}
-
-static void mc_save_card(int slot) {
-    if (!s_card_loaded[slot]) return;
-    mc_ensure_dir();
-    FILE *f = fopen(s_card_path[slot], "wb");
-    if (f) {
-        fwrite(s_card[slot], 1, MC_CARD_SIZE, f);
-        fclose(f);
-    }
-}
-
-/* Low-level sector read/write — used by B(0x4E)/B(0x4F) and internally by _bu_* */
-static int mc_read_sector(int slot, uint32_t sector, uint8_t *buf) {
-    if (slot < 0 || slot > 1 || sector >= MC_SECTORS) return 0;
-    mc_load_card(slot);
-    memcpy(buf, &s_card[slot][sector * MC_SECTOR_SIZE], MC_SECTOR_SIZE);
-    return 1;
-}
-
-static int mc_write_sector(int slot, uint32_t sector, const uint8_t *buf) {
-    if (slot < 0 || slot > 1 || sector >= MC_SECTORS) return 0;
-    mc_load_card(slot);
-    memcpy(&s_card[slot][sector * MC_SECTOR_SIZE], buf, MC_SECTOR_SIZE);
-    mc_save_card(slot);  /* flush to disk after every write */
-    return 1;
-}
-
-/* Directory helpers */
-static uint8_t* mc_dir_entry(int slot, int block) {
-    /* block 1-15 → directory sector 1-15 */
-    if (block < 1 || block > 15) return NULL;
-    mc_load_card(slot);
-    return &s_card[slot][block * MC_SECTOR_SIZE];
-}
-
-static int mc_find_file(int slot, const char *name) {
-    /* Search directory entries (blocks 1-15) for a file with matching name */
-    for (int blk = 1; blk <= 15; blk++) {
-        uint8_t *de = mc_dir_entry(slot, blk);
-        uint32_t state = de[0] | (de[1] << 8) | (de[2] << 16) | (de[3] << 24);
-        if (state != 0x51) continue;  /* only first-block entries */
-        if (strncmp((const char *)&de[0x0A], name, 20) == 0)
-            return blk;
-    }
-    return -1; /* not found */
-}
-
-static int mc_find_free_block(int slot) {
-    for (int blk = 1; blk <= 15; blk++) {
-        uint8_t *de = mc_dir_entry(slot, blk);
-        uint32_t state = de[0] | (de[1] << 8) | (de[2] << 16) | (de[3] << 24);
-        if (state == 0xA0 || state == 0x00)
-            return blk;
-    }
-    return -1; /* card full */
-}
-
-static void mc_update_dir_checksum(int slot, int block) {
-    uint8_t *de = mc_dir_entry(slot, block);
-    uint8_t xor = 0;
-    for (int i = 0; i < 127; i++) xor ^= de[i];
-    de[127] = xor;
-    mc_save_card(slot);
-}
-
-/* Open file descriptor table */
-#define MC_MAX_FD 4
-typedef struct {
-    int  active;
-    int  slot;       /* card slot 0 or 1 */
-    int  block;      /* starting block (1-15) */
-    uint32_t size;   /* file size */
-    uint32_t pos;    /* current read/write position */
-    int  writable;
-} mc_fd_t;
-static mc_fd_t s_mc_fds[MC_MAX_FD];
-
-/* FDs 0-1 are reserved (stdin/stdout on real PS1), so use 2+ */
-#define MC_FD_BASE 2
-
-static int mc_alloc_fd(void) {
-    for (int i = 0; i < MC_MAX_FD; i++)
-        if (!s_mc_fds[i].active) return i;
-    return -1;
-}
-
-/* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename */
+/* Parse PS1 path "bu[speed][slot]:\FILENAME" → slot (0/1) and filename.
+ * Returns 0 on success, -1 on bad format. */
 static int mc_parse_path(const char* path, int* slot_out, char* name_out, int name_max) {
-    if (strncmp(path, "bu", 2) != 0) return -1;
-    *slot_out = (path[2] == '1') ? 1 : 0;
-    const char* colon = strchr(path, ':');
-    if (!colon) return -1;
-    const char* name = colon + 1;
-    while (*name == '\\' || *name == '/') name++;
-    strncpy(name_out, name, name_max - 1);
-    name_out[name_max - 1] = '\0';
-    return 0;
-}
-
-/* firstfile/nextfile state */
-static int  s_ff_slot = 0;
-static int  s_ff_block = 0;  /* next block to check (1-15) */
-static char s_ff_pattern[32] = {0};
-
-/* Memcard activity log — queryable via TCP debug server "memcard_log" command */
-#define MC_LOG_CAP 32
-typedef struct {
-    uint32_t frame;
-    uint32_t bios_fn;   /* 0x32=open, 0x33=lseek, 0x34=read, 0x35=write, 0x36=close */
-    uint32_t a0, a1, a2, a3;
-    uint32_t ret;       /* v0 return value */
-    uint32_t ra;
-    uint8_t  buf_head[16]; /* first 16 bytes of buffer (for write/read) */
-    int      buf_nonzero;  /* count of non-zero bytes in buffer */
-} mc_log_entry_t;
-static mc_log_entry_t s_mc_log[MC_LOG_CAP];
-static int s_mc_log_count = 0;
-
-static void mc_log_push(uint32_t fn, CPUState* cpu, uint32_t ret, uint32_t buf_addr, uint32_t buf_len) {
-    int idx = s_mc_log_count % MC_LOG_CAP;
-    mc_log_entry_t *e = &s_mc_log[idx];
-    e->frame = g_ps1_frame;
-    e->bios_fn = fn;
-    e->a0 = cpu->a0; e->a1 = cpu->a1; e->a2 = cpu->a2; e->a3 = cpu->a3;
-    e->ret = ret;
-    e->ra = cpu->ra;
-    memset(e->buf_head, 0, 16);
-    e->buf_nonzero = 0;
-    if (buf_addr > 0 && buf_len > 0) {
-        uint32_t phys = buf_addr & 0x1FFFFFFFu;
-        if (phys + buf_len <= sizeof(g_ram)) {
-            for (uint32_t i = 0; i < buf_len && i < 16; i++)
-                e->buf_head[i] = g_ram[phys + i];
-            for (uint32_t i = 0; i < buf_len && i < 8192; i++)
-                if (g_ram[phys + i]) e->buf_nonzero++;
-        }
-    }
-    s_mc_log_count++;
-}
-
-/* Exposed for debug_server.c */
-int psx_mc_log_count(void) { return s_mc_log_count; }
-const void* psx_mc_log_entry(int i) {
-    if (i < 0 || i >= s_mc_log_count) return NULL;
-    if (s_mc_log_count > MC_LOG_CAP && i < s_mc_log_count - MC_LOG_CAP) return NULL;
-    return &s_mc_log[i % MC_LOG_CAP];
-}
-
-/* ---------------------------------------------------------------------------
- * CDROM virtual file descriptors— backs B(0x32-0x36) for cdrom:/sim: paths.
- * Files are served from the mounted ISO image via psx_cdrom_read_sector().
- * --------------------------------------------------------------------------- */
-#define CDROM_FD_BASE 0x40   /* cdrom fds: 0x40..0x43 (no overlap with memcard 0..1) */
-#define CDROM_MAX_VFD 4
-typedef struct {
-    int      active;
-    uint32_t start_lba;   /* file's starting sector on disc */
-    uint32_t file_size;   /* file size in bytes */
-    uint32_t position;    /* current byte offset within file */
-} cdrom_vfd_t;
-static cdrom_vfd_t s_cdrom_vfds[CDROM_MAX_VFD];
-
-static int is_cdrom_fd(int fd) {
-    return fd >= CDROM_FD_BASE && fd < CDROM_FD_BASE + CDROM_MAX_VFD;
-}
-
-/* Extract ISO path from "sim:c:\bin\dra.bin" or "cdrom:\DRA.BIN;1" etc.
- * Converts to uppercase and uses forward slashes for ISOReader.
- * E.g., "sim:c:\bin\f_title0.bin" -> "BIN/F_TITLE0.BIN"
- * Returns pointer into static buffer (overwritten each call). */
-static const char* cdrom_extract_filename(const char* path) {
-    static char buf[128];
-    const char* p = path;
-    /* Skip device prefix (sim:, cdrom:) */
-    const char* colon = strchr(p, ':');
-    if (colon) p = colon + 1;
-    /* Skip drive letter if present (e.g., "c:\") */
-    if (p[0] && p[1] == ':') p += 2;
-    /* Skip leading path separators */
-    while (*p == '\\' || *p == '/') p++;
-    /* Copy path, converting to uppercase and forward slashes, strip ";N" */
+    if (!path || path[0] != 'b' || path[1] != 'u') return -1;
+    *slot_out = (path[3] == '1') ? 1 : 0;
+    /* skip past ':' and optional backslash */
+    const char* p = strchr(path + 4, ':');
+    if (p) p++;
+    else    p = path + 4;
+    if (*p == '\\' || *p == '/') p++;
     int i = 0;
-    while (*p && *p != ';' && i < (int)sizeof(buf) - 1) {
-        char c = *p++;
-        if (c == '\\') c = '/';
-        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-        buf[i++] = c;
-    }
-    buf[i] = '\0';
-    return buf;
-}
-
-/* Check if path is a cdrom/sim device path */
-static int is_cdrom_path(const char* path) {
-    if (!path) return 0;
-    if (strncmp(path, "sim:", 4) == 0) return 1;
-    if (strncmp(path, "cdrom:", 6) == 0) return 1;
-    if (strncmp(path, "cdrom\\", 6) == 0) return 1;
-    if (path[0] == '\\' && strchr(path, '.')) return 1; /* \DRA.BIN;1 style */
-    return 0;
+    while (*p && i < name_max - 1) { name_out[i++] = *p++; }
+    name_out[i] = '\0';
+    return (i > 0) ? 0 : -1;
 }
 
 /* ---------------------------------------------------------------------------
- * Frame-gated diagnostic logging— fires only during DIAG_FRAME_START..END
+ * Frame-gated diagnostic logging — fires only during DIAG_FRAME_START..END
  * --------------------------------------------------------------------------- */
 extern uint32_t g_ps1_frame;
 
@@ -365,10 +111,6 @@ uint32_t g_attack_trace_end_frame = 0;
  * psx_override_dispatch uses the compiled stub (which returns quickly) instead of
  * spawning another interpreter level.  This prevents unbounded recursion. */
 static int s_interp_a664 = 0;
-
-/* Global interpreter instruction limit — see psx_runtime.h for docs */
-uint32_t g_interp_total_limit = 0;
-uint32_t g_interp_total_counter = 0;
 
 
 /* ---------------------------------------------------------------------------
@@ -494,7 +236,7 @@ static void watchdog_check(uint32_t addr, int width) {
 #define DIAG_FRAME_END   4385
 /* DIAG window disabled — was freezing game at frame ~4382 during normal play.
  * Re-enable by restoring: (g_ps1_frame >= DIAG_FRAME_START && g_ps1_frame <= DIAG_FRAME_END) */
-#define DIAG_ENABLED() (g_ps1_frame >= 95 && g_ps1_frame <= 100)
+#define DIAG_ENABLED() 0
 
 /* Entity loop (FUN_8001dfd4) s0/s1 save — protects caller's registers */
 static uint32_t g_entity_saved_s0, g_entity_saved_s1;
@@ -711,14 +453,12 @@ static LPVOID g_fiber_main      = NULL;  /* main thread fiber */
 static LPVOID g_fiber_display   = NULL;  /* display thread fiber */
 static LPVOID g_fiber_loading   = NULL;  /* loading/CDROM thread fiber */
 static LPVOID g_fiber_secondary = NULL;  /* secondary processing thread (TCB[1]) */
-static LPVOID g_fiber_game      = NULL;  /* MainGame fiber (DRA.BIN 0x800E3988) */
 
 /* Saved MIPS GP register banks (one per thread) */
 static uint32_t g_main_saved[MIPS_GP_REGS];
 static uint32_t g_display_saved[MIPS_GP_REGS];
 static uint32_t g_loading_saved[MIPS_GP_REGS];
 static uint32_t g_secondary_saved[MIPS_GP_REGS];
-static uint32_t g_game_saved[MIPS_GP_REGS];
 
 /* Loading fiber setup from OpenThread */
 static uint32_t g_loading_sp    = 0x801FF400u;  /* initial MIPS SP for loading thread */
@@ -793,28 +533,6 @@ static VOID WINAPI fiber_secondary_func(PVOID param) {
            g_secondary_entry, g_secondary_sp);
     fflush(stdout);
     psx_dispatch_compiled(cpu, g_secondary_entry);
-    for (;;) { SwitchToFiber(g_fiber_main); }
-}
-
-/* Forward declaration — defined later in this file */
-void mips_interpret(CPUState* cpu, uint32_t start_pc);
-
-/* MainGame fiber — runs DRA.BIN's MainGame loop (0x800E3988) via interpreter.
- * MainGame is an infinite loop: UpdateGame → Render → AddPrim → DrawOTag → VSync.
- * VSync (0x80016C54) yields back to the pump loop each frame. The fiber preserves
- * the interpreter's entire host stack (including interp_call_stack and PC), so
- * MainGame resumes exactly where it left off next frame. */
-static VOID WINAPI fiber_game_func(PVOID param) {
-    CPUState* cpu = (CPUState*)param;
-    memcpy(cpu, g_game_saved, MIPS_GP_REGS * sizeof(uint32_t));
-    printf("[GAME-FIBER] Starting MainGame at 0x800E3988 sp=0x%08X ra=0x%08X\n",
-           cpu->sp, cpu->ra);
-    fflush(stdout);
-    /* MainGame is an infinite loop. The interpreter guard is set very large
-     * (10M instructions) since VSync yields the fiber every frame. */
-    mips_interpret(cpu, 0x800E3988u);
-    printf("[GAME-FIBER] MainGame returned (unexpected — infinite loop exited)\n");
-    fflush(stdout);
     for (;;) { SwitchToFiber(g_fiber_main); }
 }
 
@@ -1000,151 +718,6 @@ static void write_word(uint32_t addr, uint32_t value) {
                 fflush(stdout);
             }
         }
-        /* Trap for DRA.BIN render-gate variables */
-        if (phys == 0x3C734u || phys == 0x973ECu || phys == 0xBD1C0u || phys == 0x1362B0u) {
-            static uint32_t s_rgate_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            ++s_rgate_writes;
-            if (s_rgate_writes <= 200u || (s_rgate_writes % 500u) == 0u) {
-                printf("[RGATE-W] f%u #%u phys=0x%05X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_rgate_writes, phys, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-         /* Always-on trap for key game state addresses */
-        if (phys == 0x32AB0u || phys == 0x32A24u || phys == 0x32AA4u || phys == 0x32AA8u || phys == 0x32D80u) {
-            static uint32_t s_key_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            ++s_key_writes;
-            if (s_key_writes <= 60u) {
-                printf("[KEY-WRITE] f%u #%u phys=0x%05X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_key_writes, phys, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to sub_state (0x80073060 = phys 0x73060) */
-        if (phys == 0x73060u) {
-            static uint32_t s_ss_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_ss_writes <= 40u) {
-                printf("[SUBSTATE-W] f%u #%u old=%u new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_ss_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to D_8006C3B0 (phys 0x6C3B0) — blocking sub_state 5 */
-        if (phys == 0x6C3B0u) {
-            static uint32_t s_c3b0_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_c3b0_writes <= 40u) {
-                printf("[D6C3B0-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_c3b0_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to D_8006C398 (phys 0x6C398) — the "please load" flag */
-        if (phys == 0x6C398u) {
-            static uint32_t s_c398_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_c398_writes <= 40u) {
-                printf("[D6C398-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_c398_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to D_8006BAFC (phys 0x6BAFC) — loading status register */
-        if (phys == 0x6BAFCu) {
-            static uint32_t s_bafc_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_bafc_writes <= 40u) {
-                printf("[D6BAFC-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_bafc_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to g_GameState (phys 0x3C734) */
-        if (phys == 0x3C734u) {
-            static uint32_t s_gs_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_gs_writes <= 40u) {
-                printf("[GAMESTATE-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_gs_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to C780's internal sub-state (phys 0x3C9A4) */
-        if (phys == 0x3C9A4u) {
-            static uint32_t s_c9a4_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_c9a4_writes <= 60u) {
-                printf("[C9A4-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_c9a4_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to overlay B010 (phys 0x1BB010) — entity index for case 2 */
-        if (phys == 0x1BB010u) {
-            static uint32_t s_b010_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_b010_writes <= 30u) {
-                printf("[B010-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_b010_writes, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Trap writes to gate at phys 0x97494 (halfword, controls case 2 exit) */
-        if (phys >= 0x97494u && phys <= 0x97495u) {
-            static uint32_t s_gate_writes = 0;
-            uint16_t oldv = 0;
-            memcpy(&oldv, &g_ram[0x97494], 2);
-            if (++s_gate_writes <= 40u) {
-                printf("[7494-W] f%u #%u phys=0x%X old=0x%04X val=0x%08X ra=0x%08X pc=0x%08X\n",
-                       g_ps1_frame, s_gate_writes, phys, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u);
-                fflush(stdout);
-            }
-        }
-        /* Track writes to function pointers at C778/C780 (case 6 handlers) */
-        if (phys == 0x3C778u || phys == 0x3C780u) {
-            static uint32_t s_fp_writes = 0;
-            uint32_t oldv = 0;
-            memcpy(&oldv, p, 4);
-            if (++s_fp_writes <= 30u) {
-                printf("[FP-WRITE] f%u addr=0x%08X old=0x%08X new=0x%08X pc=0x%08X ra=0x%08X\n",
-                       g_ps1_frame, 0x80000000u | phys, oldv, value,
-                       g_diag_cpu ? g_diag_cpu->pc : 0u,
-                       g_diag_cpu ? g_diag_cpu->ra : 0u);
-                fflush(stdout);
-            }
-        }
         if (s_trace_cv_ptr_writes &&
             (phys == 0x32D68u || phys == 0x32D70u || phys == 0x32D74u || phys == 0x32D78u)) {
             uint32_t oldv = 0;
@@ -1250,7 +823,6 @@ static void write_word(uint32_t addr, uint32_t value) {
 
     /* ---- MMIO hardware intercepts (addr_ptr returned NULL) ---- */
     extern void gpu_submit_word(uint32_t w);
-    extern void gpu_abort_streaming(void);
     mmio_trace("W", addr, value, 32);
 
     /* Interrupt Status — writing 0 to a bit acknowledges it */
@@ -1329,12 +901,12 @@ static void write_word(uint32_t addr, uint32_t value) {
         uint32_t sync = (value >> 9) & 3u;
         uint32_t dir  =  value       & 1u;
         static uint32_t s_dma2_calls = 0;
-        /* [DMA2-CHCR] — log GPU DMA trigger events */
-        if ((value & 0x01000000u)) {
+        /* [DMA2-CHCR] — re-enable when debugging GPU DMA:
+        if ((value & 0x01000000u) && (s_dma2_calls < 5 || DIAG_ENABLED())) {
             printf("[DMA2-CHCR] #%u: value=0x%08X sync=%u dir=%u madr=0x%08X bcr=0x%08X\n",
                    s_dma2_calls + 1, value, sync, dir, s_dma2_madr, s_dma2_bcr);
             fflush(stdout);
-        }
+        } */
         if ((value & 0x01000000u) && sync == 1u && dir == 1u) {
             /* Block mode, RAM→GPU (dir=1 = to-device): forward every word to the GPU interpreter */
             uint32_t block_size  = s_dma2_bcr & 0xFFFFu;
@@ -1359,79 +931,22 @@ static void write_word(uint32_t addr, uint32_t value) {
         } else if ((value & 0x01000000u) && sync == 2u && dir == 1u) {
             /* Linked-list mode, RAM→GPU (dir=1 = to-device): walk the OT chain from MADR */
             ++s_dma2_calls;
+            /* Note: linked-list GPU DMA is already handled by the FUN_80060B70
+             * override (DrawOTag intercept).  This path is a fallback in case
+             * the game triggers the DMA hardware directly via MMIO. */
             uint32_t ptr = s_dma2_madr | 0x80000000u;
-            uint32_t gp0_total = 0;
-            uint32_t ll_count = 0;
             for (int ll_limit = 0; ll_limit < 65536; ll_limit++) {
                 uint8_t* ph = addr_ptr(ptr);
                 if (!ph) break;
                 uint32_t hdr; memcpy(&hdr, ph, 4);
                 uint8_t cnt = (uint8_t)(hdr >> 24);
-                ll_count++;
                 for (uint8_t wi = 0; wi < cnt; wi++) {
                     uint8_t* pw = addr_ptr(ptr + 4u + wi * 4u);
-                    if (pw) { uint32_t w; memcpy(&w, pw, 4); gpu_submit_word(w); gp0_total++; }
+                    if (pw) { uint32_t w; memcpy(&w, pw, 4); gpu_submit_word(w); }
                 }
-                /* Abort any CPUToVRAM streaming between OT entries — on real
-                 * hardware each linked-list node is a separate DMA block, and
-                 * any CPUToVRAM data would arrive via block-mode DMA, not from
-                 * subsequent OT entries. */
-                gpu_abort_streaming();
                 uint32_t nxt = hdr & 0xFFFFFFu;
                 if (nxt == 0xFFFFFFu || nxt == 0u) break;
                 ptr = nxt | 0x80000000u;
-            }
-            if (s_dma2_calls <= 20u || gp0_total > 0u || (s_dma2_calls % 500u) == 0u) {
-                printf("[DMA2-LL] #%u f%u madr=0x%08X links=%u gp0_words=%u\n",
-                       s_dma2_calls, g_ps1_frame, s_dma2_madr, ll_count, gp0_total);
-                fflush(stdout);
-            }
-            /* Dump actual GP0 words when OT has a small number of primitives */
-            if (gp0_total > 0u && gp0_total <= 32u && s_dma2_calls <= 100u) {
-                uint32_t dptr = s_dma2_madr | 0x80000000u;
-                printf("[GP0-DUMP] f%u OT=0x%08X:", g_ps1_frame, s_dma2_madr);
-                for (int dl = 0; dl < 65536; dl++) {
-                    uint8_t* dph = addr_ptr(dptr);
-                    if (!dph) break;
-                    uint32_t dhdr; memcpy(&dhdr, dph, 4);
-                    uint8_t dcnt = (uint8_t)(dhdr >> 24);
-                    printf(" [hdr=%08X", dhdr);
-                    for (uint8_t dwi = 0; dwi < dcnt; dwi++) {
-                        uint8_t* dpw = addr_ptr(dptr + 4u + dwi * 4u);
-                        if (dpw) { uint32_t dw; memcpy(&dw, dpw, 4); printf(" %08X", dw); }
-                    }
-                    printf("]");
-                    uint32_t dnxt = dhdr & 0xFFFFFFu;
-                    if (dnxt == 0xFFFFFFu || dnxt == 0u) break;
-                    dptr = dnxt | 0x80000000u;
-                }
-                printf("\n");
-                fflush(stdout);
-            }
-            /* Dump OT contents for diagnostic frames (95-100) even for large OTs */
-            if (DIAG_ENABLED() && gp0_total > 32u) {
-                uint32_t dptr = s_dma2_madr | 0x80000000u;
-                printf("[GP0-DIAG] f%u OT=0x%08X gp0=%u links=%u:\n", g_ps1_frame, s_dma2_madr, gp0_total, ll_count);
-                int entry_i = 0;
-                for (int dl = 0; dl < 65536 && entry_i < 30; dl++) {
-                    uint8_t* dph = addr_ptr(dptr);
-                    if (!dph) break;
-                    uint32_t dhdr; memcpy(&dhdr, dph, 4);
-                    uint8_t dcnt = (uint8_t)(dhdr >> 24);
-                    if (dcnt > 0) {
-                        printf("  [%d] @0x%08X cnt=%u:", entry_i, dptr, dcnt);
-                        for (uint8_t dwi = 0; dwi < dcnt && dwi < 12; dwi++) {
-                            uint8_t* dpw = addr_ptr(dptr + 4u + dwi * 4u);
-                            if (dpw) { uint32_t dw; memcpy(&dw, dpw, 4); printf(" %08X", dw); }
-                        }
-                        printf("\n");
-                    }
-                    entry_i++;
-                    uint32_t dnxt = dhdr & 0xFFFFFFu;
-                    if (dnxt == 0xFFFFFFu || dnxt == 0u) break;
-                    dptr = dnxt | 0x80000000u;
-                }
-                fflush(stdout);
             }
         } else if ((value & 0x01000000u) && sync == 1u && dir == 0u) {
             /* Block mode, GPU→RAM (dir=0 = from-device): drain GPUREAD buffer into g_ram.
@@ -2002,7 +1517,7 @@ static uint32_t g_heap_ptr  = 0;  /* next free PS1 address */
  * --------------------------------------------------------------------------- */
 
 /* Forward declaration — mips_interpret calls call_by_address for compiled fns */
-void mips_interpret(CPUState* cpu, uint32_t start_pc);
+static void mips_interpret(CPUState* cpu, uint32_t start_pc);
 
 static int cv_force_interpret_range(uint32_t addr) {
     return (addr == 0x80019844u ||
@@ -2085,13 +1600,9 @@ static int mips_exec_one(CPUState* cpu, uint32_t* R[32],
         case 0x27: *R[rd] = ~(*R[rs] | *R[rt]); break; /* NOR */
         case 0x2A: *R[rd] = (int32_t)*R[rs] < (int32_t)*R[rt] ? 1 : 0; break; /* SLT  */
         case 0x2B: *R[rd] = *R[rs] < *R[rt] ? 1 : 0; break;                   /* SLTU */
-        default: {
-            static uint32_t s_bad_funct = 0;
-            if (++s_bad_funct <= 20u || (s_bad_funct % 10000u) == 0u) {
-                printf("[INTERP] SPECIAL funct=0x%02X at 0x%08X (#%u)\n", funct, pc, s_bad_funct);
-                fflush(stdout);
-            }
-        }
+        default:
+            printf("[INTERP] SPECIAL funct=0x%02X at 0x%08X\n", funct, pc);
+            fflush(stdout);
         }
         return 0;
 
@@ -2191,18 +1702,14 @@ static int mips_exec_one(CPUState* cpu, uint32_t* R[32],
     case 0x3A: /* SWC2 — store word from GTE data register */
         cpu->write_word(*R[rs]+(uint32_t)simm, gte_read_data(cpu, (uint8_t)rt));
         return 0;
-    default: {
-        static uint32_t s_bad_op = 0;
-        if (++s_bad_op <= 20u || (s_bad_op % 10000u) == 0u) {
-            printf("[INTERP] opcode=0x%02X at 0x%08X instr=0x%08X (#%u)\n", op, pc, instr, s_bad_op);
-            fflush(stdout);
-        }
+    default:
+        printf("[INTERP] opcode=0x%02X at 0x%08X instr=0x%08X\n", op, pc, instr);
+        fflush(stdout);
         return 0;
-    }
     }
 }
 
-void mips_interpret(CPUState* cpu, uint32_t start_pc) {
+static void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     /* Register pointer array — builds once per call depth */
     uint32_t zero_sink = 0;
     uint32_t* R[32];
@@ -2218,1239 +1725,6 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
 
     static int s_log = 0; ++s_log;
     /* [INTERP] enter — first 8: printf("[INTERP] enter 0x%08X ra=0x%08X\n", start_pc, cpu->ra); */
-
-    /* ---- CD Sector Loader intercept (func_801073C0) ----
-     * Called from overlay loading code at 0x8010882C with:
-     *   a0=sector, a1=0, a2=size, a3=completion_flag_addr
-     * On real PS1, this sets up async CD read. In our recompiler,
-     * we load sectors directly from ISO. */
-    if (start_pc == 0x801073C0u) {
-        static uint32_t s_cd_load_calls = 0;
-        s_cd_load_calls++;
-        uint32_t sector   = cpu->a0;
-        uint32_t mode     = cpu->a1;
-        uint32_t size     = cpu->a2;
-        uint32_t flag_ptr = cpu->a3;
-        fprintf(stderr, "[CD-SECTOR-LOAD] #%u f%u sector=0x%X(%u) mode=%u size=0x%X flag=0x%08X ra=0x%08X sp=0x%08X\n",
-                s_cd_load_calls, g_ps1_frame, sector, sector, mode, size, flag_ptr, cpu->ra, cpu->sp);
-        /* Dump first 32 MIPS instructions at func_801073C0 (first call only) */
-        if (s_cd_load_calls == 1u) {
-            fprintf(stderr, "[CD-SECTOR-LOAD] MIPS dump at 0x801073C0 (32 instrs):\n");
-            for (int _i = 0; _i < 32; _i++) {
-                uint32_t addr = 0x1073C0 + _i * 4;
-                uint32_t instr = 0;
-                if (addr + 4 <= 0x200000u) memcpy(&instr, &g_ram[addr], 4);
-                fprintf(stderr, "  0x%08X: %08X\n", 0x801073C0u + _i*4, instr);
-            }
-            /* Dump RAM around completion flag structure */
-            fprintf(stderr, "[CD-SECTOR-LOAD] RAM[0x3C0E0..0x3C110]:\n");
-            for (uint32_t off = 0x3C0E0; off < 0x3C110; off += 4) {
-                uint32_t val = 0;
-                memcpy(&val, &g_ram[off], 4);
-                if (val != 0) fprintf(stderr, "  [0x%05X] = 0x%08X\n", off, val);
-            }
-            fflush(stderr);
-        }
-        /* Load sectors from ISO if we have valid parameters */
-        if (sector > 0 && size > 0 && size < 0x200000u) {
-            /* Destination: the game's overlay loading system stores
-             * the destination in a global. Check RAM[0x6C3AC] (D_8006C3AC
-             * = g_CdLoadDest). If 0, fall back to 0x80180000. */
-            uint32_t dest = 0;
-            memcpy(&dest, &g_ram[0x6C3AC], 4);
-            if (dest == 0) {
-                /* Also check RAM[0x3C3B4] as an alternate location */
-                memcpy(&dest, &g_ram[0x3C3B4], 4);
-            }
-            /* If still 0, check stack frame for destination (sp+0x10 or sp+0x14) */
-            if (dest == 0 && cpu->sp >= 0x80000000u) {
-                uint32_t sp_phys = cpu->sp & 0x1FFFFFu;
-                if (sp_phys + 0x20 < 0x200000u) {
-                    for (int si = 0; si < 8; si++) {
-                        uint32_t sv = 0;
-                        memcpy(&sv, &g_ram[sp_phys + si*4], 4);
-                        fprintf(stderr, "[CD-SECTOR-LOAD] stack[sp+0x%02X]=0x%08X\n", si*4, sv);
-                    }
-                }
-            }
-            if (dest == 0) dest = 0x80180000u;  /* default overlay region */
-            uint32_t dest_phys = dest & 0x1FFFFFu;
-            uint32_t sectors_needed = (size + 2047u) / 2048u;
-            fprintf(stderr, "[CD-SECTOR-LOAD] loading %u sectors from %u to 0x%08X (phys 0x%05X)\n",
-                    sectors_needed, sector, dest, dest_phys);
-            uint8_t sec_buf[2048];
-            int ok = 1;
-            for (uint32_t i = 0; i < sectors_needed; i++) {
-                if (!psx_cdrom_read_sector(sector + i, sec_buf)) {
-                    fprintf(stderr, "[CD-SECTOR-LOAD] FAILED reading sector %u\n", sector + i);
-                    ok = 0;
-                    break;
-                }
-                uint32_t copy_size = 2048u;
-                if (i == sectors_needed - 1u) {
-                    uint32_t remainder = size % 2048u;
-                    if (remainder != 0) copy_size = remainder;
-                }
-                uint32_t dp = dest_phys + i * 2048u;
-                if (dp + copy_size <= 0x200000u) {
-                    memcpy(&g_ram[dp], sec_buf, copy_size);
-                }
-            }
-            fprintf(stderr, "[CD-SECTOR-LOAD] done: ok=%d, loaded %u bytes to 0x%08X\n",
-                    ok, size, dest);
-            /* Dump first 32 bytes at destination */
-            fprintf(stderr, "[CD-SECTOR-LOAD] data@dest: ");
-            for (int dd = 0; dd < 32 && dest_phys + dd < 0x200000u; dd++) {
-                fprintf(stderr, "%02X", g_ram[dest_phys + dd]);
-                if ((dd & 3) == 3) fprintf(stderr, " ");
-            }
-            fprintf(stderr, "\n");
-            fflush(stderr);
-            /* Set completion flag to 0 (loading complete) */
-            if (flag_ptr >= 0x80000000u) {
-                uint32_t flag_phys = flag_ptr & 0x1FFFFFu;
-                if (flag_phys + 4 <= 0x200000u) {
-                    uint32_t zero = 0;
-                    memcpy(&g_ram[flag_phys], &zero, 4);
-                    fprintf(stderr, "[CD-SECTOR-LOAD] cleared flag at 0x%08X\n", flag_ptr);
-                }
-            }
-        }
-        cpu->v0 = 0;  /* return success */
-        fflush(stderr);
-        return;
-    }
-
-    /* ---- CD Load Status Check intercept (func_801073E8) ----
-     * Called from overlay code to check/start CD operations.
-     * Return 0 = success/complete. */
-    if (start_pc == 0x801073E8u) {
-        static uint32_t s_cd_status = 0;
-        if (++s_cd_status <= 10u) {
-            fprintf(stderr, "[CD-STATUS-CHECK] #%u f%u a0=0x%X a1=0x%X a2=0x%X ra=0x%08X\n",
-                    s_cd_status, g_ps1_frame, cpu->a0, cpu->a1, cpu->a2, cpu->ra);
-            fflush(stderr);
-        }
-        cpu->v0 = 0;
-        return;
-    }
-
-    /* DebugUpdate (0x800E2F34): body compiled out in VERSION_US.
-     * The function is just `jr $ra; nop` — returns whatever was in $v0.
-     * If $v0 happens to be 0 (from ClearOTag or GPU counter resets),
-     * MainGame's `if (DebugUpdate() != 0) UpdateGame();` never runs
-     * UpdateGame, keeping g_GameState stuck at Game_Init=0 forever.
-     * Fix: intercept and force v0=1 so UpdateGame always runs. */
-    if (start_pc == 0x800E2F34u) {
-        static uint32_t s_dbg_calls = 0;
-        if (++s_dbg_calls <= 10u || (s_dbg_calls % 240u) == 0u) {
-            printf("[DEBUGUPDATE] f%u #%u v0_was=0x%08X → forcing v0=1 ra=0x%08X\n",
-                   g_ps1_frame, s_dbg_calls, cpu->v0, cpu->ra);
-            fflush(stdout);
-        }
-        cpu->v0 = 1u;
-        return;
-    }
-
-    /* UpdateGame (0x800E7AEC): advances the game state machine.
-     * Trace entry + current g_GameState to see state transitions.
-     * Also trace sub-calls to understand what Game_Init does. */
-    if (start_pc == 0x800E7AECu) {
-        static uint32_t s_upd_calls = 0;
-        uint32_t game_state = 0;
-        memcpy(&game_state, &g_ram[0x3C734], 4);
-        uint32_t sub_state = 0;
-        memcpy(&sub_state, &g_ram[0x73060], 4);
-        if (++s_upd_calls <= 20u || (s_upd_calls % 240u) == 0u) {
-            printf("[UPDATEGAME] f%u #%u g_GameState=%u sub_state=%u ra=0x%08X\n",
-                   g_ps1_frame, s_upd_calls, game_state, sub_state, cpu->ra);
-            fflush(stdout);
-        }
-        /* Dump the jump table entry for the current game_state to verify dispatch */
-        if (game_state == 8u && sub_state == 6u) {
-            static uint32_t s_jt_dump = 0;
-            if (++s_jt_dump <= 5u) {
-                /* UpdateGame jump table at 0x800DB828 + gs*4 (g_ram offset 0xDB828) */
-                uint32_t jt_base = 0xDB828u; /* 0x800DB828 - 0x80000000 */
-                uint32_t jt_addr = jt_base + game_state * 4;
-                uint32_t jt_val = 0;
-                if (jt_addr + 4 <= 0x200000u) {
-                    memcpy(&jt_val, &g_ram[jt_addr], 4);
-                }
-                /* Also read the gs=8 handler's sub_state switch table */
-                uint32_t sub_jt = 0;
-                uint32_t sub_state_ram = 0;
-                memcpy(&sub_state_ram, &g_ram[0x73060], 4);
-                printf("[UG-JT] f%u gs=%u sub=%u jt_entry[%u]=0x%08X (table@0x800DB828)\n",
-                       g_ps1_frame, game_state, sub_state_ram, game_state, jt_val);
-                fflush(stdout);
-            }
-        }
-        /* Track sub_state changes frame-to-frame for gs=8 */
-        if (game_state == 8u) {
-            static uint32_t s_prev_sub = 0xFFFFFFFF;
-            static uint32_t s_gs8_stuck_count = 0;
-            if (sub_state != s_prev_sub) {
-                printf("[GS8-SUB-CHANGE] f%u sub: %u → %u\n", g_ps1_frame, s_prev_sub, sub_state);
-                fflush(stdout);
-                s_gs8_stuck_count = 0;
-            } else {
-                s_gs8_stuck_count++;
-                if (s_gs8_stuck_count <= 5u || s_gs8_stuck_count == 20u) {
-                    printf("[GS8-SUB-STUCK] f%u sub=%u stuck for %u frames\n",
-                           g_ps1_frame, sub_state, s_gs8_stuck_count);
-                    fflush(stdout);
-                }
-            }
-            s_prev_sub = sub_state;
-        }
-        /* When sub_state >= 5, log key values for loading debugging */
-        if (sub_state >= 5u && s_upd_calls <= 80u) {
-            uint32_t v_978AC = 0, v_6C3B0 = 0, v_3C9A4 = 0, v_bafc_diag = 0, v_c398_diag = 0;
-            memcpy(&v_978AC, &g_ram[0x978AC], 4);
-            memcpy(&v_6C3B0, &g_ram[0x6C3B0], 4);
-            memcpy(&v_3C9A4, &g_ram[0x3C9A4], 4);
-            memcpy(&v_bafc_diag, &g_ram[0x6BAFC], 4);
-            memcpy(&v_c398_diag, &g_ram[0x6C398], 4);
-            printf("[UG-CASE5] f%u #%u sub=%u 978AC=0x%08X 6C3B0=0x%08X BAFC=0x%08X C398=0x%08X\n",
-                   g_ps1_frame, s_upd_calls, sub_state, v_978AC, v_6C3B0, v_bafc_diag, v_c398_diag);
-            fflush(stdout);
-        }
-        /* OVERLAY LOADING FIX: When sub_state==5 and D_8006BAFC==0x100,
-         * the game wants to load an overlay from CD but the async CD event
-         * system (CdlSeekL → TestEvent via A110) doesn't work in our recompiler.
-         * Fix: load the overlay data directly from ISO, copy to RAM, then
-         * clear the loading flags so the game can proceed. */
-        /* OVERLAY TABLE CACHE: On frame 0 (before BSS clear), dump and cache
-         * the overlay table from DRA.BIN data. The table at 0x800A4820 contains
-         * overlay entries. Entry 0x45 is at 0xA4820 with sector=0x754F. */
-        if (g_ps1_frame == 0u && s_upd_calls == 1u) {
-            /* Dump from entry 0 (0xA3C14) through entry 0x46 (0xA487C) */
-            fprintf(stderr, "[OVL-TBL-DUMP] Non-zero words in 0xA3C00..0xA4900:\n");
-            for (uint32_t off = 0xA3C00; off < 0xA4900; off += 4) {
-                uint32_t val = 0;
-                if (off + 4 <= 0x200000u) memcpy(&val, &g_ram[off], 4);
-                if (val != 0) {
-                    fprintf(stderr, "  [0x%05X] = 0x%08X\n", off, val);
-                }
-            }
-            /* Dense dump of entries 0-5 (0xA3C14..0xA3D28) */
-            fprintf(stderr, "[OVL-TBL-DUMP] Dense entries 0-5 (0xA3C14..0xA3D28):\n");
-            for (uint32_t off = 0xA3C14; off < 0xA3D28; off += 4) {
-                uint32_t val = 0;
-                memcpy(&val, &g_ram[off], 4);
-                fprintf(stderr, "  [0x%05X] = 0x%08X\n", off, val);
-            }
-            fflush(stderr);
-        }
-        if (sub_state == 5u) {
-            fprintf(stderr, "[OVL-FIX-DBG] f%u entering overlay fix check\n", g_ps1_frame);
-            fflush(stderr);
-            uint32_t v_bafc = 0, v_c398 = 0;
-            memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
-            memcpy(&v_c398, &g_ram[0x6C398], 4);
-            fprintf(stderr, "[OVL-FIX-DBG] BAFC=0x%08X C398=0x%08X\n", v_bafc, v_c398);
-            fflush(stderr);
-            if (v_c398 != 0u && v_bafc != 0u) {
-                static int s_ovl_loaded = 0;
-                if (!s_ovl_loaded) {
-                    s_ovl_loaded = 1;
-                    fprintf(stderr, "[OVL-FIX-DBG] step 1: reading overlay table\n"); fflush(stderr);
-                    /* Overlay table gets cleared during frame 1 (BSS init). Use cached values
-                     * from frame-1 dump: ID=0x45 at 0xA4820:
-                     * sector=0x754F(30031) size=0x56B28(355112) init=0x800DCDF4
-                     * update=0x800DCDF0 cleanup=0x800DD178 */
-                    uint32_t ovl_id = 0x45;
-                    uint32_t ovl_sector = 0x754F;  /* 30031 */
-                    uint32_t ovl_size   = 0x56B28; /* 355112 bytes */
-                    uint32_t ovl_init   = 0x800DCDF4;
-                    uint32_t ovl_update = 0x800DCDF0;
-                    uint32_t ovl_cleanup= 0x800DD178;
-                    fprintf(stderr, "[OVL-FIX-DBG] step 2: id=0x%X sector=%u size=%u init=0x%08X\n",
-                            ovl_id, ovl_sector, ovl_size, ovl_init); fflush(stderr);
-                    /* Load address: SotN stage overlays load to 0x80180000 */
-                    uint32_t load_addr = 0x80180000u;
-                    uint32_t load_phys = load_addr & 0x1FFFFFFF;
-                    uint32_t sectors_needed = (ovl_size + 2047u) / 2048u;
-                    uint8_t sec_buf[2048];
-                    int ok = 1;
-                    fprintf(stderr, "[OVL-FIX-DBG] step 3: reading %u sectors\n", sectors_needed); fflush(stderr);
-                    for (uint32_t i = 0; i < sectors_needed; i++) {
-                        if (!psx_cdrom_read_sector(ovl_sector + i, sec_buf)) {
-                            fprintf(stderr, "[OVL-FIX] FAILED reading sector %u\n", ovl_sector + i);
-                            fflush(stderr);
-                            ok = 0;
-                            break;
-                        }
-                        uint32_t copy_size = 2048u;
-                        if (i == sectors_needed - 1u) {
-                            uint32_t remainder = ovl_size % 2048u;
-                            if (remainder != 0) copy_size = remainder;
-                        }
-                        uint32_t dest_phys = load_phys + i * 2048u;
-                        if (dest_phys + copy_size <= 0x200000u) {
-                            memcpy(&g_ram[dest_phys], sec_buf, copy_size);
-                        }
-                    }
-                    fprintf(stderr, "[OVL-FIX-DBG] step 4: read done, ok=%d\n", ok); fflush(stderr);
-                    /* Dump first 64 bytes of overlay data at 0x180000 */
-                    {
-                        fprintf(stderr, "[OVL-FIX-DATA] @0x180000 first 64B: ");
-                        for (int _dd = 0; _dd < 64; _dd++) {
-                            fprintf(stderr, "%02X", g_ram[0x180000 + _dd]);
-                            if ((_dd & 3) == 3) fprintf(stderr, " ");
-                        }
-                        fprintf(stderr, "\n"); fflush(stderr);
-                        /* Dump MIPS at init function 0x800DCDF4 (phys 0xDCDF4) */
-                        fprintf(stderr, "[OVL-FIX-INIT-DUMP] MIPS at 0x800DCDF4 (8 instrs):\n");
-                        for (int _mi = 0; _mi < 8; _mi++) {
-                            uint32_t maddr = 0xDCDF4 + _mi * 4;
-                            uint32_t minstr = 0;
-                            memcpy(&minstr, &g_ram[maddr], 4);
-                            fprintf(stderr, "  0x%08X: %08X\n", 0x800DCDF4 + _mi*4, minstr);
-                        }
-                        fflush(stderr);
-                    }
-                    if (ok) {
-                        fprintf(stderr, "[OVL-FIX-DBG] step 5: clearing flags\n"); fflush(stderr);
-                        /* Clear loading flags to unblock case 5 */
-                        uint32_t zero = 0;
-                        memcpy(&g_ram[0x6BAFC], &zero, 4);  /* D_8006BAFC = 0 */
-                        memcpy(&g_ram[0x6C398], &zero, 4);  /* D_8006C398 = 0 */
-                        /* Also trace function pointers BEFORE init */
-                        uint32_t fp_c778 = 0, fp_c780 = 0;
-                        memcpy(&fp_c778, &g_ram[0x3C778], 4);
-                        memcpy(&fp_c780, &g_ram[0x3C780], 4);
-                        fprintf(stderr, "[OVL-FIX-DBG] step 6: C778=0x%08X C780=0x%08X\n", fp_c778, fp_c780); fflush(stderr);
-                        /* The overlay header at 0x80180000 contains function pointers.
-                         * Read the first two and store them as the stage init/update handlers
-                         * at C778/C780. The original game reads these during early init
-                         * (frame 1, before overlay loads), getting garbage. Fix by writing
-                         * the correct values now. */
-                        uint32_t ovl_fn0 = 0, ovl_fn1 = 0, ovl_fn2 = 0;
-                        memcpy(&ovl_fn0, &g_ram[0x180000], 4);  /* overlay[+0x00] */
-                        memcpy(&ovl_fn1, &g_ram[0x180004], 4);  /* overlay[+0x04] */
-                        memcpy(&ovl_fn2, &g_ram[0x180008], 4);  /* overlay[+0x08] */
-                        fprintf(stderr, "[OVL-FIX-DBG] step 6b: ovl_fn0=0x%08X ovl_fn1=0x%08X ovl_fn2=0x%08X\n", ovl_fn0, ovl_fn1, ovl_fn2); fflush(stderr);
-                        if (ovl_fn0 >= 0x80180000u && ovl_fn0 <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C778], &ovl_fn0, 4);
-                            fprintf(stderr, "[OVL-FIX] Set C778 = 0x%08X (overlay[0])\n", ovl_fn0); fflush(stderr);
-                        }
-                        if (ovl_fn1 >= 0x80180000u && ovl_fn1 <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C780], &ovl_fn1, 4);
-                            fprintf(stderr, "[OVL-FIX] Set C780 = 0x%08X (overlay[4])\n", ovl_fn1); fflush(stderr);
-                        }
-                        if (ovl_fn2 >= 0x80180000u && ovl_fn2 <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C774], &ovl_fn2, 4);
-                            fprintf(stderr, "[OVL-FIX] Set C774 = 0x%08X (overlay[8])\n", ovl_fn2); fflush(stderr);
-                        }
-                        /* Skip calling init function since 0x800DCDF4 is actually 
-                         * a string table ("F_SEL", "NO3", etc.), not executable code */
-                        #if 0
-                        /* Call init function with saved/restored CPU state. */
-                        if (ovl_init >= 0x800A0000u && ovl_init <= 0x801FFFFFu) {
-                            fprintf(stderr, "[OVL-FIX-DBG] step 7: calling init at 0x%08X\n", ovl_init); fflush(stderr);
-                            CPUState saved = *cpu;
-                            cpu->a0 = 0;
-                            cpu->ra = 0;
-                            call_by_address(cpu, ovl_init);
-                            memcpy(&fp_c778, &g_ram[0x3C778], 4);
-                            memcpy(&fp_c780, &g_ram[0x3C780], 4);
-                            fprintf(stderr, "[OVL-FIX-DBG] step 8: post-init C778=0x%08X C780=0x%08X\n", fp_c778, fp_c780); fflush(stderr);
-                            *cpu = saved;
-                        }
-                        #endif
-                        fprintf(stderr, "[OVL-FIX-DBG] step 9: DONE\n"); fflush(stderr);
-                    }
-                ovl_fix_done: ;
-                }
-            }
-        }
-        /* AUTO-CLEAR loading requests AND load overlay data from ISO.
-         * Handles BOTH the initial overlay (sub_state>=6) AND game state
-         * transitions (gs=8 prologue, etc.).
-         * On a real PS1 the CD event system handles this asynchronously.
-         * We intercept and load data synchronously. */
-        {
-            uint32_t v_bafc = 0, v_c398 = 0, v_c3b0 = 0;
-            memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
-            memcpy(&v_c398, &g_ram[0x6C398], 4);
-            memcpy(&v_c3b0, &g_ram[0x6C3B0], 4);
-            if (v_c398 != 0u || v_bafc != 0u) {
-                static uint32_t s_autoclear = 0;
-                int tile_cluts_uploaded = 0; /* set when tile CLUT extraction succeeds */
-                if (++s_autoclear <= 40u) {
-                    printf("[LOAD-AUTOCLEAR] f%u #%u gs=%u sub=%u BAFC=0x%08X C398=0x%08X C3B0=0x%08X -> clearing\n",
-                           g_ps1_frame, s_autoclear, game_state, sub_state, v_bafc, v_c398, v_c3b0);
-                    fflush(stdout);
-                }
-
-                /* Overlay table — full 70-entry table read from DRA.BIN at
-                 * file offset 0x3C40 (runtime 0x800A3C40). Each entry = 0x2C bytes.
-                 * Verified against known entries: ID 3 (prologue), 13 (room), 69 (F_TITLE0). */
-                typedef struct {
-                    uint32_t clut_sec;   /* +00 CLUT sector on disc */
-                    uint32_t ovl_sec;    /* +04 overlay code start sector */
-                    uint32_t ovl_size;   /* +08 overlay size in bytes */
-                    uint32_t sec3;       /* +0C secondary sector (tileset/room) */
-                    uint32_t vram_pos;   /* +10 VRAM destination */
-                    uint32_t unk14;      /* +14 */
-                    uint32_t flags;      /* +18 */
-                    uint32_t init;       /* +1C init function pointer */
-                    uint32_t update;     /* +20 update function pointer */
-                    uint32_t cleanup;    /* +24 cleanup function pointer */
-                    uint32_t misc;       /* +28 */
-                } OvlEntry;
-
-                static const OvlEntry s_ovl_table[] = {
-                    [0]  = { .clut_sec=0x7E5D, .ovl_sec=0x7F16, .ovl_size=0x5F58C, .sec3=0x7EDD, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x30D, .init=0x800DD180, .update=0x800DD17C, .cleanup=0x800DD178 },
-                    [1]  = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x313, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD168 },
-                    [2]  = { .clut_sec=0x7C0E, .ovl_sec=0x7CBF, .ovl_size=0x552CC, .sec3=0x7C8E, .vram_pos=0x1A20, .unk14=0x16250, .flags=0x309, .init=0x800DD160, .update=0x800DD15C, .cleanup=0x800DD158 },
-                    [3]  = { .clut_sec=0x7849, .ovl_sec=0x7766, .ovl_size=0x585C0, .sec3=0x7817, .vram_pos=0x1A20, .unk14=0x16960, .flags=0x307, .init=0x800DD150, .update=0x800DD14C, .cleanup=0x800DD148 },
-                    [4]  = { .clut_sec=0x813E, .ovl_sec=0x81F6, .ovl_size=0x4FDBC, .sec3=0x81BE, .vram_pos=0x1C20, .unk14=0x19D00, .flags=0x317, .init=0x800DD140, .update=0x800DD13C, .cleanup=0x800DD134 },
-                    [5]  = { .clut_sec=0x7A34, .ovl_sec=0x79BF, .ovl_size=0x2F428, .sec3=0x7A1E, .vram_pos=0x1420, .unk14=0x9420,  .flags=0x319, .init=0x800DD12C, .update=0x800DD128, .cleanup=0x800DD124 },
-                    [6]  = { .clut_sec=0x7B8C, .ovl_sec=0x7AB5, .ovl_size=0x5B404, .sec3=0x7B6C, .vram_pos=0x1A20, .unk14=0xDF10,  .flags=0x305, .init=0x800DD11C, .update=0x800DD118, .cleanup=0x800DD114 },
-                    [7]  = { .clut_sec=0x917F, .ovl_sec=0x9235, .ovl_size=0x53434, .sec3=0x91FF, .vram_pos=0x1C20, .unk14=0x18D10, .flags=0x30F, .init=0x800DD10C, .update=0x800DD108, .cleanup=0x800DD100 },
-                    [8]  = { .clut_sec=0x793E, .ovl_sec=0x78CA, .ovl_size=0x1D46C, .sec3=0x7905, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x325, .init=0x800DD0F8, .update=0x800DD0F4, .cleanup=0x800DD178 },
-                    [9]  = { .clut_sec=0x8400, .ovl_sec=0x84AF, .ovl_size=0x5F85C, .sec3=0x8480, .vram_pos=0x1A20, .unk14=0x151C0, .flags=0x30B, .init=0x800DD0EC, .update=0x800DD0E8, .cleanup=0x800DD0E0 },
-                    [10] = { .clut_sec=0x76E5, .ovl_sec=0x7600, .ovl_size=0x5617C, .sec3=0x76AD, .vram_pos=0x1C20, .unk14=0x19FD0, .flags=0x323, .init=0x800DD0D8, .update=0x800DD0D4, .cleanup=0x800DD0CC },
-                    [11] = { .clut_sec=0x9554, .ovl_sec=0x95DE, .ovl_size=0x3C55C, .sec3=0x95D4, .vram_pos=0x1A20, .unk14=0x28C0,  .flags=0x31B, .init=0x800DD0C4, .update=0x800DD0C0, .cleanup=0x800DD0BC },
-                    [12] = { .clut_sec=0x92DD, .ovl_sec=0x937D, .ovl_size=0x4B780, .sec3=0x935D, .vram_pos=0x1820, .unk14=0xDE90,  .flags=0x32E, .init=0x800DD0B4, .update=0x800DD0B0, .cleanup=0x800DD0A8 },
-                    [13] = { .clut_sec=0x9415, .ovl_sec=0x94CE, .ovl_size=0x42340, .sec3=0x9495, .vram_pos=0x1C20, .unk14=0x1A060, .flags=0x311, .init=0x800DD0A0, .update=0x800DD09C, .cleanup=0x800DD094 },
-                    [14] = { .clut_sec=0x996C, .ovl_sec=0x9A25, .ovl_size=0x14768, .sec3=0x99EC, .vram_pos=0x1C20, .unk14=0x1A060, .flags=0x2FF, .init=0x800DD08C, .update=0x800DD088, .cleanup=0x800DD094 },
-                    [15] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x30D, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [16] = { .clut_sec=0x7E5D, .ovl_sec=0x7F16, .ovl_size=0x5F58C, .sec3=0x7EDD, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x30D, .init=0x800DD180, .update=0x800DD17C, .cleanup=0x800DD178 },
-                    [17] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x30D, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [18] = { .clut_sec=0x9DAA, .ovl_sec=0x9E62, .ovl_size=0x23FCC, .sec3=0x9E2A, .vram_pos=0x1620, .unk14=0x1A610, .flags=0x2FF, .init=0x800DD080, .update=0x800DD07C, .cleanup=0x800DD074 },
-                    [19] = { .clut_sec=0x92DD, .ovl_sec=0x937D, .ovl_size=0x4B780, .sec3=0x935D, .vram_pos=0x1820, .unk14=0xDE90,  .flags=0x32E, .init=0x800DD0B4, .update=0x800DD0B0, .cleanup=0x800DD0A8 },
-                    [20] = { .clut_sec=0x9415, .ovl_sec=0x94CE, .ovl_size=0x42340, .sec3=0x9495, .vram_pos=0x1C20, .unk14=0x1A060, .flags=0x311, .init=0x800DD0A0, .update=0x800DD09C, .cleanup=0x800DD094 },
-                    [21] = { .clut_sec=0x7C0E, .ovl_sec=0x7CBF, .ovl_size=0x552CC, .sec3=0x7C8E, .vram_pos=0x1A20, .unk14=0x16250, .flags=0x309, .init=0x800DD160, .update=0x800DD15C, .cleanup=0x800DD158 },
-                    [22] = { .clut_sec=0xB23A, .ovl_sec=0xB2DA, .ovl_size=0x23460, .sec3=0xB2BA, .vram_pos=0x1A20, .unk14=0xDCE0,  .flags=0x2FF, .init=0x800DD12C, .update=0x800DD070, .cleanup=0x800DD068 },
-                    [23] = { .clut_sec=0xAF3A, .ovl_sec=0xAFF3, .ovl_size=0x1AF70, .sec3=0x7EDD, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x2FF, .init=0x800DD180, .update=0x800DD064, .cleanup=0x800DD178 },
-                    [24] = { .clut_sec=0xACDD, .ovl_sec=0xAD91, .ovl_size=0x516E8, .sec3=0xAD5D, .vram_pos=0x1820, .unk14=0x17AB0, .flags=0x2FF, .init=0x800DD0C4, .update=0x800DD060, .cleanup=0x800DD058 },
-                    [25] = { .clut_sec=0xABD1, .ovl_sec=0xAC71, .ovl_size=0x35630, .sec3=0xAC51, .vram_pos=0x1A20, .unk14=0xDF10,  .flags=0x2FF, .init=0x800DD11C, .update=0x800DD054, .cleanup=0x800DD114 },
-                    [26] = { .clut_sec=0xAA76, .ovl_sec=0xAB26, .ovl_size=0x54E38, .sec3=0xAAF6, .vram_pos=0x1420, .unk14=0x162F0, .flags=0x2FF, .init=0x800DD170, .update=0x800DD050, .cleanup=0x800DD048 },
-                    [27] = { .clut_sec=0xA956, .ovl_sec=0xAA0E, .ovl_size=0x33530, .sec3=0xA9D6, .vram_pos=0x1A20, .unk14=0x19850, .flags=0x2FF, .init=0x800DD0EC, .update=0x800DD044, .cleanup=0x800DD03C },
-                    [28] = { .clut_sec=0xA854, .ovl_sec=0xA8E7, .ovl_size=0x36934, .sec3=0xA8D4, .vram_pos=0x1A20, .unk14=0x70F0,  .flags=0x2FF, .init=0x800DD0D8, .update=0x800DD038, .cleanup=0x800DD030 },
-                    [29] = { .clut_sec=0xA737, .ovl_sec=0xA7EE, .ovl_size=0x323BC, .sec3=0xA7B7, .vram_pos=0x1020, .unk14=0x19E70, .flags=0x2FF, .init=0x800DD150, .update=0x800DD02C, .cleanup=0x800DD024 },
-                    [30] = { .clut_sec=0xA5E2, .ovl_sec=0xA699, .ovl_size=0x4E5B4, .sec3=0xA662, .vram_pos=0x1420, .unk14=0x19D50, .flags=0x2FF, .init=0x800DD140, .update=0x800DD020, .cleanup=0x800DD018 },
-                    [31] = { .clut_sec=0x9044, .ovl_sec=0x90F9, .ovl_size=0x425C4, .sec3=0x90C4, .vram_pos=0x1220, .unk14=0x18BC0, .flags=0x321, .init=0x800DD010, .update=0x800DD00C, .cleanup=0x800DD004 },
-                    [32] = { .clut_sec=0x89C4, .ovl_sec=0x8A7B, .ovl_size=0x54B8C, .sec3=0x8A44, .vram_pos=0x1C20, .unk14=0x19170, .flags=0x338, .init=0x800DCFFC, .update=0x800DCFF4, .cleanup=0x800DCFEC },
-                    [33] = { .clut_sec=0x8B26, .ovl_sec=0x8BDC, .ovl_size=0x380E0, .sec3=0x8BA6, .vram_pos=0x1A20, .unk14=0x18E40, .flags=0x338, .init=0x800DCFE4, .update=0x800DCFDC, .cleanup=0x800DCFD4 },
-                    [34] = { .clut_sec=0x88BE, .ovl_sec=0x8960, .ovl_size=0x31430, .sec3=0x893E, .vram_pos=0x1A20, .unk14=0xEE70,  .flags=0x301, .init=0x800DCFCC, .update=0x800DCFC4, .cleanup=0x800DCFBC },
-                    [35] = { .clut_sec=0x8570, .ovl_sec=0x860E, .ovl_size=0x43EAC, .sec3=0x85F0, .vram_pos=0x1A20, .unk14=0xCA30,  .flags=0x303, .init=0x800DCFB4, .update=0x800DCFAC, .cleanup=0x800DCFA4 },
-                    [36] = { .clut_sec=0x8C4E, .ovl_sec=0x8D01, .ovl_size=0x4C9D8, .sec3=0x8CCE, .vram_pos=0x1C20, .unk14=0x170E0, .flags=0x338, .init=0x800DCF9C, .update=0x800DCF94, .cleanup=0x800DCF8C },
-                    [37] = { .clut_sec=0x8697, .ovl_sec=0x8737, .ovl_size=0x2AB20, .sec3=0x8717, .vram_pos=0x1620, .unk14=0xE020,  .flags=0x319, .init=0x800DCF84, .update=0x800DCF7C, .cleanup=0x800DCF74 },
-                    [38] = { .clut_sec=0x878E, .ovl_sec=0x882C, .ovl_size=0x48338, .sec3=0x880E, .vram_pos=0x1820, .unk14=0xC820,  .flags=0x301, .init=0x800DCF6C, .update=0x800DCF64, .cleanup=0x800DCF5C },
-                    [39] = { .clut_sec=0x8D9C, .ovl_sec=0x8E3C, .ovl_size=0x4A52C, .sec3=0x8E1C, .vram_pos=0x1A20, .unk14=0xDF40,  .flags=0x338, .init=0x800DCF54, .update=0x800DCF4C, .cleanup=0x800DCF44 },
-                    [40] = { .clut_sec=0x9658, .ovl_sec=0x970F, .ovl_size=0x2D3D4, .sec3=0x96D8, .vram_pos=0x1420, .unk14=0x19E50, .flags=0x325, .init=0x800DCF3C, .update=0x800DCF34, .cleanup=0x800DCF2C },
-                    [41] = { .clut_sec=0x8ED2, .ovl_sec=0x8F87, .ovl_size=0x5DC14, .sec3=0x8F52, .vram_pos=0x1A20, .unk14=0x185D0, .flags=0x301, .init=0x800DCF24, .update=0x800DCF1C, .cleanup=0x800DCF14 },
-                    [42] = { .clut_sec=0x976B, .ovl_sec=0x980F, .ovl_size=0x39390, .sec3=0x97EB, .vram_pos=0x1A20, .unk14=0xF9C0,  .flags=0x315, .init=0x800DCF0C, .update=0x800DCF04, .cleanup=0x800DCEFC },
-                    [43] = { .clut_sec=0x9883, .ovl_sec=0x9908, .ovl_size=0x3111C, .sec3=0x9903, .vram_pos=0x1A20, .unk14=0x6F0,   .flags=0x31B, .init=0x800DCEF4, .update=0x800DCEEC, .cleanup=0x800DCEE4 },
-                    [44] = { .clut_sec=0x9A4F, .ovl_sec=0x9B02, .ovl_size=0x44BA8, .sec3=0x9ACF, .vram_pos=0x1C20, .unk14=0x17430, .flags=0x338, .init=0x800DCEDC, .update=0x800DCED4, .cleanup=0x800DCECC },
-                    [45] = { .clut_sec=0x9B8D, .ovl_sec=0x9C44, .ovl_size=0x3FB60, .sec3=0x9C0D, .vram_pos=0x1C20, .unk14=0x19350, .flags=0x338, .init=0x800DCEC4, .update=0x800DCEBC, .cleanup=0x800DCEB4 },
-                    [46] = { .clut_sec=0x9CC5, .ovl_sec=0x9D7C, .ovl_size=0x166E8, .sec3=0x9D45, .vram_pos=0x1C20, .unk14=0x19350, .flags=0x2FF, .init=0x800DCEAC, .update=0x800DCEA4, .cleanup=0x800DCEB4 },
-                    [47] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [48] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [49] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [50] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [51] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [52] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [53] = { .clut_sec=0x9B8D, .ovl_sec=0x9C44, .ovl_size=0x3FB60, .sec3=0x9C0D, .vram_pos=0x1C20, .unk14=0x19350, .flags=0x338, .init=0x800DCEC4, .update=0x800DCEBC, .cleanup=0x800DCEB4 },
-                    [54] = { .clut_sec=0xB88F, .ovl_sec=0xB93F, .ovl_size=0x275BC, .sec3=0xB90F, .vram_pos=0x1420, .unk14=0x16750, .flags=0x2FF, .init=0x800DCFB4, .update=0x800DCE9C, .cleanup=0x800DCE94 },
-                    [55] = { .clut_sec=0xB791, .ovl_sec=0xB848, .ovl_size=0x22CEC, .sec3=0xB811, .vram_pos=0x1020, .unk14=0x19F60, .flags=0x2FF, .init=0x800DCF9C, .update=0x800DCE8C, .cleanup=0x800DCE84 },
-                    [56] = { .clut_sec=0xB671, .ovl_sec=0xB727, .ovl_size=0x34044, .sec3=0xB6F1, .vram_pos=0x1820, .unk14=0x18910, .flags=0x2FF, .init=0x800DCF3C, .update=0x800DCE7C, .cleanup=0x800DCE74 },
-                    [57] = { .clut_sec=0xB517, .ovl_sec=0xB5C7, .ovl_size=0x54408, .sec3=0xB597, .vram_pos=0x1420, .unk14=0x162F0, .flags=0x2FF, .init=0x800DCF24, .update=0x800DCE6C, .cleanup=0x800DD048 },
-                    [58] = { .clut_sec=0xB415, .ovl_sec=0xB4CA, .ovl_size=0x25C24, .sec3=0xB495, .vram_pos=0x1420, .unk14=0x18C30, .flags=0x2FF, .init=0x800DCFE4, .update=0x800DCE64, .cleanup=0x800DCE5C },
-                    [59] = { .clut_sec=0xB322, .ovl_sec=0xB3D3, .ovl_size=0x20630, .sec3=0xB3A2, .vram_pos=0x1220, .unk14=0x16E90, .flags=0x2FF, .init=0x800DCF6C, .update=0x800DCE54, .cleanup=0x800DCE4C },
-                    [60] = { .clut_sec=0xB125, .ovl_sec=0xB1DB, .ovl_size=0x2E948, .sec3=0xB1A5, .vram_pos=0x1420, .unk14=0x191E0, .flags=0x2FF, .init=0x800DCF84, .update=0x800DCE44, .cleanup=0x800DCE3C },
-                    [61] = { .clut_sec=0xB02A, .ovl_sec=0xB0E0, .ovl_size=0x21F60, .sec3=0xB0AA, .vram_pos=0x1020, .unk14=0x193E0, .flags=0x2FF, .init=0x800DCEDC, .update=0x800DCE34, .cleanup=0x800DCE2C },
-                    [62] = { .clut_sec=0xAE35, .ovl_sec=0xAEEA, .ovl_size=0x274DC, .sec3=0xAEB5, .vram_pos=0x1420, .unk14=0x18D60, .flags=0x2FF, .init=0x800DCF0C, .update=0x800DCE24, .cleanup=0x800DCE1C },
-                    [63] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD178 },
-                    [64] = { .clut_sec=0x7D6F, .ovl_sec=0x7E28, .ovl_size=0x19E94, .sec3=0x7DEF, .vram_pos=0x1820, .unk14=0x1A700, .flags=0x34B, .init=0x800DCE14, .update=0x800DCE10, .cleanup=0x800DD178 },
-                    [65] = { .clut_sec=0x8297, .ovl_sec=0x834F, .ovl_size=0x57E18, .sec3=0x8317, .vram_pos=0x1C20, .unk14=0x19AD0, .flags=0x30F, .init=0x800DCE08, .update=0x800DCE04, .cleanup=0x800DCDFC },
-                    [66] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD11C, .update=0x800DD118, .cleanup=0x800DD168 },
-                    [67] = { .clut_sec=0x7C0E, .ovl_sec=0x7CBF, .ovl_size=0x552CC, .sec3=0x7C8E, .vram_pos=0x1A20, .unk14=0x16250, .flags=0x338, .init=0x800DD160, .update=0x800DD15C, .cleanup=0x800DD158 },
-                    [68] = { .clut_sec=0x7FD6, .ovl_sec=0x808E, .ovl_size=0x57064, .sec3=0x8056, .vram_pos=0x1A20, .unk14=0x19CA0, .flags=0x338, .init=0x800DD170, .update=0x800DD16C, .cleanup=0x800DD168 },
-                    [69] = { .clut_sec=0x74B6, .ovl_sec=0x754F, .ovl_size=0x56B28, .sec3=0x7516, .vram_pos=0x1A20, .unk14=0x1A3A0, .flags=0x0,   .init=0x800DCDF4, .update=0x800DCDF0, .cleanup=0x800DD178 },
-                };
-
-                /* If BAFC looks like an overlay ID (low byte), try loading.
-                 * BAFC & 0x8000: preload only (load data, don't switch C778/C780)
-                 * BAFC without 0x8000: full switch (load data AND update C778/C780)
-                 * This matters because F_TITLE0 writes BAFC=0x8003 to preload
-                 * prologue data while the title screen is still active. */
-                uint32_t ovl_id = v_bafc & 0xFFu;
-                int is_preload = (v_bafc & 0x8000u) != 0;
-                if (ovl_id < sizeof(s_ovl_table)/sizeof(s_ovl_table[0])
-                    && s_ovl_table[ovl_id].ovl_sec != 0
-                    && s_ovl_table[ovl_id].ovl_size != 0) {
-                    const OvlEntry *e = &s_ovl_table[ovl_id];
-                    uint32_t load_addr = 0x80180000u;
-                    uint32_t load_phys = load_addr & 0x1FFFFFu;
-                    uint32_t sectors_needed = (e->ovl_size + 2047u) / 2048u;
-                    fprintf(stderr, "[OVL-LOAD] f%u %s overlay ID=%u sector=%u size=%u (%u sectors) to 0x%08X\n",
-                            g_ps1_frame, is_preload ? "PRELOADING" : "LOADING",
-                            ovl_id, e->ovl_sec, e->ovl_size, sectors_needed, load_addr);
-                    fflush(stderr);
-
-                    uint8_t sec_buf[2048];
-                    int ok = 1;
-                    for (uint32_t i = 0; i < sectors_needed; i++) {
-                        if (!psx_cdrom_read_sector(e->ovl_sec + i, sec_buf)) {
-                            fprintf(stderr, "[OVL-LOAD] FAILED reading sector %u\n", e->ovl_sec + i);
-                            ok = 0; break;
-                        }
-                        uint32_t copy_size = 2048u;
-                        if (i == sectors_needed - 1u) {
-                            uint32_t rem = e->ovl_size % 2048u;
-                            if (rem != 0) copy_size = rem;
-                        }
-                        uint32_t dp = load_phys + i * 2048u;
-                        if (dp + copy_size <= 0x200000u) {
-                            memcpy(&g_ram[dp], sec_buf, copy_size);
-                        }
-                    }
-                    fprintf(stderr, "[OVL-LOAD] done: ok=%d preload=%d\n", ok, is_preload);
-
-                    /* Dump key BSS data that C774 needs */
-                    if (ok) {
-                        uint32_t clut_ptr = 0;
-                        memcpy(&clut_ptr, &g_ram[0x1C1688], 4);
-                        fprintf(stderr, "[OVL-LOAD] After load: RAM[0x801C1688]=0x%08X (CLUT list ptr)\n", clut_ptr);
-                        /* Also check what's at the end of the loaded data (BSS boundary) */
-                        fprintf(stderr, "[OVL-LOAD] overlay end at 0x%08X (0x80180000 + 0x%X)\n",
-                                0x80180000u + e->ovl_size, e->ovl_size);
-                        /* Check if 0x801C1688 is within loaded range */
-                        uint32_t off_1688 = 0x1C1688u - 0x180000u;
-                        fprintf(stderr, "[OVL-LOAD] 0x801C1688 is at ovl offset 0x%X (%s loaded range 0x%X)\n",
-                                off_1688, off_1688 < e->ovl_size ? "WITHIN" : "BEYOND", e->ovl_size);
-                    }
-
-                    if (ok && !is_preload) {
-                        /* Full overlay switch: update C774/C778/C780 from overlay header */
-                        uint32_t hdr[8];
-                        memcpy(hdr, &g_ram[load_phys], sizeof(hdr));
-                        fprintf(stderr, "[OVL-LOAD] header: [0]=0x%08X [4]=0x%08X [8]=0x%08X [C]=0x%08X\n",
-                                hdr[0], hdr[1], hdr[2], hdr[3]);
-                        fprintf(stderr, "[OVL-LOAD] header: [10]=0x%08X [14]=0x%08X [18]=0x%08X [1C]=0x%08X\n",
-                                hdr[4], hdr[5], hdr[6], hdr[7]);
-
-                        if (hdr[0] >= 0x80180000u && hdr[0] <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C778], &hdr[0], 4);
-                            fprintf(stderr, "[OVL-LOAD] Set C778 = 0x%08X\n", hdr[0]);
-                        }
-                        if (hdr[1] >= 0x80180000u && hdr[1] <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C780], &hdr[1], 4);
-                            fprintf(stderr, "[OVL-LOAD] Set C780 = 0x%08X\n", hdr[1]);
-                        }
-                        /* gs=8 case 6 reads C774 for its JALR target — set from header[2] */
-                        if (hdr[2] >= 0x80180000u && hdr[2] <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C774], &hdr[2], 4);
-                            fprintf(stderr, "[OVL-LOAD] Set C774 = 0x%08X\n", hdr[2]);
-                        }
-
-                        fprintf(stderr, "[OVL-LOAD] data@0x180000: ");
-                        for (int dd = 0; dd < 32; dd++) {
-                            fprintf(stderr, "%02X", g_ram[load_phys + dd]);
-                            if ((dd & 3) == 3) fprintf(stderr, " ");
-                        }
-                        fprintf(stderr, "\n");
-
-                        /* Dump first 8 instructions at each overlay function */
-                        uint32_t fn_addrs[3];
-                        memcpy(&fn_addrs[0], &g_ram[0x3C778], 4);
-                        memcpy(&fn_addrs[1], &g_ram[0x3C780], 4);
-                        memcpy(&fn_addrs[2], &g_ram[0x3C774], 4);
-                        const char* fn_names[] = {"C778(init)", "C780(update)", "C774(draw)"};
-                        for (int fi = 0; fi < 3; fi++) {
-                            uint32_t fa = fn_addrs[fi] & 0x1FFFFFFFu;
-                            if (fa >= 0x180000u && fa < 0x200000u) {
-                                fprintf(stderr, "[OVL-CODE] %s at 0x%08X:", fn_names[fi], fn_addrs[fi]);
-                                for (int ii = 0; ii < 8; ii++) {
-                                    uint32_t w = 0;
-                                    memcpy(&w, &g_ram[fa + ii * 4], 4);
-                                    fprintf(stderr, " %08X", w);
-                                }
-                                fprintf(stderr, "\n");
-                            }
-                        }
-                    }
-                    fflush(stderr);
-
-                    /* -------------------------------------------------------
-                     * CLUT / tile-graphics upload to VRAM
-                     *
-                     * The "clut_sec" sectors contain raw 16-bit pixel data
-                     * (4bpp tile graphics) that must be uploaded to the GPU
-                     * VRAM texture area.  On real hardware, the game's overlay
-                     * init function reads these sectors via CdRead and uploads
-                     * them with LoadImage.  Since our CD path is incomplete,
-                     * we do the upload directly here.
-                     *
-                     * VRAM layout (SOTN):
-                     *   Rows   0-239: Framebuffers (double-buffered 320/256×240)
-                     *   Row  240-255: CLUT palettes (16-color tables, 16bpp)
-                     *   Rows 256-511: Tile/sprite graphics (4bpp / 8bpp)
-                     *
-                     * All observed textured primitives reference tpage=(15,1)
-                     * = VRAM (960, 256) at 4-bit depth.
-                     *
-                     * Upload strategy:
-                     *   128 sectors = 262144 bytes = 131072 x 16-bit pixels
-                     *   → RECT {512, 256, 512, 256} covers right half of
-                     *     bottom VRAM area where tpage 8..15 reside.
-                     * ------------------------------------------------------- */
-                    if (ok && e->clut_sec != 0) {
-                        extern void gpu_submit_word(uint32_t w);
-
-                        /* Compute number of CLUT sectors.
-                         * When clut_sec < sec3:  data = clut_sec..sec3-1
-                         * When sec3 < clut_sec:  use 128 sectors (default) */
-                        uint32_t clut_sectors = 128u;
-                        if (e->clut_sec < e->sec3) {
-                            clut_sectors = e->sec3 - e->clut_sec;
-                        }
-                        if (clut_sectors > 256u) clut_sectors = 256u;
-
-                        /* Allocate a temp buffer for the raw pixel data */
-                        uint32_t clut_bytes = clut_sectors * 2048u;
-                        uint8_t *clut_buf = (uint8_t *)malloc(clut_bytes);
-                        if (clut_buf) {
-                            int clut_ok = 1;
-                            for (uint32_t ci = 0; ci < clut_sectors; ci++) {
-                                if (!psx_cdrom_read_sector(e->clut_sec + ci, clut_buf + ci * 2048u)) {
-                                    fprintf(stderr, "[VRAM-UPLOAD] FAILED reading CLUT sector %u\n",
-                                            e->clut_sec + ci);
-                                    clut_ok = 0; break;
-                                }
-                            }
-
-                            if (clut_ok) {
-                                /* Decode vram_pos: high byte / 2 = start tpage */
-                                uint16_t start_tpage = ((e->vram_pos >> 8) & 0xFF) / 2;
-                                uint16_t vram_x_base = start_tpage * 64;
-                                uint16_t tile_width  = 1024 - vram_x_base;
-                                if (tile_width > 512) tile_width = 512;
-                                fprintf(stderr, "[VRAM-POS] vram_pos=0x%04X → tpage=%u x=%u w=%u\n",
-                                        e->vram_pos, start_tpage, vram_x_base, tile_width);
-
-                                /* ----- SOTN Stage Graphics Upload -----
-                                 * Per SOTN decomp (47BB8.c LoadStageTileset + LoadFileSimToMem):
-                                 *
-                                 * The disc file at clut_sec is 0x42000 bytes (132 sectors):
-                                 *   - First 0x40000 bytes (128 sectors): 32 tile blocks
-                                 *     Each block is 32×128 VRAM pixels (0x2000 bytes).
-                                 *     Scatter-uploaded using D_800AC958 lookup table.
-                                 *   - Last 0x2000 bytes (4 sectors): CLUT palette data
-                                 *     Uploaded to VRAM (512, 240, 256, 16).
-                                 *
-                                 * The scatter pattern fills tpages 8-15 (X=512-1023):
-                                 *   Block i: X = 512 + (i/4)*64 + (i%2)*32
-                                 *            Y = base_y + ((i&2) ? 128 : 0)
-                                 */
-                                extern void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data);
-
-                                /* --- 1. Scatter-upload 32 tile blocks --- */
-                                uint16_t tile_base_y = 256;
-                                uint32_t tile_data_bytes = 32u * 0x2000u; /* 262144 bytes */
-                                int blocks_uploaded = 0;
-                                if (clut_bytes >= tile_data_bytes) {
-                                    for (int ti = 0; ti < 32; ti++) {
-                                        uint16_t tx = 512 + (ti / 4) * 64 + (ti % 2) * 32;
-                                        uint16_t ty = (ti & 2) ? tile_base_y + 128 : tile_base_y;
-                                        uint8_t *block = clut_buf + ti * 0x2000;
-                                        psx_vram_upload(tx, ty, 32, 128, (const uint16_t *)block);
-                                        blocks_uploaded++;
-                                    }
-                                } else {
-                                    /* Fewer than 128 sectors — upload as many full blocks as possible */
-                                    uint32_t avail_blocks = clut_bytes / 0x2000u;
-                                    for (uint32_t ti = 0; ti < avail_blocks && ti < 32; ti++) {
-                                        uint16_t tx = 512 + (ti / 4) * 64 + (ti % 2) * 32;
-                                        uint16_t ty = (ti & 2) ? tile_base_y + 128 : tile_base_y;
-                                        uint8_t *block = clut_buf + ti * 0x2000;
-                                        psx_vram_upload(tx, ty, 32, 128, (const uint16_t *)block);
-                                        blocks_uploaded++;
-                                    }
-                                }
-                                fprintf(stderr, "[TILE-SCATTER] f%u ovl=%u: %d blocks uploaded to tpages 8-15 (Y=%u)\n",
-                                        g_ps1_frame, ovl_id, blocks_uploaded, tile_base_y);
-
-                                /* --- 2. Extract embedded CLUT palettes from tile blocks ---
-                                 *
-                                 * Per SOTN decomp (47BB8.c LoadStageTileset):
-                                 * When tiles load to Y=0, blocks with (i&2) go to Y=128,
-                                 * covering VRAM rows 128-255. Rows 240-255 (the last 16
-                                 * rows of each block) ARE the CLUT palette data — they
-                                 * land directly in the VRAM CLUT area at Y=240.
-                                 *
-                                 * Since we upload tiles to Y=256 (for tpage compatibility),
-                                 * these CLUT rows end up at Y=496 instead of Y=240.
-                                 * Fix: extract rows 112-127 from each Y+128 block and
-                                 * upload them separately to VRAM (X, 240, 32, 16).
-                                 *
-                                 * Only blocks with X=512-736 contribute to the RIGHT CLUT
-                                 * rect at D_800ACDB8 (512, 240, 256, 16). That's blocks
-                                 * 2,3,6,7,10,11,14,15 — 8 blocks × 32px = 256px width.
-                                 */
-                                {
-                                    int clut_blocks = 0;
-                                    for (int ti = 0; ti < 32; ti++) {
-                                        if (!(ti & 2)) continue; /* only Y=base+128 blocks */
-                                        uint16_t tx = 512 + (ti / 4) * 64 + (ti % 2) * 32;
-                                        if (tx >= 768) continue; /* only RIGHT CLUT rect X range */
-                                        if ((uint32_t)(ti + 1) * 0x2000u > clut_bytes) break;
-
-                                        /* Row 112 of the 128-row block = where Y=240 starts */
-                                        uint8_t *block = clut_buf + ti * 0x2000;
-                                        uint8_t *clut_rows = block + 112 * 64; /* 64 B/row = 32px × 2B */
-                                        psx_vram_upload(tx, 240, 32, 16, (const uint16_t *)clut_rows);
-                                        clut_blocks++;
-                                    }
-                                    if (clut_blocks > 0) {
-                                        tile_cluts_uploaded = 1;
-                                        fprintf(stderr, "[CLUT-TILE] f%u ovl=%u: extracted CLUTs from %d tile blocks "
-                                                "to VRAM (512-736, 240-255)\n",
-                                                g_ps1_frame, ovl_id, clut_blocks);
-                                        /* Dump block[2] palette row 0 (X=512,Y=240) for verification */
-                                        if (clut_bytes >= 3 * 0x2000u) {
-                                            uint16_t *p0 = (uint16_t *)(clut_buf + 2 * 0x2000 + 112 * 64);
-                                            fprintf(stderr, "[CLUT-TILE-PAL0]: %04X %04X %04X %04X %04X %04X %04X %04X\n",
-                                                    p0[0], p0[1], p0[2], p0[3], p0[4], p0[5], p0[6], p0[7]);
-                                        }
-                                    } else {
-                                        fprintf(stderr, "[CLUT-TILE] f%u ovl=%u: no CLUT blocks extracted "
-                                                "(tile data too small?)\n", g_ps1_frame, ovl_id);
-                                    }
-                                }
-
-                                /* --- 3. Test palette injection ---
-                                 * When enabled, upload a vivid test palette to the CLUT
-                                 * positions that game primitives reference (544,240 = pal#2
-                                 * and 560,240 = pal#3). This helps verify whether missing
-                                 * CLUTs are the cause of invisible tile rendering. */
-                                if (getenv("PSX_CV_TEST_PALETTE")) {
-                                    uint16_t test_pal[16] = {
-                                        0x0000, /* 0: transparent */
-                                        0x801F, /* 1: red */
-                                        0x83E0, /* 2: green */
-                                        0xFC00, /* 3: blue */
-                                        0x83FF, /* 4: yellow */
-                                        0xFC1F, /* 5: magenta */
-                                        0xFFE0, /* 6: cyan */
-                                        0xFFFF, /* 7: white */
-                                        0x8421, /* 8: dark gray */
-                                        0x94A5, /* 9: medium gray */
-                                        0xAD6B, /* 10: light gray */
-                                        0xC631, /* 11: lighter gray */
-                                        0xD6B5, /* 12: near-white */
-                                        0x8C00, /* 13: dark blue */
-                                        0x801F, /* 14: red variant */
-                                        0xFBDE, /* 15: bright */
-                                    };
-                                    /* Upload to CLUT positions 0-15 (each palette = one 16-pixel row) */
-                                    for (int pi = 0; pi < 16; pi++) {
-                                        psx_vram_upload(512 + pi * 16, 240, 16, 1, test_pal);
-                                    }
-                                    /* Also fill rows 1-15 (Y=241-255) for CLUT references with Y>240 */
-                                    for (int row = 1; row < 16; row++) {
-                                        for (int pi = 0; pi < 16; pi++) {
-                                            psx_vram_upload(512 + pi * 16, 240 + row, 16, 1, test_pal);
-                                        }
-                                    }
-                                    fprintf(stderr, "[TEST-PAL] f%u: injected test palette to all CLUT positions\n",
-                                            g_ps1_frame);
-                                }
-
-                                fprintf(stderr, "[VRAM-UPLOAD] f%u ovl=%u complete\n",
-                                        g_ps1_frame, ovl_id);
-                            }
-                            free(clut_buf);
-                        } else {
-                            fprintf(stderr, "[VRAM-UPLOAD] malloc(%u) failed!\n", clut_bytes);
-                        }
-                    }
-
-                    /* After loading room overlay, the CLUT list pointer at
-                     * 0x801C1688 (overlay BSS) is zero because room CLUT/tileset
-                     * data isn't loaded from CD (clut_sec/sec3).  C774's search
-                     * function loops forever on a null list.
-                     * Fix: if the CLUT list ptr is NULL, point it at a small
-                     * terminator buffer so the search exits immediately. */
-                    if (ok && !is_preload) {
-                        uint32_t clut_ptr = 0;
-                        memcpy(&clut_ptr, &g_ram[0x1C1688], 4);
-                        if (clut_ptr == 0u) {
-                            /* Place a {0xFFFE, 0xFFFF} terminator at a safe
-                             * address past the overlay end (0x801C4000). */
-                            uint32_t term_addr_phys = 0x1C4000u;
-                            uint16_t term_val = 0xFFFEu;
-                            memcpy(&g_ram[term_addr_phys], &term_val, 2);
-                            term_val = 0xFFFFu;
-                            memcpy(&g_ram[term_addr_phys + 2], &term_val, 2);
-                            uint32_t term_ptr = 0x801C4000u;
-                            memcpy(&g_ram[0x1C1688], &term_ptr, 4);
-                            fprintf(stderr, "[OVL-LOAD] CLUT-FIX: set 0x801C1688 → 0x%08X (terminator)\n",
-                                    term_ptr);
-                        }
-                    }
-                }
-
-                /* Initialize g_ClutIds (D_8003C104): when SIM data isn't loaded,
-                 * this array defaults to 0 → entities reference CLUT(0,0) which
-                 * reads framebuffer as palette.  Fill with sequential CLUT
-                 * coordinates covering VRAM (512,240)-(767,255) = 256 palettes.
-                 * Layout: 16 palettes/row × 16 rows = 256 entries. */
-                {
-                    uint32_t clut_base = 0x3C104u; /* D_8003C104 physical */
-                    for (int ci = 0; ci < 256; ci++) {
-                        uint16_t cx = (uint16_t)(512 + (ci % 16) * 16);
-                        uint16_t cy = (uint16_t)(240 + (ci / 16));
-                        uint16_t clut_id = (uint16_t)((cy << 6) | (cx >> 4));
-                        memcpy(&g_ram[clut_base + ci * 2], &clut_id, 2);
-                    }
-                    fprintf(stderr, "[CLUT-IDS] Initialized D_8003C104 (256 entries)\n");
-                }
-
-                /* Upload DRA.BIN default CLUTs to VRAM as FALLBACK only.
-                 * Skip if tile CLUT extraction already uploaded stage-accurate
-                 * palettes from the loaded tile data blocks. */
-                if (!tile_cluts_uploaded) {
-                    extern void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data);
-                    uint32_t dra_clut_phys = 0xD8994u; /* 0x800D8994 physical */
-                    if (dra_clut_phys + 16 * 32 <= sizeof(g_ram)) {
-                        uint16_t pal_buf[16 * 16]; /* 16 palettes × 16 colors */
-                        memcpy(pal_buf, &g_ram[dra_clut_phys], 16 * 32);
-                        /* Verify first palette looks valid (entry[1] should have STP bit) */
-                        if (pal_buf[1] & 0x8000) {
-                            for (int row = 0; row < 16; row++) {
-                                for (int pi = 0; pi < 16; pi++) {
-                                    psx_vram_upload(512 + pi * 16, 240 + row, 16, 1,
-                                                    &pal_buf[pi * 16]);
-                                }
-                            }
-                            fprintf(stderr, "[CLUT-DRA] Uploaded 16 DRA.BIN default palettes "
-                                    "to VRAM (512,240)-(752,255)\n");
-                        } else {
-                            fprintf(stderr, "[CLUT-DRA] DRA.BIN palette data not valid "
-                                    "(pal[0][1]=0x%04X)\n", pal_buf[1]);
-                        }
-                    }
-                }
-
-                uint32_t zero = 0;
-                memcpy(&g_ram[0x6BAFC], &zero, 4);
-                memcpy(&g_ram[0x6C398], &zero, 4);
-                memcpy(&g_ram[0x6C3B0], &zero, 4);
-                /* Also clear C0F8 (completion step counter) */
-                memcpy(&g_ram[0x3C0F8], &zero, 4);
-
-                /* Set gate bits for overlay state machine progression */
-                uint16_t gate7494 = 0;
-                memcpy(&gate7494, &g_ram[0x97494], 2);
-                if (!(gate7494 & 0x6800u)) {
-                    gate7494 |= 0x6800u;
-                    memcpy(&g_ram[0x97494], &gate7494, 2);
-                    printf("[LOAD-AUTOCLEAR] set gate 0x97494=0x%04X (bits 11,13,14)\n",
-                           gate7494);
-                    fflush(stdout);
-                }
-            }
-        }
-
-        /* Skip title screen: after 60 frames of F_TITLE0 running (gs=0, sub=6, C9A4=1),
-         * force transition to gs=8 (prologue). On real hardware the player presses Start.
-         * The prologue data was already preloaded to 0x80180000 at f9. */
-        {
-            static int s_gs8_forced = 0;
-            if (!s_gs8_forced && game_state == 0u && sub_state == 6u && g_ps1_frame >= 60u) {
-                uint32_t c9a4_val = 0;
-                memcpy(&c9a4_val, &g_ram[0x3C9A4], 4);
-                if (c9a4_val == 1u) {
-                    /* Force game state to 8 (prologue) */
-                    uint32_t new_gs = 8u;
-                    uint32_t new_sub = 0u;
-                    uint32_t zero = 0u;
-                    memcpy(&g_ram[0x3C734], &new_gs, 4);    /* g_GameState = 8 */
-                    memcpy(&g_ram[0x73060], &new_sub, 4);    /* sub_state = 0 */
-                    memcpy(&g_ram[0x3C9A4], &zero, 4);       /* C9A4 = 0 */
-                    /* Update local copies */
-                    game_state = 8u;
-                    sub_state = 0u;
-                    s_gs8_forced = 1;
-
-                    /* The prologue overlay data is already at 0x80180000.
-                     * Set C774/C778/C780 from the overlay header. */
-                    uint32_t hdr[4];
-                    memcpy(hdr, &g_ram[0x180000], sizeof(hdr));
-                    if (hdr[0] >= 0x80180000u && hdr[0] <= 0x801FFFFFu) {
-                        memcpy(&g_ram[0x3C778], &hdr[0], 4);
-                    }
-                    if (hdr[1] >= 0x80180000u && hdr[1] <= 0x801FFFFFu) {
-                        memcpy(&g_ram[0x3C780], &hdr[1], 4);
-                    }
-                    if (hdr[2] >= 0x80180000u && hdr[2] <= 0x801FFFFFu) {
-                        memcpy(&g_ram[0x3C774], &hdr[2], 4);
-                    }
-
-                    printf("[GS-SKIP] f%u FORCED gs=0→8 sub=0 C774=0x%08X C778=0x%08X C780=0x%08X hdr[3]=0x%08X\n",
-                           g_ps1_frame, hdr[2], hdr[0], hdr[1], hdr[3]);
-                    fflush(stdout);
-                }
-            }
-        }
-        /* Trace case 6+: what function pointer and overlay sub-state */
-        if (sub_state >= 6u && (s_upd_calls <= 60u || game_state >= 8u)) {
-            uint32_t fp_c778 = 0, fp_c780 = 0, c9a4 = 0;
-            memcpy(&fp_c778, &g_ram[0x3C778], 4);
-            memcpy(&fp_c780, &g_ram[0x3C780], 4);
-            memcpy(&c9a4, &g_ram[0x3C9A4], 4);
-            static uint32_t s_ug6_log = 0;
-            if (++s_ug6_log <= 80u) {
-                uint32_t fp_c774 = 0;
-                memcpy(&fp_c774, &g_ram[0x3C774], 4);
-                printf("[UG-CASE6] f%u #%u gs=%u sub=%u C9A4=%u C774=0x%08X C778=0x%08X C780=0x%08X\n",
-                       g_ps1_frame, s_upd_calls, game_state, sub_state, c9a4, fp_c774, fp_c778, fp_c780);
-                fflush(stdout);
-            }
-            /* Trace prologue C780 key state when gs=8, sub=6 */
-            if (game_state == 8u && s_ug6_log <= 40u) {
-                uint16_t v73414 = 0;
-                memcpy(&v73414, &g_ram[0x73414], 2);
-                uint32_t v733d8 = 0;
-                memcpy(&v733d8, &g_ram[0x733D8], 4);
-                /* Also read sub_state from RAM[0x80073060] to see if UpdateGame gs=8 sub is advancing */
-                uint32_t gs8_sub = 0;
-                memcpy(&gs8_sub, &g_ram[0x73060], 4);
-                printf("[C780-STATE] f%u RAM[73060]=%u RAM[73414]=%04X RAM[733D8]=%08X C9A4=%u\n",
-                       g_ps1_frame, gs8_sub, v73414, v733d8, c9a4);
-                fflush(stdout);
-            }
-        }
-        /* gs=8 handler MIPS dump (one-time, at first gs=8 sub=6 frame) */
-        {
-            static int s_gs8_dump_done = 0;
-            if (!s_gs8_dump_done && game_state == 8u && sub_state == 6u) {
-                s_gs8_dump_done = 1;
-                /* Dump gs=8 handler from 0x800E768C (64 instrs = 256 bytes) */
-                printf("[MIPS-DUMP] gs8_handler 0x800E768C (64 instrs):\n");
-                for (int _i = 0; _i < 64; _i++) {
-                    uint32_t addr = 0xE768Cu + _i * 4;
-                    uint32_t instr = 0;
-                    if (addr + 4 <= 0x200000u) {
-                        memcpy(&instr, &g_ram[addr], 4);
-                        printf("  0x%08X: %08X\n", 0x800E768Cu + _i*4, instr);
-                    }
-                }
-                /* Dump gs=8 case 6 target at 0x800E7998 (64 instrs) */
-                printf("[MIPS-DUMP] gs8_case6_target 0x800E7998 (64 instrs):\n");
-                for (int _i = 0; _i < 64; _i++) {
-                    uint32_t addr = 0xE7998u + _i * 4;
-                    uint32_t instr = 0;
-                    if (addr + 4 <= 0x200000u) {
-                        memcpy(&instr, &g_ram[addr], 4);
-                        printf("  0x%08X: %08X\n", 0x800E7998u + _i*4, instr);
-                    }
-                }
-                /* Also dump C774 JALR area at 0x800E7658 (16 instrs) */
-                printf("[MIPS-DUMP] c774_jalr_area 0x800E7658 (16 instrs):\n");
-                for (int _i = 0; _i < 16; _i++) {
-                    uint32_t addr = 0xE7658u + _i * 4;
-                    uint32_t instr = 0;
-                    if (addr + 4 <= 0x200000u) {
-                        memcpy(&instr, &g_ram[addr], 4);
-                        printf("  0x%08X: %08X\n", 0x800E7658u + _i*4, instr);
-                    }
-                }
-                /* Dump RAM values that could be function pointers */
-                uint32_t c778, c780, c7b8, c7bc, c7c0;
-                memcpy(&c778, &g_ram[0x3C778], 4);
-                memcpy(&c780, &g_ram[0x3C780], 4);
-                memcpy(&c7b8, &g_ram[0x3C7B8], 4);
-                memcpy(&c7bc, &g_ram[0x3C7BC], 4);
-                memcpy(&c7c0, &g_ram[0x3C7C0], 4);
-                printf("[GS8-PTRS] C778=%08X C780=%08X C7B8=%08X C7BC=%08X C7C0=%08X\n",
-                       c778, c780, c7b8, c7bc, c7c0);
-                fflush(stdout);
-            }
-        }
-        /* One-time dump: overlay function C780 code (after overlay is loaded) */
-        if (s_upd_calls == 10u) {
-            /* Dump C780's jump table at 0x801A7B98 (7 entries) */
-            printf("[JMPTBL] C780 switch table at 0x801A7B98 (7 entries):\n");
-            for (int _i = 0; _i < 7; _i++) {
-                uint32_t addr = 0x1A7B98u + _i * 4;
-                uint32_t entry = 0;
-                if (addr + 4 <= 0x200000u) {
-                    memcpy(&entry, &g_ram[addr], 4);
-                    printf("  [%d] 0x%08X\n", _i, entry);
-                }
-            }
-            /* Dump C7B8 function pointer */
-            uint32_t c7b8 = 0;
-            memcpy(&c7b8, &g_ram[0x3C7B8], 4);
-            printf("[C7B8-PTR] RAM[0x3C7B8] = 0x%08X\n", c7b8);
-            /* Dump 978AC value */
-            uint32_t v978ac = 0;
-            memcpy(&v978ac, &g_ram[0x978AC], 4);
-            printf("[978AC] RAM[0x978AC] = 0x%08X\n", v978ac);
-            fflush(stdout);
-
-            /* Dump MIPS at C780 function (0x801B410C = phys 0x1B410C) - extended to 384 instrs */
-            uint32_t fp_c780_dump = 0;
-            memcpy(&fp_c780_dump, &g_ram[0x3C780], 4);
-            if (fp_c780_dump >= 0x80180000u && fp_c780_dump <= 0x801FFFFFu) {
-                uint32_t c780_phys = fp_c780_dump & 0x1FFFFFFF;
-                printf("[MIPS-DUMP] C780 func at 0x%08X (512 instrs):\n", fp_c780_dump);
-                for (int _i = 0; _i < 512; _i++) {
-                    uint32_t addr = c780_phys + _i * 4;
-                    uint32_t instr = 0;
-                    if (addr + 4 <= 0x200000u) {
-                        memcpy(&instr, &g_ram[addr], 4);
-                        printf("  0x%08X: %08X\n", fp_c780_dump + _i*4, instr);
-                    }
-                }
-                fflush(stdout);
-            }
-            /* Also dump Game_Init case 6 continuation (0x800E491C) */
-            printf("[MIPS-DUMP] Game_Init case6 tail 0x800E491C (8 instrs):\n");
-            for (int _i = 0; _i < 8; _i++) {
-                uint32_t addr = 0xE491Cu + _i * 4;
-                uint32_t instr = 0;
-                if (addr + 4 <= 0x200000u) {
-                    memcpy(&instr, &g_ram[addr], 4);
-                    printf("  0x%08X: %08X\n", 0x800E491Cu + _i*4, instr);
-                }
-            }
-            fflush(stdout);
-
-            /* Dump MIPS at Game_Init handler (0x800E451C) to decode case 6 logic */
-            printf("[MIPS-DUMP] Game_Init 0x800E451C (256 instrs = 0x400 bytes):\n");
-            for (int _i = 0; _i < 256; _i++) {
-                uint32_t addr = 0xE451Cu + _i * 4;
-                uint32_t instr = 0;
-                if (addr + 4 <= 0x200000u) {
-                    memcpy(&instr, &g_ram[addr], 4);
-                    printf("  0x%08X: %08X\n", 0x800E451Cu + _i*4, instr);
-                }
-            }
-            /* Also dump UpdateGame (0x800E7AEC, 128 instrs) for dispatch logic */
-            printf("[MIPS-DUMP] UpdateGame 0x800E7AEC (128 instrs):\n");
-            for (int _i = 0; _i < 128; _i++) {
-                uint32_t addr = 0xE7AECu + _i * 4;
-                uint32_t instr = 0;
-                if (addr + 4 <= 0x200000u) {
-                    memcpy(&instr, &g_ram[addr], 4);
-                    printf("  0x%08X: %08X\n", 0x800E7AECu + _i*4, instr);
-                }
-            }
-            fflush(stdout);
-        }
-    }
-
-    /* Trace calls FROM UpdateGame's PC range to see what Game_Init does */
-    if (start_pc >= 0x800E7AECu && start_pc <= 0x800E7FFFu) {
-        /* This is inside UpdateGame — probably a sub-call */
-        static uint32_t s_ugcalls = 0;
-        if (++s_ugcalls <= 50u || (s_ugcalls % 480u) == 0u) {
-            printf("[UG-SUBCALL] f%u #%u target=0x%08X ra=0x%08X a0=0x%08X\n",
-                   g_ps1_frame, s_ugcalls, start_pc, cpu->ra, cpu->a0);
-            fflush(stdout);
-        }
-    }
-
-    /* Trace gs=8 handler entry at 0x800E7458 */
-    if (start_pc == 0x800E7458u) {
-        static uint32_t s_gs8h = 0;
-        static int s_c778_called = 0;
-        uint32_t gs8_sub = 0;
-        memcpy(&gs8_sub, &g_ram[0x73060], 4);
-        if (++s_gs8h <= 40u) {
-            printf("[GS8-HANDLER] f%u #%u entry=0x800E7458 sub=%u ra=0x%08X a0=0x%08X\n",
-                   g_ps1_frame, s_gs8h, gs8_sub, cpu->ra, cpu->a0);
-            fflush(stdout);
-            /* One-time dump of the gs=8 handler (64 instructions) */
-            if (s_gs8h == 1u) {
-                printf("[MIPS-DUMP] gs8_real_handler 0x800E7458 (128 instrs):\n");
-                for (int _i = 0; _i < 128; _i++) {
-                    uint32_t addr = 0xE7458u + _i * 4;
-                    uint32_t instr = 0;
-                    if (addr + 4 <= 0x200000u) {
-                        memcpy(&instr, &g_ram[addr], 4);
-                        printf("  0x%08X: %08X\n", 0x800E7458u + _i*4, instr);
-                    }
-                }
-                fflush(stdout);
-            }
-        }
-
-        /* When sub=6, the handler just calls C774 (draw).  But C774 depends on
-         * data initialized by C778 (overlay init) and updated by C780 (overlay
-         * update).  In the original game these are called from the entity system
-         * in MainGame, but our MainGame's guard fires before that code runs.
-         * Inject C778 (once) and C780 (every frame) before the handler proceeds. */
-        if (gs8_sub == 6u) {
-            uint32_t c778 = 0, c780 = 0;
-            memcpy(&c778, &g_ram[0x3C778], 4);
-            memcpy(&c780, &g_ram[0x3C780], 4);
-
-            if (!s_c778_called && c778 != 0u && c778 >= 0x80100000u) {
-                s_c778_called = 1;
-                uint32_t ptr_before = 0;
-                memcpy(&ptr_before, &g_ram[0x1C1688], 4);
-                printf("[GS8-FIX] f%u Calling C778(init) = 0x%08X before C774 draw (0x801C1688=0x%08X)\n",
-                       g_ps1_frame, c778, ptr_before);
-                fflush(stdout);
-                uint32_t save_ra = cpu->ra;
-                uint32_t save_a0 = cpu->a0;
-                mips_interpret(cpu, c778);
-                cpu->ra = save_ra;
-                cpu->a0 = save_a0;
-                uint32_t ptr_after = 0;
-                memcpy(&ptr_after, &g_ram[0x1C1688], 4);
-                printf("[GS8-FIX] f%u C778 done. 0x801C1688: 0x%08X → 0x%08X\n",
-                       g_ps1_frame, ptr_before, ptr_after);
-                fflush(stdout);
-            }
-
-            if (c780 != 0u && c780 >= 0x80100000u) {
-                static uint32_t s_c780_calls = 0;
-                if (++s_c780_calls <= 5u) {
-                    uint32_t ptr_val = 0;
-                    memcpy(&ptr_val, &g_ram[0x1C1688], 4);
-                    printf("[GS8-FIX] f%u Calling C780(update) = 0x%08X (#%u) (0x801C1688=0x%08X)\n",
-                           g_ps1_frame, c780, s_c780_calls, ptr_val);
-                    fflush(stdout);
-                }
-                uint32_t save_ra = cpu->ra;
-                uint32_t save_a0 = cpu->a0;
-                mips_interpret(cpu, c780);
-                cpu->ra = save_ra;
-                cpu->a0 = save_a0;
-
-                /* After C778 init + several C780 update frames, the entity
-                 * system should have initialized enough state.  In the real
-                 * game, C9A4 reaches 5+ which causes sub_state to advance
-                 * 6→7.  Our interpreter can't run enough iterations for that,
-                 * so force the transition after a warmup period. */
-                if (s_c780_calls >= 8u) {
-                    uint32_t sub_now = 0;
-                    memcpy(&sub_now, &g_ram[0x73060], 4);
-                    if (sub_now == 6u) {
-                        uint32_t new_sub = 7u;
-                        memcpy(&g_ram[0x73060], &new_sub, 4);
-                        printf("[GS8-FIX] f%u Forced sub_state 6→7 (after %u C780 calls)\n",
-                               g_ps1_frame, s_c780_calls);
-                        fflush(stdout);
-                    }
-                }
-            }
-        }
-    }
-
-    /* SetGameState (0x800E4124): trace state transitions */
-    if (start_pc == 0x800E4124u) {
-        static uint32_t s_sgs_calls = 0;
-        uint32_t old_state = 0;
-        memcpy(&old_state, &g_ram[0x3C734], 4);
-        if (++s_sgs_calls <= 30u || (s_sgs_calls % 240u) == 0u) {
-            printf("[SETGAMESTATE] f%u #%u old=%u new=%u ra=0x%08X\n",
-                   g_ps1_frame, s_sgs_calls, old_state, cpu->a0, cpu->ra);
-            fflush(stdout);
-        }
-    }
-
-    /* func_800E81FC: loading function called from Game_Init case 5 */
-    if (start_pc == 0x800E81FCu) {
-        static uint32_t s_e81fc = 0;
-        if (++s_e81fc <= 30u) {
-            printf("[LOAD-E81FC] f%u #%u a0=0x%08X a1=0x%08X ra=0x%08X\n",
-                   g_ps1_frame, s_e81fc, cpu->a0, cpu->a1, cpu->ra);
-            fflush(stdout);
-        }
-    }
-
-    /* func at 0x8010847C — writes D_8006C3B0 every frame. Dump its code once. */
-    if (start_pc == 0x8010847Cu) {
-        static uint32_t s_1084 = 0;
-        if (++s_1084 == 1u) {
-            printf("[FUNC-1084] dumping 60 instr at 0x80108400:\n");
-            for (int _i = 0; _i < 60; _i++) {
-                uint32_t addr = 0x80108400u + _i * 4;
-                uint32_t instr = cpu->read_word(addr);
-                printf("  0x%08X: 0x%08X\n", addr, instr);
-            }
-            fflush(stdout);
-        }
-        if (s_1084 <= 15u) {
-            uint32_t v_c398 = 0, v_c3b0 = 0, v_bafc = 0;
-            memcpy(&v_c398, &g_ram[0x6C398], 4);
-            memcpy(&v_c3b0, &g_ram[0x6C3B0], 4);
-            memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
-            printf("[FUNC-1084] f%u #%u a0=0x%08X C398=0x%08X C3B0=0x%08X BAFC=0x%08X ra=0x%08X\n",
-                   g_ps1_frame, s_1084, cpu->a0, v_c398, v_c3b0, v_bafc, cpu->ra);
-            fflush(stdout);
-        }
-    }
-
-    /* func_800E451C: Game_Init sub-state handler — trace case 5+ specifically */
-    if (start_pc == 0x800E451Cu) {
-        static uint32_t s_451c = 0;
-        uint32_t sub_state = 0;
-        memcpy(&sub_state, &g_ram[0x73060], 4);
-        if (sub_state >= 5u && ++s_451c <= 20u) {
-            uint32_t v_978AC = 0, v_6C3B0 = 0;
-            memcpy(&v_978AC, &g_ram[0x978AC], 4);
-            memcpy(&v_6C3B0, &g_ram[0x6C3B0], 4);
-            printf("[GAMEINIT-SS5] f%u #%u sub=%u 978AC=0x%08X 6C3B0=0x%08X a0=0x%08X\n",
-                   g_ps1_frame, s_451c, sub_state, v_978AC, v_6C3B0, cpu->a0);
-            fflush(stdout);
-        }
-    }
-
-    /* MainGame (0x800E3988): the infinite main loop of DRA.BIN.
-     * Trace entry to confirm it's running. */
-    if (start_pc == 0x800E3988u) {
-        static uint32_t s_main_calls = 0;
-        if (++s_main_calls <= 5u) {
-            printf("[MAINGAME] f%u #%u entry 0x800E3988 ra=0x%08X sp=0x%08X\n",
-                   g_ps1_frame, s_main_calls, cpu->ra, cpu->sp);
-            fflush(stdout);
-        }
-    }
-    /* DIAG: trace every mips_interpret entry with address >= 0x80010000 */
-    if (start_pc >= 0x800A0000u) {
-        static uint32_t s_all_interp = 0;
-        if (++s_all_interp <= 50u) {
-            printf("[INTERP-ALL] #%u f%u pc=0x%08X ra=0x%08X sp=0x%08X\n",
-                   s_all_interp, g_ps1_frame, start_pc, cpu->ra, cpu->sp);
-            fflush(stdout);
-        }
-    }
-
-    /* Trace key DRA.BIN function entries for Castlevania rendering pipeline analysis */
-    if (start_pc == 0x80106670u || start_pc == 0x800EDEDCu ||
-        start_pc == 0x800E414Cu || start_pc == 0x800F3828u ||
-        start_pc == 0x800F44C8u || start_pc == 0x800E4128u) {
-        static uint32_t s_dra_trace[6] = {0};
-        int idx = (start_pc == 0x80106670u) ? 0 :
-                  (start_pc == 0x800EDEDCu) ? 1 :
-                  (start_pc == 0x800E414Cu) ? 2 :
-                  (start_pc == 0x800F3828u) ? 3 :
-                  (start_pc == 0x800F44C8u) ? 4 : 5;
-        static const char* dra_names[] = {
-            "RenderFunc", "ProcEntities", "StepHandler",
-            "StepCaller1", "StepCaller2", "StepInit"
-        };
-        s_dra_trace[idx]++;
-        if (s_dra_trace[idx] <= 20u || (s_dra_trace[idx] % 240u) == 0u) {
-            printf("[DRA-TRACE] f%u %s(0x%08X) #%u ra=0x%08X a0=0x%08X\n",
-                   g_ps1_frame, dra_names[idx], start_pc, s_dra_trace[idx],
-                   cpu->ra, cpu->a0);
-            fflush(stdout);
-        }
-    }
 
     /* Trace calls to 0x800022C4 (kernel RAM function called from Tomba tick) */
     /* [0x22C4] kernel RAM function trace — re-enable when debugging tick dispatch:
@@ -3530,66 +1804,9 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     if (start_pc == 0x8001A664u && s_interp_guard_a664 != 0u) {
         guard_limit = s_interp_guard_a664;
     }
-    /* MainGame (0x800E3988) runs in its own fiber. VSync yields the fiber each
-     * frame, so the guard just needs to be large enough to cover several frames
-     * in case VSync doesn't fire immediately. 10M instructions is plenty.
-     * UpdateGame (0x800E7AEC) is the core per-frame game logic (state machine,
-     * entity updates, rendering). Its entity init loops alone need 25K+ compiled
-     * calls, so it also needs a generous guard limit.
-     * MainGame runs in a fiber that yields on VSync.  The guard counter is
-     * cumulative across yields (mips_interpret doesn't restart), so it needs
-     * to be essentially unlimited for long play sessions. */
-    if (start_pc == 0x800E3988u) {
-        guard_limit = (uint32_t)INT32_MAX;
-    }
-    if (start_pc == 0x800E7AECu) {
-        guard_limit = 10000000u;
-    }
-    /* All DRA.BIN / stage overlay code (≥0x800A0000) dispatched via start_pc
-     * intercept needs a generous guard.  Overlay draw functions (C774) contain
-     * data-scan loops that easily exceed the default 10K iterations.
-     * Exclude MainGame/UpdateGame (already set above). */
-    if (start_pc >= 0x800A0000u && start_pc <= 0x801FFFFFu
-        && start_pc != 0x800E3988u && start_pc != 0x800E7AECu) {
-        guard_limit = 100000u;
-    }
-    /* DRA.BIN overlay code (≥0x800A0000): the main game function at 0x800E3988
-     * is an infinite loop (init + while(1) { frame... }).  The default 10K guard
-     * kills it prematurely, causing boot to return before rendering starts.
-     * DRA.BIN / overlay code uses the same guard as everything else.
-     * The pump loop calls mips_interpret per frame, so 10000 is enough. */
-    /* DIAG: trace all DRA.BIN interpreter entries/exits */
-    if (start_pc >= 0x800A0000u && start_pc <= 0x801FFFFFu) {
-        static uint32_t s_dra_enter = 0;
-        if (++s_dra_enter <= 30u) {
-            printf("[DRA-ENTER] #%u f%u pc=0x%08X guard=%u ra=0x%08X\n",
-                   s_dra_enter, g_ps1_frame, start_pc, guard_limit, cpu->ra);
-            fflush(stdout);
-        }
-    }
-    /* Iterative call stack — avoids deep recursion that overflows the native stack
-     * when interpreting DRA.BIN overlay code (many non-compiled sub-function calls).
-     * Static to reduce mips_interpret's stack frame size (~512 bytes saved).
-     * Uses a global 'top' pointer so nested mips_interpret calls (e.g. the A664
-     * override calling mips_interpret from inside a compiled function) use a
-     * separate region of the array instead of overwriting the outer call's entries. */
-    #define INTERP_CALL_STACK_MAX 512
-    static uint32_t interp_call_stack[INTERP_CALL_STACK_MAX];
-    static int      interp_call_top = 0;
-    int      interp_call_base = interp_call_top;  /* base for this nesting level */
     int guard;
 
     for (guard = 0; guard < (int)guard_limit; guard++) {
-        /* Global instruction limit (set before potentially-hanging calls) */
-        if (g_interp_total_limit > 0u && ++g_interp_total_counter > g_interp_total_limit) {
-            static uint32_t s_total_limit_hits = 0;
-            if (++s_total_limit_hits <= 10u) {
-                printf("[INTERP-LIMIT] Global limit %u reached (entry=0x%08X pc=0x%08X)\n",
-                       g_interp_total_limit, start_pc, pc);
-                fflush(stdout);
-            }
-            interp_call_top = interp_call_base; return;
-        }
         if (s_interp_min_sp != 0u && cpu->sp < s_interp_min_sp) {
             static uint32_t s_interp_min_sp_hits = 0;
             if (s_interp_min_sp_hits < 40u) {
@@ -3598,7 +1815,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                        s_interp_min_sp_hits, start_pc, pc, cpu->sp, cpu->ra);
                 fflush(stdout);
             }
-            interp_call_top = interp_call_base; return;
+            return;
         }
         cpu->zero = 0;
         cpu->pc = pc;
@@ -3635,19 +1852,6 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 fflush(stdout);
             }
         }
-        /* Bail out if PC is outside valid PS1 RAM (2MB physical) */
-        {
-            uint32_t pc_phys = pc & 0x1FFFFFFFu;
-            if (pc_phys >= 0x200000u) {
-                static uint32_t s_bad_pc_hits = 0;
-                if (++s_bad_pc_hits <= 10u) {
-                    printf("[BAD-PC] #%u entry=0x%08X pc=0x%08X f%u guard=%d ra=0x%08X\n",
-                           s_bad_pc_hits, start_pc, pc, g_ps1_frame, guard, cpu->ra);
-                    fflush(stdout);
-                }
-                interp_call_top = interp_call_base; return;
-            }
-        }
         uint32_t instr = cpu->read_word(pc);
         int  is_link = 0, is_jr31 = 0;
         uint32_t target = 0;
@@ -3676,30 +1880,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
          * pc+8 (the instruction after the delay slot).  Just returning would
          * leave the outer mips_interpret in a bad state (it already set *R[rd]
          * = pc+8 in the JALR case, so we want to continue from there). */
-        /* JR $ra — check FIRST before null-guard, because the interp_call_stack
-         * holds the correct return address even when cpu->ra == 0 (e.g. restored
-         * from a different stack frame by compiled epilogue code). */
-        if (is_jr31 && !is_link) {
-            if (interp_call_top > interp_call_base) {
-                pc = interp_call_stack[--interp_call_top];
-                continue;
-            }
-            /* Top-level return — log if from MainGame for debugging */
-            if (start_pc == 0x800E3988u) {
-                printf("[MAINGAME-EXIT] f%u JR $ra at pc=0x%08X ra=0x%08X guard=%d/%u sp=0x%08X depth=%d\n",
-                       g_ps1_frame, pc, cpu->ra, guard, guard_limit, cpu->sp,
-                       interp_call_top - interp_call_base);
-                fflush(stdout);
-            }
-            interp_call_top = interp_call_base;  /* restore for outer level */
-            return;
-        }
-
-        /* Reject targets outside valid PS1 RAM (2MB physical) or null */
-        uint32_t tgt_phys = target & 0x1FFFFFFFu;
-        if (target == 0
-            || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)
-            || (target >= 0x80000000u && tgt_phys >= 0x200000u)) {
+        if (target == 0 || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)) {
             if (trace_cv_interp) {
                 static uint32_t s_cv_null_target = 0;
                 if (++s_cv_null_target <= 30u) {
@@ -3709,28 +1890,29 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 }
             }
             if (is_link) {
+                /* [NULL-JALR] — re-enable when debugging null function pointers:
                 static uint32_t s_null_jalr = 0;
-                if (++s_null_jalr <= 50) {
-                    printf("[NULL-JALR] #%u f%u pc=0x%08X target=0x%08X ra=0x%08X — null call skipped\n",
-                           s_null_jalr, g_ps1_frame, pc, target, cpu->ra);
+                if (++s_null_jalr <= 20) {
+                    printf("[NULL-JALR] #%u f%u pc=0x%08X ra=0x%08X — null call skipped\n",
+                           s_null_jalr, g_ps1_frame, pc, cpu->ra);
                     fflush(stdout);
-                }
+                } */
                 pc = pc + 8;  /* skip past JALR+delay-slot, treat call as no-op */
                 continue;
             }
-            if (start_pc == 0x800E3988u) {
-                printf("[MAINGAME-EXIT-NULL] f%u pc=0x%08X target=0x%08X ra=0x%08X guard=%d\n",
-                       g_ps1_frame, pc, target, cpu->ra, guard);
-                fflush(stdout);
-            }
-            interp_call_top = interp_call_base; return;
+            return;
         }
 
         /* BIOS dispatch: jr/jalr to 0xA0/0xB0/0xC0 from interpreted BIOS stubs */
         if (target == 0xA0u || target == 0xB0u || target == 0xC0u) {
             call_by_address(cpu, target);
             if (is_link) { pc = pc + 8; continue; }
-            interp_call_top = interp_call_base; return;
+            return;
+        }
+
+        if (is_jr31) {
+            /* JR $ra — true function return, back to compiled caller */
+            return;
         }
 
         if (is_link) {
@@ -3738,12 +1920,6 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             uint32_t ret_pc = pc + 8;
             if (is_compiled_addr(target)) {
                 if (cv_force_interpret_range(target)) {
-                    /* Interpret iteratively instead of recursively */
-                    if (interp_call_top < INTERP_CALL_STACK_MAX) {
-                        interp_call_stack[interp_call_top++] = ret_pc;
-                        pc = target;
-                        continue;
-                    }
                     mips_interpret(cpu, target);
                     pc = ret_pc;
                     continue;
@@ -3779,141 +1955,13 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         printf("[INTERP-CALL] f%u 0x%08X → compiled 0x%08X\n", g_ps1_frame, pc, target); */
                     }
                 }
-                /* Trace OT-related compiled calls from DRA.BIN (any frame) */
-                if (pc >= 0x80080000u) {
-                    if (target == 0x80012E8Cu || target == 0x80012FE4u ||
-                        target == 0x80012E1Cu || target == 0x80012C90u) {
-                        static uint32_t s_ot_calls = 0;
-                        if (++s_ot_calls <= 30u || (s_ot_calls % 300u) == 0u) {
-                            printf("[DRA-OT] f%u #%u from=0x%08X to=0x%08X a0=0x%08X a1=0x%08X\n",
-                                   g_ps1_frame, s_ot_calls, pc, target, cpu->a0, cpu->a1);
-                            fflush(stdout);
-                        }
-                    }
-                }
-                /* Boot-time trace: overlay/DRA.BIN → compiled calls */
-                if (g_ps1_frame == 0u && pc >= 0x80080000u) {
-                    static uint32_t s_boot_compiled = 0;
-                    ++s_boot_compiled;
-                    if (s_boot_compiled <= 100u || (s_boot_compiled % 200u) == 0u) {
-                        printf("[BOOT-DRA2C] f%u #%u from=0x%08X to=0x%08X a0=0x%08X a1=0x%08X ra=0x%08X\n",
-                               g_ps1_frame, s_boot_compiled, pc, target, cpu->a0, cpu->a1, cpu->ra);
-                        fflush(stdout);
-                    }
-                }
-                /* Trace compiled calls from UpdateGame */
-                if (start_pc == 0x800E7AECu) {
-                    static uint32_t s_ug_compiled = 0;
-                    if (++s_ug_compiled <= 40u || (s_ug_compiled % 480u) == 0u) {
-                        printf("[UG-COMPILED] f%u #%u pc=0x%08X → 0x%08X a0=0x%08X a1=0x%08X\n",
-                               g_ps1_frame, s_ug_compiled, pc, target, cpu->a0, cpu->a1);
-                        fflush(stdout);
-                    }
-                }
-                /* Trace compiled calls from overlay code (start_pc >= 0x80180000, f66+) */
-                if (start_pc >= 0x80180000u && g_ps1_frame >= 66u) {
-                    static uint32_t s_ovl_compiled = 0;
-                    if (++s_ovl_compiled <= 40u) {
-                        fprintf(stderr, "[OVL-COMPILED] f%u #%u pc=0x%08X → 0x%08X a0=0x%08X ra=0x%08X\n",
-                               g_ps1_frame, s_ovl_compiled, pc, target, cpu->a0, cpu->ra);
-                        fflush(stderr);
-                    }
-                }
                 call_by_address(cpu, target);
-                if (pc >= 0x80108450u && pc <= 0x80109300u) {
-                    static uint32_t s_ovl_calls = 0;
-                    if (++s_ovl_calls <= 200u) {
-                        printf("[OVL-LOAD-JAL] f%u #%u pc=0x%08X → 0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
-                               g_ps1_frame, s_ovl_calls, pc, target, cpu->a0, cpu->a1, cpu->a2, cpu->a3);
-                        fflush(stdout);
-                    }
-                }
-                if (target >= 0x80080000u && target <= 0x801FFFFFu) {
-                    static uint32_t s_interp_dra = 0;
-                    ++s_interp_dra;
-                    if (s_interp_dra <= 50u || (s_interp_dra % 500u) == 0u) {
-                        printf("[DRA-INTERP] f%u #%u from=0x%08X target=0x%08X a0=0x%08X ra=0x%08X\n",
-                               g_ps1_frame, s_interp_dra, pc, target, cpu->a0, cpu->ra);
-                        fflush(stdout);
-                    }
-                    /* Trace overlay calls that go to overlay space (0x80180000+) */
-                    if (target >= 0x80180000u && g_ps1_frame >= 66u) {
-                        static uint32_t s_ovl_jal = 0;
-                        if (++s_ovl_jal <= 30u) {
-                            fprintf(stderr, "[OVL-JAL-ENTER] f%u #%u from=0x%08X target=0x%08X a0=0x%08X ra=0x%08X\n",
-                                   g_ps1_frame, s_ovl_jal, pc, target, cpu->a0, cpu->ra);
-                            fflush(stderr);
-                        }
-                    }
-                }
-                /* Trace JAL calls from UpdateGame (0x800E7AEC) during gs=8 */
-                if (start_pc == 0x800E7AECu) {
-                    uint32_t gs_jal = 0;
-                    memcpy(&gs_jal, &g_ram[0x3C734], 4);
-                    static uint32_t s_ug_jal = 0;
-                    static uint32_t s_ug_jal_gs8 = 0;
-                    ++s_ug_jal;
-                    if (gs_jal == 8u && (++s_ug_jal_gs8 <= 40u)) {
-                        uint32_t sub_jal = 0;
-                        memcpy(&sub_jal, &g_ram[0x73060], 4);
-                        printf("[UG-JAL-GS8] f%u #%u pc=0x%08X → 0x%08X sub=%u depth=%d\n",
-                               g_ps1_frame, s_ug_jal_gs8, pc, target, sub_jal,
-                               interp_call_top - interp_call_base);
-                        fflush(stdout);
-                    } else if (s_ug_jal <= 60u || (s_ug_jal % 480u) == 0u) {
-                        printf("[UG-JAL] f%u #%u pc=0x%08X → 0x%08X a0=0x%08X a1=0x%08X\n",
-                               g_ps1_frame, s_ug_jal, pc, target, cpu->a0, cpu->a1);
-                        fflush(stdout);
-                    }
-                }
             } else {
-                /* Non-compiled target (DRA.BIN / overlay).
-                 * Functions with start_pc intercepts MUST use recursive dispatch
-                 * so the start_pc checks at the top of mips_interpret fire.
-                 * All other functions use the iterative call stack. */
-                int needs_start_pc_intercept =
-                    target == 0x800E2F34u ||  /* DebugUpdate: force v0=1 */
-                    target == 0x800E7AECu ||  /* UpdateGame: overlay loading */
-                    target == 0x800E7458u ||  /* gs=8 handler: trace entry/exit */
-                    target == 0x801073C0u ||  /* CD sector loader */
-                    target == 0x801073E8u;    /* CD status check */
-                /* Trace overlay function calls (0x80180000+) from any context */
-                if (target >= 0x80180000u && target <= 0x801FFFFFu) {
-                    static uint32_t s_ovl_nc = 0;
-                    if (++s_ovl_nc <= 50u || (s_ovl_nc % 500u) == 0u) {
-                        printf("[OVL-CALL] f%u #%u from=0x%08X → 0x%08X a0=0x%08X ra=0x%08X entry=0x%08X\n",
-                               g_ps1_frame, s_ovl_nc, pc, target, cpu->a0, cpu->ra, start_pc);
-                        fflush(stdout);
-                    }
-                }
-                if (needs_start_pc_intercept) {
-                    mips_interpret(cpu, target);
-                } else if (interp_call_top < INTERP_CALL_STACK_MAX) {
-                    interp_call_stack[interp_call_top++] = ret_pc;
-                    pc = target;
-                    continue;
-                } else {
-                    /* Stack full — rare fallback to recursive */
-                    mips_interpret(cpu, target);
-                }
+                mips_interpret(cpu, target);
             }
             pc = ret_pc;
         } else {
             /* J / JR $tx — unconditional jump (or fall-through to pc+8) */
-            /* Trace jumps within UpdateGame context during gs=8 */
-            if (start_pc == 0x800E7AECu && target != pc + 8) {
-                static uint32_t s_ug_jr = 0;
-                uint32_t gs_now = 0;
-                memcpy(&gs_now, &g_ram[0x3C734], 4);
-                if (gs_now == 8u && (++s_ug_jr <= 30u)) {
-                    uint32_t sub_now = 0;
-                    memcpy(&sub_now, &g_ram[0x73060], 4);
-                    printf("[UG-JUMP] f%u #%u pc=0x%08X → 0x%08X sub=%u depth=%d\n",
-                           g_ps1_frame, s_ug_jr, pc, target, sub_now,
-                           interp_call_top - interp_call_base);
-                    fflush(stdout);
-                }
-            }
             if (target == pc + 8) {
                 /* Branch not taken (BEQ/BNE etc.) — fall through after delay slot */
                 pc = target;
@@ -3962,25 +2010,12 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                 }
                 call_by_address(cpu, target);
-                if (start_pc == 0x800E3988u) {
-                    printf("[MAINGAME-EXIT-TAIL] f%u pc=0x%08X → compiled 0x%08X ra=0x%08X guard=%d\n",
-                           g_ps1_frame, pc, target, cpu->ra, guard);
-                    fflush(stdout);
-                }
-                interp_call_top = interp_call_base; return;
+                return;
             } else {
                 /* Local jump within overlay space */
                 pc = target;
             }
         }
-    }
-
-    interp_call_top = interp_call_base;
-
-    if (start_pc == 0x800E3988u) {
-        printf("[MAINGAME-EXIT-GUARD] f%u pc=0x%08X guard=%d/%u ra=0x%08X sp=0x%08X\n",
-               g_ps1_frame, pc, guard, guard_limit, cpu->ra, cpu->sp);
-        fflush(stdout);
     }
 
     if (start_pc == 0x8001A664u) {
@@ -4022,28 +2057,13 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         }
     }
 
-    /* [INTERP-GUARD] — log when interpreter guard fires for overlay code */
-    if (start_pc >= 0x800A0000u && start_pc <= 0x801FFFFFu) {
-        static uint32_t s_ovl_guard_hit = 0;
-        if (++s_ovl_guard_hit <= 20u) {
-            printf("[OVL-GUARD-HIT] #%u entry=0x%08X stuck_pc=0x%08X f%u guard=%u ra=0x%08X v0=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
-                   s_ovl_guard_hit, start_pc, pc, g_ps1_frame, guard_limit, cpu->ra, cpu->v0,
-                   cpu->a0, cpu->a1, cpu->a2, cpu->a3);
-            /* Dump 64 instructions around stuck PC */
-            if (s_ovl_guard_hit <= 3u) {
-                printf("[LOOP-DUMP] 64 instrs starting at 0x%08X:\n", pc - 16);
-                for (int dd = -4; dd < 60; dd++) {
-                    uint32_t dpc = pc + (uint32_t)(dd * 4);
-                    uint8_t* dp = addr_ptr(dpc);
-                    uint32_t di = 0;
-                    if (dp) memcpy(&di, dp, 4);
-                    printf("  %s 0x%08X: %08X\n", (dd == 0) ? ">>" : "  ", dpc, di);
-                }
-                fflush(stdout);
-            }
-            fflush(stdout);
-        }
-    }
+    /* [INTERP-GUARD] — re-enable when debugging interpreter loop limits:
+    static uint32_t s_guard_hit = 0;
+    if (++s_guard_hit <= 50) {
+        printf("[INTERP-GUARD] #%u guard at PC=0x%08X entry=0x%08X f%u\n",
+               s_guard_hit, pc, start_pc, g_ps1_frame);
+        fflush(stdout);
+    } */
 }
 
 /* ---------------------------------------------------------------------------
@@ -4084,15 +2104,6 @@ static void fire_interrupt_chain(CPUState *cpu, uint32_t priority) {
 }
 
 void call_by_address(CPUState* cpu, uint32_t addr) {
-    /* ---- CD library call trace ---- */
-    if (addr >= 0x80064000u && addr < 0x80070000u) {
-        static uint32_t s_cd_cba = 0;
-        if (++s_cd_cba <= 50) {
-            printf("[CD-CALL-BY-ADDR] #%u addr=0x%08X ra=0x%08X f%u\n",
-                   s_cd_cba, addr, cpu->ra, g_ps1_frame);
-            fflush(stdout);
-        }
-    }
     static uint32_t s_call_60b70 = 0;
     static uint32_t s_call_5dfd8 = 0;
     static uint32_t s_call_1a8a8 = 0;
@@ -4214,31 +2225,6 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             fflush(stdout);
         }
     }
-    /* DRA.BIN call trace — always on */
-    if (addr >= 0x800A0000u && addr <= 0x801FFFFFu) {
-        static uint32_t s_dra_calls = 0;
-        ++s_dra_calls;
-        if (s_dra_calls <= 50u || (s_dra_calls % 500u) == 0u) {
-            printf("[DRA-CALL] f%u #%u addr=0x%08X a0=0x%08X ra=0x%08X\n",
-                   g_ps1_frame, s_dra_calls, addr, cpu->a0, cpu->ra);
-            fflush(stdout);
-        }
-    }
-    /* Per-frame compiled function call trace: log EVERY call from DRA.BIN/overlay
-     * code to compiled functions during frames 1-3. This shows what game functions
-     * do when they should be adding primitives to the OT. */
-    {
-        static uint32_t s_pfcall = 0;
-        if (g_ps1_frame >= 1u && g_ps1_frame <= 3u &&
-            cpu->ra >= 0x800A0000u && cpu->ra <= 0x801FFFFFu &&
-            addr < 0x800A0000u) {
-            if (++s_pfcall <= 200u) {
-                printf("[FRAME-CALL] f%u #%u ra=0x%08X → 0x%08X a0=0x%08X a1=0x%08X\n",
-                       g_ps1_frame, s_pfcall, cpu->ra, addr, cpu->a0, cpu->a1);
-                fflush(stdout);
-            }
-        }
-    }
     /* Normalise KUSEG/KSEG1 addresses to KSEG0 before dispatch.
      * Some game code stores function pointers as KUSEG (no KSEG0 bit).
      * e.g. 0x00014900 → 0x80014900. */
@@ -4314,34 +2300,6 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
     if (addr == 0x8004DEF0u) {
         cpu->a0 = cpu->s0;
         if (psx_dispatch_compiled(cpu, 0x8004E244u)) goto sp_check;
-        goto sp_check;
-    }
-
-    /* ---- Split-function fixups ------------------------------------------------
-     * The recompiler sometimes splits a PSX function into a 2-instruction
-     * prologue block (loads v0 from RAM) at the end of one compiled function,
-     * and the main body as a separate compiled function immediately after.
-     * When game code JALs to the prologue address, psx_dispatch_compiled has
-     * no case for it.  Fix: run the prologue inline, then dispatch to the body.
-     *
-     *   0x80012C90 (ClearImage)  → prologue → body at 0x80012C98
-     *   0x80012E8C (ClearOTag)   → prologue → body at 0x80012E94
-     *   0x80012FE4 (DrawOTag)    → prologue → body at 0x80012FEC
-     *
-     * Prologue: lui v0,0x8003 ; lw v0,-0x3D98(v0)  →  v0 = RAM[0x8002C268]
-     */
-    if (addr == 0x80012C90u || addr == 0x80012E8Cu || addr == 0x80012FE4u) {
-        static uint32_t s_split_fix = 0;
-        cpu->v0 = cpu->read_word(0x8002C268u);  /* prologue: load GPU status */
-        uint32_t body = (addr == 0x80012C90u) ? 0x80012C98u :
-                        (addr == 0x80012E8Cu) ? 0x80012E94u :
-                                                0x80012FECu;
-        if (++s_split_fix <= 30u || (s_split_fix % 500u) == 0u) {
-            printf("[SPLIT-FIX] #%u f%u addr=0x%08X → body=0x%08X ra=0x%08X a0=0x%08X a1=0x%08X\n",
-                   s_split_fix, g_ps1_frame, addr, body, cpu->ra, cpu->a0, cpu->a1);
-            fflush(stdout);
-        }
-        psx_dispatch_compiled(cpu, body);
         goto sp_check;
     }
 
@@ -4480,12 +2438,8 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x3F: {  /* printf(fmt, ...) — best-effort: just print fmt string */
                 if (cpu->a0) {
                     const char* s = (const char*)&g_ram[cpu->a0 & 0x1FFFFFFF];
-                    /* Skip CD timeout spam */
-                    if (strncmp(s, "CD timeout", 10) != 0 && 
-                        strncmp(s, "%s:(%s) Sync", 12) != 0) {
-                        printf("[BIOS printf] %s", s);
-                        fflush(stdout);
-                    }
+                    printf("[BIOS printf] %s", s);
+                    fflush(stdout);
                 }
                 return;
             }
@@ -4512,22 +2466,19 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 return;
             }
             default:
-                /* Unhandled BIOS A calls — silently return for now */
+                /* [BIOS A()] — re-enable when debugging unknown BIOS A calls:
+                printf("[BIOS A(0x%02X)] a0=0x%08X a1=0x%08X\n", func, cpu->a0, cpu->a1);
+                fflush(stdout); */
                 return;
         }
     }
 
     /* --- BIOS Function Table B (addr=0xB0) -------------------------------- */
     if (addr == 0xB0) {
-        /* Trace BIOS B calls (excluding frequent ones) */
-        if (func != 0x0B && func != 0x10 && func != 0x0C && func != 0x0D) {
-            static uint32_t s_b0_trace = 0;
-            if (++s_b0_trace <= 50u || (s_b0_trace % 240u) == 0u) {
-                printf("[B0] f%u B(0x%02X) ra=0x%08X a0=0x%08X\n",
-                       g_ps1_frame, func, cpu->ra, cpu->a0);
-                fflush(stdout);
-            }
-        }
+        /* [B0] — re-enable when debugging BIOS B calls:
+        if (func != 0x0B && func != 0x10) {
+            printf("[B0] f%u B(0x%02X) ra=0x%08X\n", g_ps1_frame, func, cpu->ra);
+        } */
         switch (func) {
             case 0x08: /* OpenEvent(class,spec,mode,func) → event handle */
                 /* Minimal stub: return a non-zero handle so callers don't treat it as error */
@@ -4538,8 +2489,6 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x0B: cpu->v0 = 1; return;  /* TestEvent — return 1 (event fired) */
             case 0x0C: cpu->v0 = 1; return;  /* EnableEvent — success */
             case 0x0D: cpu->v0 = 1; return;  /* DisableEvent — success */
-            case 0x15: cpu->v0 = 1; return;  /* PAD_init2 — stub */
-            case 0x16: cpu->v0 = 0; return;  /* PAD_dr — stub, return 0 (no data) */
             case 0x0F: cpu->v0 = 1; return;  /* CloseThread — no-op in fiber model */
             case 0x0E: {  /* OpenThread(entry, sp, stksz) → thread handle */
                 if (cpu->a0 == 0x800191E0u) {
@@ -4922,400 +2871,157 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 cpu->v0 = 0;
                 return;
             }
-            /* Memory card I/O — proper 128KB raw card image implementation.
-             * B(0x32) open, B(0x33) lseek, B(0x34) read, B(0x35) write, B(0x36) close
-             * B(0x42) firstfile, B(0x43) nextfile
-             * B(0x4A) InitCard, B(0x4B) StartCard, B(0x4E) card_write, B(0x4F) card_read */
-            case 0x32: {  /* _bu_open(path, flags, size) → fd or -1 */
+            /* Memory card file I/O — B(0x32) open, B(0x33) lseek, B(0x34) read,
+             * B(0x35) write, B(0x36) close.  Backed by flat files in C:/temp/memcard/. */
+            case 0x32: {  /* open(path, flags) → fd or -1 */
                 uint32_t pa = cpu->a0 & 0x1FFFFFFFu;
                 uint32_t flags = cpu->a1;
-                uint32_t file_size = cpu->a2;
-                const char *path = (pa < sizeof(g_ram)) ? (const char*)&g_ram[pa] : "";
-                /* --- CDROM / sim: file open --- */
-                if (is_cdrom_path(path)) {
-                    const char* fname = cdrom_extract_filename(path);
-                    uint32_t start_lba = 0, file_size_cd = 0;
-                    int found = psx_cdrom_find_file(fname, &start_lba, &file_size_cd);
-                    /* If not found with path, try just the filename (root directory) */
-                    if (!found) {
-                        const char* just_name = fname;
-                        for (const char* p = fname; *p; p++) {
-                            if (*p == '/') just_name = p + 1;
+                const char* path = (pa < sizeof(g_ram)) ? (const char*)&g_ram[pa] : "";
+                /* [OPEN-DUMP] one-shot overlay dump — data collected, no longer needed.
+                 * Result: a2=0x0C00 (save data size), ra=0x800E7BDC, overlay at 0x800E7BD0.
+                 * Re-enable: remove comment-out below.
+                if ((flags & 0x200u) && g_ps1_frame >= 3490u && g_ps1_frame <= 3510u) {
+                    static int s_dump_done = 0;
+                    if (!s_dump_done) {
+                        s_dump_done = 1;
+                        printf("[OPEN-DUMP] f%u a0=0x%08X(\"%s\") a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X\n",
+                               g_ps1_frame, cpu->a0, path, cpu->a1, cpu->a2, cpu->a3, cpu->ra);
+                        uint32_t dump_start = (cpu->ra - 0x30u) & 0x1FFFFFFFu;
+                        uint32_t dump_end   = (cpu->ra + 0x60u) & 0x1FFFFFFFu;
+                        printf("[OPEN-DUMP] overlay code 0x%08X - 0x%08X:\n", dump_start + 0x80000000u, dump_end + 0x80000000u);
+                        for (uint32_t i = dump_start; i < dump_end && i < sizeof(g_ram); i += 4) {
+                            uint32_t w = g_ram[i] | (g_ram[i+1]<<8) | (g_ram[i+2]<<16) | (g_ram[i+3]<<24);
+                            printf("  0x%08X: %08X\n", i + 0x80000000u, w);
                         }
-                        if (just_name != fname) {
-                            found = psx_cdrom_find_file(just_name, &start_lba, &file_size_cd);
-                            if (found) fname = just_name;
-                        }
-                    }
-                    if (!found) {
-                        printf("[CDROM open] NOT FOUND: \"%s\" (from \"%s\") ra=0x%08X\n",
-                               fname, path, cpu->ra);
                         fflush(stdout);
-                        cpu->v0 = (uint32_t)-1; return;
                     }
-                    /* Allocate a cdrom virtual fd */
-                    int vfd_idx = -1;
-                    for (int i = 0; i < CDROM_MAX_VFD; i++) {
-                        if (!s_cdrom_vfds[i].active) { vfd_idx = i; break; }
-                    }
-                    if (vfd_idx < 0) {
-                        printf("[CDROM open] NO FREE VFD for \"%s\"\n", fname);
-                        cpu->v0 = (uint32_t)-1; return;
-                    }
-                    s_cdrom_vfds[vfd_idx].active    = 1;
-                    s_cdrom_vfds[vfd_idx].start_lba = start_lba;
-                    s_cdrom_vfds[vfd_idx].file_size = file_size_cd;
-                    s_cdrom_vfds[vfd_idx].position  = 0;
-                    int fd = CDROM_FD_BASE + vfd_idx;
-                    cpu->v0 = (uint32_t)fd;
-                    printf("[CDROM open] fd=%d \"%s\" LBA=%u size=%u ra=0x%08X\n",
-                           fd, fname, start_lba, file_size_cd, cpu->ra);
-                    fflush(stdout);
-                    return;
-                }
-                /* --- Memory card file open --- */
+                } */
                 int slot = 0;  char name[64] = {0};
                 if (mc_parse_path(path, &slot, name, sizeof(name)) < 0) {
-                    cpu->v0 = (uint32_t)-1;
-                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                    return;
+                    printf("[MEMCARD open] bad path a0=0x%08X flags=0x%05X\n", cpu->a0, flags);
+                    cpu->v0 = (uint32_t)-1; return;
                 }
-                mc_load_card(slot);
+                mc_ensure_dir();
+                char filepath[256];
+                snprintf(filepath, sizeof(filepath), "C:/temp/memcard/slot%d_%s.bin", slot, name);
+                /* flags: bit 9 (0x200) = O_CREAT, bit 1 (0x2) = write, bit 0 (0x1) = read
+                 * PS1 O_CREAT = create if not exists, open if exists (no truncation).
+                 * Real PS1 BIOS: repeated O_CREAT to the same path returns same fd (slot reuse). */
                 int create = (flags & 0x200u) != 0;
-                int writable = (flags & 0x002u) != 0 || create;
-                int existing_block = mc_find_file(slot, name);
-
+                int write  = (flags & 0x002u) != 0;
+                /* On O_CREAT: if path already open, return existing fd (PS1 BIOS slot reuse) */
                 if (create) {
-                    if (existing_block >= 0) {
-                        /* File already exists — return -1 per PS1 BIOS O_CREAT semantics */
-                        cpu->v0 = (uint32_t)-1;
-                        mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                        return;
-                    }
-
-                    /* Check if this is a continuation block (name ends in -01, -02, etc.)
-                     * If so, link it to the parent -00 block instead of creating independently. */
-                    int nlen = (int)strlen(name);
-                    int is_continuation = 0;
-                    int parent_block = -1;
-                    int block_index = 0;  /* 0=first, 1=second, 2=third... */
-                    if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] >= '0' && name[nlen-1] >= '0') {
-                        block_index = (name[nlen-2] - '0') * 10 + (name[nlen-1] - '0');
-                        if (block_index > 0) {
-                            is_continuation = 1;
-                            /* Find the parent -00 block */
-                            char parent_name[64];
-                            strncpy(parent_name, name, sizeof(parent_name) - 1);
-                            parent_name[nlen-2] = '0'; parent_name[nlen-1] = '0';
-                            parent_block = mc_find_file(slot, parent_name);
+                    for (int i = 0; i < MEMCARD_MAX_FD; i++) {
+                        if (s_mc_fds[i].fp && strcmp(s_mc_fds[i].path, filepath) == 0) {
+                            cpu->v0 = (uint32_t)i;
+                            printf("[MEMCARD open] fd=%d reuse %s flags=0x%05X ra=0x%08X\n", i, filepath, flags, cpu->ra);
+                            return;
                         }
                     }
-
-                    /* Allocate one free block */
-                    int new_block = mc_find_free_block(slot);
-                    if (new_block < 0) {
-                        cpu->v0 = (uint32_t)-1;  /* card full */
-                        mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                        return;
-                    }
-
-                    /* Write directory entry */
-                    uint8_t *de = mc_dir_entry(slot, new_block);
-                    memset(de, 0, MC_SECTOR_SIZE);
-
-                    if (is_continuation && parent_block >= 0) {
-                        /* Continuation block: state = 0xA1 (middle) or 0xA2 (last, we'll set A2 for now) */
-                        uint32_t state = 0xA2;  /* assume last; if another -0N follows it updates to A1 */
-                        de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
-                        de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
-                        de[8] = 0xFF; de[9] = 0xFF;  /* next = none (last block) */
-                        mc_update_dir_checksum(slot, new_block);
-
-                        /* Walk the chain from parent to find the last block, then link to us */
-                        int prev = parent_block;
-                        while (1) {
-                            uint8_t *pde = mc_dir_entry(slot, prev);
-                            uint16_t pnext = pde[8] | (pde[9] << 8);
-                            if (pnext == 0xFFFF) break;
-                            prev = (int)(pnext + 1);
-                            if (prev < 1 || prev > 15) break;
+                }
+                /* Find a free FD slot — PS1 BIOS uses 0 and 1 (no stdin/stdout reservation) */
+                int fd = -1;
+                for (int i = 0; i < MEMCARD_MAX_FD; i++) {
+                    if (!s_mc_fds[i].fp) { fd = i; break; }
+                }
+                if (fd < 0) { cpu->v0 = (uint32_t)-1; return; }
+                if (create) {
+                    /* Try to open existing file first (r+b), fall back to create (w+b) */
+                    s_mc_fds[fd].fp = fopen(filepath, "r+b");
+                    if (!s_mc_fds[fd].fp) {
+                        /* New file: create and pre-fill 8 KB with zeros so read-back verify returns data */
+                        static const char zeros[0x2000];
+                        s_mc_fds[fd].fp = fopen(filepath, "w+b");
+                        if (s_mc_fds[fd].fp) {
+                            fwrite(zeros, 1, sizeof(zeros), s_mc_fds[fd].fp);
+                            rewind(s_mc_fds[fd].fp);
                         }
-                        /* Link previous last block to this new block */
-                        uint8_t *pde = mc_dir_entry(slot, prev);
-                        uint16_t link = (uint16_t)(new_block - 1);
-                        pde[8] = link & 0xFF; pde[9] = (link >> 8) & 0xFF;
-                        /* Update previous block state: if it was 0xA2 (last), change to 0xA1 (middle) */
-                        uint32_t prev_state = pde[0] | (pde[1]<<8) | (pde[2]<<16) | (pde[3]<<24);
-                        if (prev_state == 0xA2) {
-                            pde[0] = 0xA1; pde[1] = 0; pde[2] = 0; pde[3] = 0;
+                        /* If this is a "-00" block, also create companion "-01" and "-02" files */
+                        int nlen = (int)strlen(name);
+                        if (nlen >= 3 && name[nlen-3] == '-' && name[nlen-2] == '0' && name[nlen-1] == '0') {
+                            for (int blk = 1; blk <= 2; blk++) {
+                                char comp_path[256];
+                                snprintf(comp_path, sizeof(comp_path), "C:/temp/memcard/slot%d_%s.bin", slot, name);
+                                int clen = (int)strlen(comp_path);
+                                comp_path[clen - 5] = '0' + blk;  /* -00.bin → -01.bin / -02.bin */
+                                FILE *cfp = fopen(comp_path, "r+b");
+                                if (!cfp) {
+                                    cfp = fopen(comp_path, "w+b");
+                                    if (cfp) {
+                                        fwrite(zeros, 1, sizeof(zeros), cfp);
+                                        printf("[MEMCARD create] companion %s\n", comp_path);
+                                        fclose(cfp);
+                                    }
+                                } else {
+                                    fclose(cfp);
+                                }
+                            }
                         }
-                        mc_update_dir_checksum(slot, prev);
-
-                        /* Update parent's size to reflect total */
-                        uint8_t *parent_de = mc_dir_entry(slot, parent_block);
-                        uint32_t total_size = (block_index + 1) * MC_BLOCK_SIZE;
-                        parent_de[4] = total_size & 0xFF; parent_de[5] = (total_size>>8)&0xFF;
-                        parent_de[6] = (total_size>>16)&0xFF; parent_de[7] = (total_size>>24)&0xFF;
-                        mc_update_dir_checksum(slot, parent_block);
-                    } else {
-                        /* First block of a new file */
-                        uint32_t state = 0x51;
-                        de[0] = state & 0xFF; de[1] = (state>>8)&0xFF;
-                        de[2] = (state>>16)&0xFF; de[3] = (state>>24)&0xFF;
-                        de[4] = file_size & 0xFF; de[5] = (file_size>>8)&0xFF;
-                        de[6] = (file_size>>16)&0xFF; de[7] = (file_size>>24)&0xFF;
-                        de[8] = 0xFF; de[9] = 0xFF;  /* next = none (single block for now) */
-                        strncpy((char*)&de[0x0A], name, 20);
-                        mc_update_dir_checksum(slot, new_block);
                     }
-                    existing_block = new_block;
+                } else if (write) {
+                    s_mc_fds[fd].fp = fopen(filepath, "r+b");
+                    if (!s_mc_fds[fd].fp) s_mc_fds[fd].fp = fopen(filepath, "w+b");
+                } else {
+                    s_mc_fds[fd].fp = fopen(filepath, "rb");
                 }
-
-                if (existing_block < 0) {
-                    cpu->v0 = (uint32_t)-1;  /* file not found */
-                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                    return;
+                if (!s_mc_fds[fd].fp) {
+                    printf("[MEMCARD open] FAIL %s flags=0x%05X\n", filepath, flags);
+                    cpu->v0 = (uint32_t)-1; return;
                 }
-
-                /* Allocate fd */
-                int fdi = mc_alloc_fd();
-                if (fdi < 0) {
-                    cpu->v0 = (uint32_t)-1;
-                    mc_log_push(0x32, cpu, cpu->v0, 0, 0);
-                    return;
-                }
-                s_mc_fds[fdi].active = 1;
-                s_mc_fds[fdi].slot = slot;
-                s_mc_fds[fdi].block = existing_block;
-                uint8_t *de = mc_dir_entry(slot, existing_block);
-                s_mc_fds[fdi].size = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
-                s_mc_fds[fdi].pos = 0;
-                s_mc_fds[fdi].writable = writable;
-                cpu->v0 = (uint32_t)(fdi + MC_FD_BASE);
-                mc_log_push(0x32, cpu, cpu->v0, 0, 0);
+                strncpy(s_mc_fds[fd].path, filepath, sizeof(s_mc_fds[fd].path) - 1);
+                /* Track the PS1 name for firstfile/nextfile direntry population */
+                if (create) strncpy(s_last_mc_name, name, sizeof(s_last_mc_name) - 1);
+                cpu->v0 = (uint32_t)fd;
+                printf("[MEMCARD open] fd=%d %s flags=0x%05X ra=0x%08X\n", fd, filepath, flags, cpu->ra);
                 return;
             }
             case 0x33: {  /* lseek(fd, offset, whence) → new position */
                 int fd = (int)cpu->a0;
                 int32_t offset = (int32_t)cpu->a1;
                 int whence = (int)cpu->a2;
-                /* CDROM virtual fd lseek */
-                if (is_cdrom_fd(fd)) {
-                    int idx = fd - CDROM_FD_BASE;
-                    if (!s_cdrom_vfds[idx].active) { cpu->v0 = (uint32_t)-1; return; }
-                    uint32_t fsz = s_cdrom_vfds[idx].file_size;
-                    uint32_t pos = s_cdrom_vfds[idx].position;
-                    if (whence == 0) pos = (uint32_t)offset;        /* SEEK_SET */
-                    else if (whence == 1) pos += (uint32_t)offset;  /* SEEK_CUR */
-                    else pos = fsz + (uint32_t)offset;              /* SEEK_END */
-                    if (pos > fsz) pos = fsz;
-                    s_cdrom_vfds[idx].position = pos;
-                    cpu->v0 = pos;
-                    return;
-                }
-                /* Memcard lseek */
-                int fdi = fd - MC_FD_BASE;
-                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active) {
-                    cpu->v0 = (uint32_t)-1;
-                    mc_log_push(0x33, cpu, cpu->v0, 0, 0);
-                    return;
-                }
-                uint32_t newpos = s_mc_fds[fdi].pos;
-                if (whence == 0) newpos = (uint32_t)offset;
-                else if (whence == 1) newpos = (uint32_t)((int32_t)newpos + offset);
-                else if (whence == 2) newpos = (uint32_t)((int32_t)s_mc_fds[fdi].size + offset);
-                s_mc_fds[fdi].pos = newpos;
-                cpu->v0 = newpos;
-                mc_log_push(0x33, cpu, cpu->v0, 0, 0);
-                return;
+                printf("[MEMCARD lseek] fd=%d offset=%d whence=%d ra=0x%08X\n", fd, offset, whence, cpu->ra);
+                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
+                int w = (whence == 0) ? SEEK_SET : (whence == 1) ? SEEK_CUR : SEEK_END;
+                fseek(s_mc_fds[fd].fp, offset, w);
+                cpu->v0 = (uint32_t)ftell(s_mc_fds[fd].fp); return;
             }
             case 0x34: {  /* read(fd, buf, len) → bytes read */
                 int fd = (int)cpu->a0;
-                /* PS1 RAM is mirrored every 2MB. Apply mask. */
-                uint32_t buf = (cpu->a1 & 0x1FFFFFFFu) % 0x200000u;
-                uint32_t len = cpu->a2;
-                /* CDROM virtual fd read */
-                if (is_cdrom_fd(fd)) {
-                    int idx = fd - CDROM_FD_BASE;
-                    if (!s_cdrom_vfds[idx].active) {
-                        printf("[CDROM read] INACTIVE fd=%d\n", fd);
-                        cpu->v0 = (uint32_t)-1; return;
-                    }
-                    uint32_t pos  = s_cdrom_vfds[idx].position;
-                    uint32_t fsz  = s_cdrom_vfds[idx].file_size;
-                    uint32_t slba = s_cdrom_vfds[idx].start_lba;
-                    /* Clamp to remaining bytes */
-                    uint32_t avail = (pos < fsz) ? (fsz - pos) : 0;
-                    if (len > avail) len = avail;
-                    if (len == 0) { cpu->v0 = 0; return; }
-                    if (buf + len > sizeof(g_ram)) {
-                        printf("[CDROM read] dest 0x%08X+%u exceeds RAM\n", buf, len);
-                        cpu->v0 = (uint32_t)-1; return;
-                    }
-                    printf("[CDROM read] fd=%d LBA=%u+%u pos=%u len=%u -> RAM 0x%08X ra=0x%08X\n",
-                           fd, slba, pos / 2048, pos, len, buf + 0x80000000u, cpu->ra);
-                    fflush(stdout);
-                    uint32_t bytes_read = 0;
-                    uint8_t sec_buf[2048];
-                    while (bytes_read < len) {
-                        uint32_t cur_pos = pos + bytes_read;
-                        uint32_t sector  = slba + cur_pos / 2048;
-                        uint32_t sec_off = cur_pos % 2048;
-                        uint32_t chunk   = 2048 - sec_off;
-                        if (chunk > len - bytes_read) chunk = len - bytes_read;
-                        if (!psx_cdrom_read_sector(sector, sec_buf)) {
-                            printf("[CDROM read] FAILED at sector %u\n", sector);
-                            break;
-                        }
-                        memcpy(&g_ram[buf + bytes_read], &sec_buf[sec_off], chunk);
-                        bytes_read += chunk;
-                    }
-                    s_cdrom_vfds[idx].position = pos + bytes_read;
-                    cpu->v0 = bytes_read;
-                    printf("[CDROM read] done: %u bytes read\n", bytes_read);
-                    fflush(stdout);
-                    return;
-                }
-                /* Memcard read */
-                int fdi = fd - MC_FD_BASE;
-                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active) {
-                    cpu->v0 = (uint32_t)-1;
-                    mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
-                    return;
-                }
-                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len); return; }
-                /* Read from card sectors: block N starts at sector N*64 */
-                uint32_t bytes_read = 0;
-                int mc_slot = s_mc_fds[fdi].slot;
-                int blk = s_mc_fds[fdi].block;
-                uint32_t pos = s_mc_fds[fdi].pos;
-                while (bytes_read < len && blk >= 1 && blk <= 15) {
-                    uint32_t blk_offset = pos % MC_BLOCK_SIZE;
-                    uint32_t blk_remain = MC_BLOCK_SIZE - blk_offset;
-                    uint32_t to_read = len - bytes_read;
-                    if (to_read > blk_remain) to_read = blk_remain;
-                    uint32_t sector_start = blk * 64 + blk_offset / MC_SECTOR_SIZE;
-                    uint32_t sec_offset = blk_offset % MC_SECTOR_SIZE;
-                    for (uint32_t i = 0; i < to_read; ) {
-                        uint8_t mc_sec_buf[MC_SECTOR_SIZE];
-                        uint32_t sec = sector_start + (sec_offset + i) / MC_SECTOR_SIZE;
-                        mc_read_sector(mc_slot, sec, mc_sec_buf);
-                        uint32_t off_in_sec = (sec_offset + i) % MC_SECTOR_SIZE;
-                        uint32_t chunk = MC_SECTOR_SIZE - off_in_sec;
-                        if (chunk > to_read - i) chunk = to_read - i;
-                        memcpy(&g_ram[buf + bytes_read + i], &mc_sec_buf[off_in_sec], chunk);
-                        i += chunk;
-                    }
-                    bytes_read += to_read;
-                    pos += to_read;
-                    if (pos % MC_BLOCK_SIZE == 0) {
-                        /* Move to next linked block */
-                        uint8_t *de = mc_dir_entry(mc_slot, blk);
-                        uint16_t next = de[8] | (de[9] << 8);
-                        blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
-                    }
-                }
-                s_mc_fds[fdi].pos = pos;
-                cpu->v0 = bytes_read;
-                mc_log_push(0x34, cpu, cpu->v0, cpu->a1, len);
-                return;
-            }
-            case 0x35: {  /* write(fd, buf, len) → bytes written */
-                int fdi = (int)cpu->a0 - MC_FD_BASE;
                 uint32_t buf = cpu->a1 & 0x1FFFFFFFu;
                 uint32_t len = cpu->a2;
-                /* stdout (fd=1) passthrough */
-                if (cpu->a0 == 1) {
+                printf("[MEMCARD read] fd=%d buf=0x%08X len=%u ra=0x%08X\n", fd, cpu->a1, len, cpu->ra);
+                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
+                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
+                size_t n = fread(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
+                cpu->v0 = (uint32_t)n; return;
+            }
+            case 0x35: {  /* write(fd, buf, len) → bytes written */
+                int fd = (int)cpu->a0;
+                uint32_t buf = cpu->a1 & 0x1FFFFFFFu;
+                uint32_t len = cpu->a2;
+                /* stdout (fd=1) writes — only if fd=1 is NOT an open memcard file */
+                if (fd == 1 && (fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp)) {
                     if (buf < sizeof(g_ram) && len > 0) fwrite(&g_ram[buf], 1, len, stdout);
                     cpu->v0 = len; return;
                 }
-                if (fdi < 0 || fdi >= MC_MAX_FD || !s_mc_fds[fdi].active || !s_mc_fds[fdi].writable) {
-                    cpu->v0 = (uint32_t)-1;
-                    mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
-                    return;
-                }
-                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len); return; }
-                /* Write to card sectors */
-                uint32_t bytes_written = 0;
-                int mc_slot = s_mc_fds[fdi].slot;
-                int blk = s_mc_fds[fdi].block;
-                uint32_t pos = s_mc_fds[fdi].pos;
-                /* Walk linked blocks to find current position's block */
-                uint32_t skip_blocks = pos / MC_BLOCK_SIZE;
-                for (uint32_t i = 0; i < skip_blocks && blk >= 1 && blk <= 15; i++) {
-                    uint8_t *de = mc_dir_entry(mc_slot, blk);
-                    uint16_t next = de[8] | (de[9] << 8);
-                    blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
-                }
-                while (bytes_written < len && blk >= 1 && blk <= 15) {
-                    uint32_t blk_offset = pos % MC_BLOCK_SIZE;
-                    uint32_t blk_remain = MC_BLOCK_SIZE - blk_offset;
-                    uint32_t to_write = len - bytes_written;
-                    if (to_write > blk_remain) to_write = blk_remain;
-                    /* Write sector by sector */
-                    uint32_t base_sector = blk * 64;
-                    for (uint32_t i = 0; i < to_write; ) {
-                        uint32_t off_in_blk = (blk_offset + i);
-                        uint32_t sec = base_sector + off_in_blk / MC_SECTOR_SIZE;
-                        uint32_t off_in_sec = off_in_blk % MC_SECTOR_SIZE;
-                        uint8_t mc_sec_buf[MC_SECTOR_SIZE];
-                        mc_read_sector(mc_slot, sec, mc_sec_buf);
-                        uint32_t chunk = MC_SECTOR_SIZE - off_in_sec;
-                        if (chunk > to_write - i) chunk = to_write - i;
-                        memcpy(&mc_sec_buf[off_in_sec], &g_ram[buf + bytes_written + i], chunk);
-                        mc_write_sector(mc_slot, sec, mc_sec_buf);
-                        i += chunk;
-                    }
-                    bytes_written += to_write;
-                    pos += to_write;
-                    if (pos % MC_BLOCK_SIZE == 0) {
-                        uint8_t *de = mc_dir_entry(mc_slot, blk);
-                        uint16_t next = de[8] | (de[9] << 8);
-                        blk = (next == 0xFFFF) ? -1 : (int)(next + 1);
-                    }
-                }
-                s_mc_fds[fdi].pos = pos;
-                cpu->v0 = bytes_written;
-                mc_log_push(0x35, cpu, cpu->v0, cpu->a1, len);
-                return;
+                printf("[MEMCARD write] fd=%d buf=0x%08X len=%u ra=0x%08X\n", fd, cpu->a1, len, cpu->ra);
+                if (fd < 0 || fd >= MEMCARD_MAX_FD || !s_mc_fds[fd].fp) { cpu->v0 = (uint32_t)-1; return; }
+                if (buf + len > sizeof(g_ram)) { cpu->v0 = (uint32_t)-1; return; }
+                size_t n = fwrite(&g_ram[buf], 1, len, s_mc_fds[fd].fp);
+                fflush(s_mc_fds[fd].fp);
+                cpu->v0 = (uint32_t)n; return;
             }
             case 0x36: {  /* close(fd) → 0 */
                 int fd = (int)cpu->a0;
-                /* CDROM virtual fd close */
-                if (is_cdrom_fd(fd)) {
-                    int idx = fd - CDROM_FD_BASE;
-                    printf("[CDROM close] fd=%d ra=0x%08X\n", fd, cpu->ra);
-                    if (s_cdrom_vfds[idx].active) {
-                        s_cdrom_vfds[idx].active = 0;
-                    }
-                    cpu->v0 = 0; return;
+                printf("[MEMCARD close] fd=%d ra=0x%08X\n", fd, cpu->ra);
+                if (fd >= 0 && fd < MEMCARD_MAX_FD && s_mc_fds[fd].fp) {
+                    fclose(s_mc_fds[fd].fp);
+                    s_mc_fds[fd].fp = NULL;
+                    s_mc_fds[fd].path[0] = '\0';
                 }
-                /* Memcard close */
-                int fdi = fd - MC_FD_BASE;
-                if (fdi >= 0 && fdi < MC_MAX_FD && s_mc_fds[fdi].active) {
-                    s_mc_fds[fdi].active = 0;
-                }
-                cpu->v0 = 0;
-                mc_log_push(0x36, cpu, cpu->v0, 0, 0);
-                return;
+                cpu->v0 = 0; return;
             }
-            case 0x3D: {  /* putchar */
-                /* Suppress CD timeout character output */
-                static char s_putchar_buf[64];
-                static int s_putchar_idx = 0;
-                char c = cpu->a0 & 0xFF;
-                if (c == '\n' || c == '\r') {
-                    s_putchar_buf[s_putchar_idx] = '\0';
-                    if (s_putchar_idx > 0 && strncmp(s_putchar_buf, "CD timeout", 10) != 0) {
-                        printf("%s\n", s_putchar_buf);
-                        fflush(stdout);
-                    }
-                    s_putchar_idx = 0;
-                } else if (s_putchar_idx < (int)sizeof(s_putchar_buf) - 1) {
-                    s_putchar_buf[s_putchar_idx++] = c;
-                }
-                return;
-            }
+            case 0x3D: putchar(cpu->a0 & 0xFF); fflush(stdout); return;  /* putchar */
             case 0x3F: {  /* puts */
                 if (cpu->a0) puts((const char*)&g_ram[cpu->a0 & 0x1FFFFFFF]);
                 return;
@@ -5324,126 +3030,40 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x17: return;  /* ReturnFromException — no-op in recompiler */
             case 0x18: return;  /* SetDefaultExitFromException — no-op */
             case 0x19: return;  /* SetCustomExitFromException — no-op */
-            case 0x42: {  /* firstfile(pattern, direntry) → direntry ptr or 0 */
-                uint32_t pat_addr = cpu->a0 & 0x1FFFFFFFu;
-                uint32_t de_addr  = cpu->a1 & 0x1FFFFFFFu;
-                const char *pattern = (pat_addr < sizeof(g_ram)) ? (const char*)&g_ram[pat_addr] : "";
-                int slot = 0;
-                const char *file_pat = pattern;
-                if (strncmp(pattern, "bu", 2) == 0) {
-                    slot = (pattern[2] == '1') ? 1 : 0;
-                    const char *colon = strchr(pattern, ':');
-                    if (colon) file_pat = colon + 1;
-                }
-                while (*file_pat == '\\' || *file_pat == '/') file_pat++;
-                mc_load_card(slot);
-                s_ff_slot = slot;
-                s_ff_block = 1;
-                strncpy(s_ff_pattern, file_pat, sizeof(s_ff_pattern) - 1);
-                /* Search directory for first matching file */
-                for (; s_ff_block <= 15; s_ff_block++) {
-                    uint8_t *de = mc_dir_entry(slot, s_ff_block);
-                    uint32_t state = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
-                    if (state != 0x51) continue;
-                    const char *fname = (const char*)&de[0x0A];
-                    /* Pattern match: "*" matches all, "PREFIX*" matches prefix */
-                    int match = 0;
-                    if (s_ff_pattern[0] == '*') match = 1;
-                    else {
-                        const char *star = strchr(s_ff_pattern, '*');
-                        int plen = star ? (int)(star - s_ff_pattern) : (int)strlen(s_ff_pattern);
-                        match = (strncmp(fname, s_ff_pattern, plen) == 0);
-                    }
-                    if (match) {
-                        /* Fill DIRENTRY in game RAM */
-                        if (de_addr + 0x2C <= sizeof(g_ram)) {
-                            memset(&g_ram[de_addr], 0, 0x2C);
-                            strncpy((char*)&g_ram[de_addr], fname, 20);
-                            uint32_t fsize = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
-                            *(uint32_t*)&g_ram[de_addr + 0x14] = state;
-                            *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
-                        }
-                        s_ff_block++;  /* next search starts here */
-                        cpu->v0 = cpu->a1;
-                        mc_log_push(0x42, cpu, cpu->v0, 0, 0);
-                        return;
-                    }
-                }
-                cpu->v0 = 0;  /* no files found */
-                mc_log_push(0x42, cpu, 0, 0, 0);
-                return;
-            }
-            case 0x43: {  /* nextfile(direntry) → direntry ptr or 0 */
-                uint32_t de_addr = cpu->a0 & 0x1FFFFFFFu;
-                int slot = s_ff_slot;
-                for (; s_ff_block <= 15; s_ff_block++) {
-                    uint8_t *de = mc_dir_entry(slot, s_ff_block);
-                    uint32_t state = de[0] | (de[1]<<8) | (de[2]<<16) | (de[3]<<24);
-                    if (state != 0x51 && state != 0xA1 && state != 0xA2) continue;
-                    const char *fname = (const char*)&de[0x0A];
-                    int match = 0;
-                    if (s_ff_pattern[0] == '*') match = 1;
-                    else {
-                        const char *star = strchr(s_ff_pattern, '*');
-                        int plen = star ? (int)(star - s_ff_pattern) : (int)strlen(s_ff_pattern);
-                        match = (strncmp(fname, s_ff_pattern, plen) == 0);
-                    }
-                    if (match) {
-                        if (de_addr + 0x2C <= sizeof(g_ram)) {
-                            memset(&g_ram[de_addr], 0, 0x2C);
-                            /* For continuation blocks, name is in the first block's dir entry */
-                            if (state == 0x51) strncpy((char*)&g_ram[de_addr], fname, 20);
-                            else {
-                                /* Copy name from the DIRENTRY the game already has (it tracks it) */
-                                /* Just write the state/size, name stays from firstfile */
+            case 0x42: printf("[BIOS B(0x42)] firstfile a0=0x%08X a1=0x%08X ra=0x%08X\n", cpu->a0, cpu->a1, cpu->ra); fflush(stdout); cpu->v0 = 0; return; /* firstfile — NULL = no files found */
+            case 0x43: /* nextfile — simulate 3-block chain: return a0 for remain>0, then 0.
+                         * Update attr and name for blocks 2/3 (remain=2→0xA1, remain=1→0xA2). */
+                if (cpu->a0 != 0 && s_nextfile_remain > 0) {
+                    --s_nextfile_remain;
+                    cpu->v0 = cpu->a0;
+                    if (cpu->a0 >= 0x80000000u) {
+                        uint32_t _s = cpu->a0 - 0x80000000u;
+                        uint32_t attr = (s_nextfile_remain > 0) ? 0xA1u : 0xA2u;
+                        *(uint32_t*)&g_ram[_s + 0x14] = attr;
+                        *(uint32_t*)&g_ram[_s + 0x1C] = 0u;
+                        /* Update name suffix: block2="-01", block3="-02" */
+                        if (s_last_mc_name[0]) {
+                            strncpy((char*)&g_ram[_s], s_last_mc_name, 20);
+                            int nlen = (int)strlen(s_last_mc_name);
+                            if (nlen >= 2) {
+                                int blk = (s_nextfile_remain > 0) ? 1 : 2;
+                                g_ram[_s + nlen - 2] = '0' + (blk / 10);
+                                g_ram[_s + nlen - 1] = '0' + (blk % 10);
                             }
-                            uint32_t fsize = de[4] | (de[5]<<8) | (de[6]<<16) | (de[7]<<24);
-                            *(uint32_t*)&g_ram[de_addr + 0x14] = state;
-                            *(uint32_t*)&g_ram[de_addr + 0x18] = fsize;
                         }
-                        s_ff_block++;
-                        cpu->v0 = cpu->a0;
-                        return;
                     }
+                } else {
+                    s_nextfile_remain = 0;
+                    cpu->v0 = 0;
                 }
-                cpu->v0 = 0;
+                printf("[BIOS B(0x43)] nextfile a0=0x%08X -> v0=0x%08X remain=%d\n",
+                       cpu->a0, cpu->v0, s_nextfile_remain);
                 return;
-            }
             case 0x47: return;  /* AddCDRomDevice — no-op */
-            case 0x4E: {  /* _card_write(channel, sector, buffer) → 1=ok, 0=fail */
-                uint32_t channel = cpu->a0;
-                uint32_t sector  = cpu->a1;
-                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
-                int slot = (channel >= 0x10) ? 1 : 0;
-                if (sector >= MC_SECTORS || buf + MC_SECTOR_SIZE > sizeof(g_ram)) {
-                    cpu->v0 = 0; return;
-                }
-                mc_write_sector(slot, sector, &g_ram[buf]);
-                cpu->v0 = 1;
-                mc_log_push(0x4E, cpu, 1, cpu->a2, MC_SECTOR_SIZE);
-                return;
-            }
-            case 0x4F: {  /* _card_read(channel, sector, buffer) → 1=ok, 0=fail */
-                uint32_t channel = cpu->a0;
-                uint32_t sector  = cpu->a1;
-                uint32_t buf     = cpu->a2 & 0x1FFFFFFFu;
-                int slot = (channel >= 0x10) ? 1 : 0;
-                if (sector >= MC_SECTORS || buf + MC_SECTOR_SIZE > sizeof(g_ram)) {
-                    cpu->v0 = 0; return;
-                }
-                mc_read_sector(slot, sector, &g_ram[buf]);
-                cpu->v0 = 1;
-                mc_log_push(0x4F, cpu, 1, cpu->a2, MC_SECTOR_SIZE);
-                return;
-            }
-            case 0x4A: { /* InitCard */
-                mc_load_card(0);
-                mc_load_card(1);
-                cpu->v0 = 1;
-                return;
-            }
-            case 0x4B: cpu->v0 = 1; return;  /* StartCard — success */
-            case 0x4C: cpu->v0 = 1; return;  /* StopCard — success */
+            case 0x4E: printf("[BIOS B(0x4E)] card_write a0=0x%08X a1=0x%08X a2=0x%08X ra=0x%08X\n", cpu->a0, cpu->a1, cpu->a2, cpu->ra); cpu->v0 = (uint32_t)-1; return; /* card_write — not yet implemented */
+            case 0x4A: cpu->v0 = 1; return;  /* InitCard — stub success */
+            case 0x4B: cpu->v0 = 1; return;  /* StartCard — stub success */
+            case 0x4C: cpu->v0 = 1; return;  /* StopCard — stub success */
             case 0x56: /* GetC0Table — return pointer to dummy table in RAM */
                 cpu->v0 = 0x80000100u; /* point to zero-filled area near bottom of RAM */
                 return;
@@ -5817,29 +3437,13 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
 
     /* --- Unknown call --- */
     {
-        ++s_dispatch_miss_count;
+        static uint32_t s_unk_count = 0;
+        ++s_unk_count;
         /* Suppress log after first 50 to avoid flooding; print summary every 1000 */
-        if (s_dispatch_miss_count <= 50 || s_dispatch_miss_count % 1000 == 0) {
+        if (s_unk_count <= 50 || s_unk_count % 1000 == 0) {
             printf("[UNKNOWN CALL] #%u 0x%08X  (t1=0x%08X  a0=0x%08X  ra=0x%08X  sp=0x%08X)\n",
-                   s_dispatch_miss_count, addr, cpu->t1, cpu->a0, cpu->ra, cpu->sp);
+                   s_unk_count, addr, cpu->t1, cpu->a0, cpu->ra, cpu->sp);
             fflush(stdout);
-        }
-
-        /* Track unique dispatch misses and log to file */
-        {
-            int found = -1;
-            for (int i = 0; i < s_dispatch_miss_unique_count; i++) {
-                if (s_dispatch_miss_addrs[i] == addr) { found = i; break; }
-            }
-            if (found < 0 && s_dispatch_miss_unique_count < MAX_DISPATCH_MISS_UNIQUE) {
-                found = s_dispatch_miss_unique_count++;
-                s_dispatch_miss_addrs[found] = addr;
-                FILE *mf = fopen("dispatch_misses.log", "a");
-                if (mf) {
-                    fprintf(mf, "0x%08X  ra=0x%08X  frame=%u\n", addr, cpu->ra, g_ps1_frame);
-                    fclose(mf);
-                }
-            }
         }
     }
     return;
@@ -5910,49 +3514,6 @@ static uint32_t s_b2p_cache_frame = 0;
  * Do NOT add psx_register_override() here. If a function needs different
  * behavior, fix code_generator.cpp to emit correct code. */
 int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
-    /* ---- CD subsystem init: register callbacks and return success ---- */
-    if (addr == 0x8001930Cu) {
-        static int s_logged = 0;
-        if (!s_logged) {
-            /* func_8001930C normally tries CD init up to 5 times, then on success
-             * calls func_800195B0(0x8001939C) → RAM[0x32AA4] = CdDataCallback1
-             *       func_800195C8(0x800193C4) → RAM[0x32AA8] = CdDataCallback2
-             *       func_8001C254(0x800193EC)  → RAM[0x32DB8] = CdDataCallback3
-             * We skip the actual CD hardware init but register these callbacks so
-             * the A110 display callback CD-data path can dispatch them. */
-            uint32_t cb1 = 0x8001939Cu;
-            uint32_t cb2 = 0x800193C4u;
-            uint32_t cb3 = 0x800193ECu;
-            memcpy(&g_ram[0x32AA4], &cb1, 4);
-            memcpy(&g_ram[0x32AA8], &cb2, 4);
-            memcpy(&g_ram[0x32DB8], &cb3, 4);
-            printf("[CD-INIT] func_8001930C → registered CD callbacks: "
-                   "AA4=0x%08X AA8=0x%08X DB8=0x%08X\n", cb1, cb2, cb3);
-            fflush(stdout);
-            s_logged = 1;
-        }
-        cpu->v0 = 1;  /* return success (v0=1) */
-        return 1;
-    }
-    /* ---- CD library sync functions: return success immediately ---- */
-    /* func_8001A110: display callback / CD sync — the CD polling part loops forever.
-     * We can't fully skip it (it does display work too), but we can seed the
-     * timeout counter to make the polling exit quickly. */
-    if (addr == 0x8001A110u || addr == 0x8001A404u || addr == 0x8001AF3Cu) {
-        /* Seed the CD retry counter to 100 so polling exits after ~60 iterations */
-        uint32_t retry = 100;
-        memcpy(&g_ram[0x4927C], &retry, 4);
-    }
-    /* A8A8 (timer-fired handler) — let it run naturally now. */
-    /* ---- CD library range trace (0x80064000-0x80070000) ---- */
-    if (addr >= 0x80064000u && addr < 0x80070000u) {
-        static uint32_t s_cd_trace = 0;
-        if (++s_cd_trace <= 50) {
-            printf("[CD-OVERRIDE-DISPATCH] #%u addr=0x%08X ra=0x%08X f%u\n",
-                   s_cd_trace, addr, cpu->ra, g_ps1_frame);
-            fflush(stdout);
-        }
-    }
     /* ---- Entity spawner diagnostics ---- */
     if (addr == 0x80018C40u) {
         /* FUN_80018c40: entity push */
@@ -7402,171 +4963,118 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
          * frequency so that two calls separated by real microseconds differ by the
          * expected number of ticks (~960 ticks ≈ 28 µs at 33.868 MHz). */
         case 0x80015308u: {
-            /* Timer: use QPC scaled to PS1 33.868MHz.
-             * A664/A110 timer gate: seed = timer() + 960, check = timer().
-             * Timer "fires" when check >= seed.
-             * QPC fires instantly (wall-clock microseconds >> 960 ticks). */
-            static LARGE_INTEGER s_qpc_freq = { .QuadPart = 0 };
             static uint32_t s_timer_calls = 0;
+            static LARGE_INTEGER s_qpc_freq = { .QuadPart = 0 };
             if (s_qpc_freq.QuadPart == 0)
                 QueryPerformanceFrequency(&s_qpc_freq);
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
+            /* Scale host counter to PS1 ~33.868 MHz */
             cpu->v0 = (uint32_t)((now.QuadPart * 33868800ULL) / (uint64_t)s_qpc_freq.QuadPart);
             if (++s_timer_calls <= 8 || (s_timer_calls % 240u) == 0u) {
-                printf("[TIMER-QPC] f%u calls=%u v0=0x%08X ra=0x%08X\n",
-                       g_ps1_frame, s_timer_calls, cpu->v0, cpu->ra);
+                printf("[TIMER-FIX] f%u calls=%u v0=0x%08X\n", g_ps1_frame, s_timer_calls, cpu->v0);
                 fflush(stdout);
             }
             return 1;
-        }
-
-        /* func_8001930C — CD init retry loop.
-         * Calls func_80019464(1) up to 5 times; if it returns v0==1 (success),
-         * runs init functions and returns 1.  Each call to func_80019464 costs
-         * ~102K interpreter iterations because the underlying hardware-level
-         * CD controller init (CdInit / CdReset) spins waiting for PS1 CD-ROM
-         * register responses that our emulator does not produce.
-         *
-         * Our VFD layer already provides CD file I/O — the hardware-level init
-         * is unnecessary.  Override: skip the retry loop and return success. */
-        case 0x8001930Cu: {
-            static uint32_t s_930c_calls = 0;
-            if (++s_930c_calls <= 5u) {
-                printf("[CD-INIT-SKIP] f%u #%u func_8001930C → v0=1 (skip CD HW init)\n",
-                       g_ps1_frame, s_930c_calls);
-                fflush(stdout);
-            }
-            cpu->v0 = 1u;
-            return 1;
-        }
-
-        /* func_80015650 — CD data available check.
-         * Returns RAM[0x2C2BA] halfword. If 0, the A110 callback dispatch
-         * skips all CD callbacks (RAM[0x32AA8]/[0x32AA4]).
-         * Override: return 1 so the callback dispatch path is reachable. */
-        case 0x80015650u: {
-            static uint32_t s_15650_calls = 0;
-            cpu->v0 = 1u;
-            if (++s_15650_calls <= 5 || (s_15650_calls % 240u) == 0u) {
-                printf("[CD-AVAIL] f%u func_80015650 → v0=1 (CD data available)\n",
-                       g_ps1_frame);
-                fflush(stdout);
-            }
-            return 1;
-        }
-
-        /* func_80019B98 — CD status processor. Reads CD-ROM hardware registers
-         * via pointers at RAM[0x2D68/0x2D74/0x2D6C]. Returns bit flags:
-         *   0x04 = call RAM[0x32AA8] (CdDataCallback2)
-         *   0x02 = call RAM[0x32AA4] (CdDataCallback1)
-         * Override: return 0x06 once per timer cycle to simulate one pending
-         * CD data item, then 0 to let the polling loop in A110 exit. */
-        case 0x80019B98u: {
-            static uint32_t s_19B98_calls = 0;
-            static uint32_t s_19B98_cycle = 0;
-            ++s_19B98_calls;
-            /* Return 0x06 on the first call of each cycle, then 0. 
-             * A110 loops: call 19B98 → if nonzero → process callbacks → loop.
-             * Returning 0 exits the loop so the function can return. */
-            if (s_19B98_cycle == 0) {
-                s_19B98_cycle = 1;
-                cpu->v0 = 0x0006u;
-            } else {
-                s_19B98_cycle = 0;
-                cpu->v0 = 0x0000u;
-            }
-            if (s_19B98_calls <= 10 || (s_19B98_calls % 480u) == 0u) {
-                printf("[CD-STATUS] f%u func_80019B98 #%u → v0=0x%04X\n",
-                       g_ps1_frame, s_19B98_calls, cpu->v0);
-                fflush(stdout);
-            }
-            return 1;
-        }
-
-        case 0x80016C54u: {
-            /* VSync — DRA.BIN's MainGame loop calls this every frame.
-             * If running inside the game fiber, yield back to the pump loop.
-             * Otherwise (boot or non-fiber context), present + continue. */
-            extern void psx_present_frame(void);
-            static uint32_t s_vsync_calls = 0;
-            if (++s_vsync_calls <= 20 || (s_vsync_calls % 240u) == 0u) {
-                uint32_t c0f8 = 0, c73ec = 0, c734 = 0, d1c0 = 0, b62b0 = 0;
-                memcpy(&c0f8, &g_ram[0x3C0F8], 4);
-                memcpy(&c73ec, &g_ram[0x973EC], 4);
-                memcpy(&c734, &g_ram[0x3C734], 4);
-                memcpy(&d1c0, &g_ram[0xBD1C0], 4);
-                memcpy(&b62b0, &g_ram[0x1362B0], 4);
-                printf("[VSYNC] f%u #%u ra=0x%08X | GATE: C0F8=%u 73EC=%u C734=%u D1C0=0x%X 62B0=0x%X\n",
-                       g_ps1_frame, s_vsync_calls, cpu->ra,
-                       c0f8, c73ec, c734, d1c0, b62b0);
-                fflush(stdout);
-            }
-            /* Clear 73EC (loading-busy flag) every frame */
-            {
-                uint32_t val = 0;
-                memcpy(&g_ram[0x973EC], &val, 4);
-            }
-            /* If running in game fiber, yield back to pump loop.
-             * The fiber preserves the entire interpreter host stack, so
-             * MainGame resumes exactly at the next instruction after VSync. */
-            if (g_fiber_game && GetCurrentFiber() == g_fiber_game) {
-                memcpy(g_game_saved, cpu, MIPS_GP_REGS * sizeof(uint32_t));
-                SwitchToFiber(g_fiber_main);
-                /* Pump switched back — resume MainGame */
-                memcpy(cpu, g_game_saved, MIPS_GP_REGS * sizeof(uint32_t));
-                return 1;  /* handled — don't run compiled VSync */
-            }
-            /* Non-game-fiber context (boot, scheduler): present + run normally */
-            psx_present_frame();
-            return 0;
         }
 
         case 0x8001A110u: {
-            /* A110 is the VSync handler — runs timer loop, polls CD, calls AB2C.
-             * Let compiled code handle it naturally. The timer override (+33 per
-             * call) ensures the loop fires after ~29 iterations. */
-            static uint32_t s_a110_calls = 0;
-            if (++s_a110_calls <= 10 || (s_a110_calls % 240u) == 0u) {
-                printf("[A110-RUN] f%u call#%u compiled (ra=0x%08X a0=0x%08X)\n",
-                       g_ps1_frame, s_a110_calls, cpu->ra, cpu->a0);
-                fflush(stdout);
+            static int s_override_a110 = -1;
+            if (s_override_a110 < 0) {
+                const char* env = getenv("PSX_CV_OVERRIDE_A110_CALL_A664");
+                s_override_a110 = (env && env[0] && env[0] != '0') ? 1 : 0;
+                if (s_override_a110) {
+                    printf("[CV-SIG] override A110->A664=%d (PSX_CV_OVERRIDE_A110_CALL_A664)\n", s_override_a110);
+                    fflush(stdout);
+                }
             }
-            return 0;  /* let compiled code run */
-        }
+            if (s_override_a110) {
+                uint32_t save_ra = cpu->ra;
+                uint32_t save_a0 = cpu->a0;
+                uint32_t save_a1 = cpu->a1;
+                uint32_t save_a2 = cpu->a2;
+                uint32_t save_a3 = cpu->a3;
 
-        case 0x800194F0u: {
-            /* func_800194F0: register display callback.
-             * Writes a0 → RAM[0x32AB0], returns old value in v0.
-             * Log to track when game registers its display callback. */
-            uint32_t old_cb = 0;
-            memcpy(&old_cb, &g_ram[0x32AB0], 4);
-            printf("[CV-SETCB] f%u func_800194F0: new=0x%08X old=0x%08X ra=0x%08X\n",
-                   g_ps1_frame, cpu->a0, old_cb, cpu->ra);
-            fflush(stdout);
-            return 0;  /* let compiled code run */
+                cpu->ra = 0x80010EA4u;
+                mips_interpret(cpu, 0x8001A664u);
+
+                cpu->ra = save_ra;
+                cpu->a0 = save_a0;
+                cpu->a1 = save_a1;
+                cpu->a2 = save_a2;
+                cpu->a3 = save_a3;
+                return 1;
+            }
+            break;
         }
 
         case 0x8001A65Cu: {
-            /* func_8001A65C reads RAM[0x32AB0] (display callback) and falls
-             * through to func_8001A664. Let compiled code handle it. */
+            /* func_8001A65C is a tiny callback-pointer fetch used by 0x80019844/0x80019900.
+             * In this title, the subsequent indirect JALR path is missing in recompiled code,
+             * so we optionally emulate the callback call right here. */
+            static int s_emulate_a65c_call = -1;
+            static int s_a65c_fallback_tbl0 = -1;
             static uint32_t s_a65c_hits = 0;
-            if (++s_a65c_hits <= 10u || (s_a65c_hits % 240u) == 0u) {
-                uint32_t cb = 0;
-                memcpy(&cb, &g_ram[0x32AB0], 4);
-                printf("[A65C-RUN] f%u hits=%u cb=0x%08X a0=0x%08X a1=0x%08X\n",
-                       g_ps1_frame, s_a65c_hits, cb, cpu->a0, cpu->a1);
+            if (s_emulate_a65c_call < 0) {
+                const char* env = getenv("PSX_CV_EMULATE_A65C_CALL");
+                s_emulate_a65c_call = !(env && env[0] == '0');
+                printf("[CV-SIG] emulate A65C callback=%d (PSX_CV_EMULATE_A65C_CALL)\n", s_emulate_a65c_call);
                 fflush(stdout);
             }
-            return 0;  /* let compiled code run */
+            if (s_a65c_fallback_tbl0 < 0) {
+                const char* env = getenv("PSX_CV_A65C_FALLBACK_TBL0");
+                s_a65c_fallback_tbl0 = (env && env[0] && env[0] != '0') ? 1 : 0;
+                if (s_a65c_fallback_tbl0) {
+                    printf("[CV-SIG] A65C fallback tbl0=%d (PSX_CV_A65C_FALLBACK_TBL0)\n", s_a65c_fallback_tbl0);
+                    fflush(stdout);
+                }
+            }
+
+            uint32_t cb = 0;
+            memcpy(&cb, &g_ram[0x32AB0], 4);
+            if (cb == 0 && s_a65c_fallback_tbl0) {
+                uint32_t tbl0 = 0;
+                memcpy(&tbl0, &g_ram[0x32A24], 4);
+                if (tbl0 >= 0x80000000u) {
+                    cb = tbl0;
+                    if (s_a65c_hits < 10u) {
+                        printf("[A65C-FALLBACK] f%u use tbl0=0x%08X\n", g_ps1_frame, cb);
+                        fflush(stdout);
+                    }
+                }
+            }
+            cpu->v0 = cb;
+
+            if (++s_a65c_hits <= 10u || (s_a65c_hits % 240u) == 0u) {
+                printf("[A65C-HOOK] f%u hits=%u cb=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
+                       g_ps1_frame, s_a65c_hits, cb, cpu->a0, cpu->a1, cpu->a2, cpu->a3);
+                fflush(stdout);
+            }
+
+            if (s_emulate_a65c_call && cb >= 0x80000000u) {
+                uint32_t save_ra = cpu->ra;
+                uint32_t save_a0 = cpu->a0;
+                uint32_t save_a1 = cpu->a1;
+                uint32_t save_a2 = cpu->a2;
+                uint32_t save_a3 = cpu->a3;
+                if (cb == 0x8001A664u) {
+                    cpu->a0 = 1u;
+                    cpu->a1 = 0x0015F760u;
+                    cpu->a2 = 0u;
+                    cpu->a3 = 0u;
+                }
+                mips_interpret(cpu, cb);
+                cpu->a0 = save_a0;
+                cpu->a1 = save_a1;
+                cpu->a2 = save_a2;
+                cpu->a3 = save_a3;
+                cpu->ra = save_ra;
+                cpu->v0 = cb;
+            }
+            return 1;
         }
 
         case 0x8001A664u: {
-            /* Display callback — the compiled version omits the VBlank wait
-             * chain (A860/A91C/A9E0 tail-call loop).  Run via interpreter
-             * instead so the A860 re-entry guard can break the loop.
-             * Re-entry guard: if we're already interpreting A664 (e.g. via
-             * A664 → A110 → callback → A664), fall through to compiled stub. */
             if (s_interp_a664) return 0;   /* allow compiled stub on re-entry */
             s_interp_a664 = 1;
             mips_interpret(cpu, 0x8001A664u);
@@ -7639,6 +5147,7 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             break;
         }
 
+        case 0x80015650u:
         case 0x8001A860u:
         case 0x8001A91Cu:
         case 0x8001A920u:
@@ -8062,62 +5571,7 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         }
         case 0x80016940u: { static uint32_t s_ff = 0; ++s_ff; /* [TRACE] FUN_80016940 (frame-flip) */ break; }
         case 0x80060C10u: { static uint32_t s_c10 = 0; ++s_c10; /* [GPU-Q] first 10 — re-enable printf when investigating GPU queue */ break; }
-        case 0x80060624u: {
-            /* ---------------------------------------------------------------
-             * LoadImage override  (PS1 GPU library)
-             * a0 = pointer to RECT {x, y, w, h} (4 x int16)
-             * a1 = pointer to pixel data (16-bit pixels packed as 32-bit words)
-             *
-             * Sends GP0(A0h) CPU→VRAM copy command sequence.
-             * --------------------------------------------------------------- */
-            extern void gpu_submit_word(uint32_t w);
-            uint8_t* rect_ptr = addr_ptr(cpu->a0);
-            uint8_t* data_ptr = addr_ptr(cpu->a1);
-            if (!rect_ptr || !data_ptr) {
-                static uint32_t s_624_null = 0;
-                if (++s_624_null <= 5)
-                    printf("[LoadImage] NULL ptr a0=0x%08X a1=0x%08X\n", cpu->a0, cpu->a1);
-                cpu->v0 = 0;
-                return 1;
-            }
-            int16_t rx, ry, rw, rh;
-            memcpy(&rx, rect_ptr + 0, 2);
-            memcpy(&ry, rect_ptr + 2, 2);
-            memcpy(&rw, rect_ptr + 4, 2);
-            memcpy(&rh, rect_ptr + 6, 2);
-
-            static uint32_t s_624 = 0;
-            if (++s_624 <= 30) {
-                printf("[LoadImage] #%u f%u rect=(%d,%d,%d,%d) data=0x%08X\n",
-                       s_624, g_ps1_frame, rx, ry, rw, rh, cpu->a1);
-                fflush(stdout);
-            }
-
-            /* Clamp to valid VRAM range */
-            uint16_t dx = (uint16_t)rx & 0x3FF;
-            uint16_t dy = (uint16_t)ry & 0x1FF;
-            uint16_t dw = (uint16_t)rw; if (dw == 0) dw = 0x400;
-            uint16_t dh = (uint16_t)rh; if (dh == 0) dh = 0x200;
-            if (dx + dw > 1024) dw = 1024 - dx;
-            if (dy + dh > 512)  dh = 512 - dy;
-
-            /* GP0(A0h) — CPU to VRAM copy */
-            gpu_submit_word(0xA0000000u);
-            gpu_submit_word(((uint32_t)dy << 16) | (uint32_t)dx);
-            gpu_submit_word(((uint32_t)dh << 16) | (uint32_t)dw);
-
-            /* Send pixel data: each 32-bit word = 2 x 16-bit pixels */
-            uint32_t num_pixels = (uint32_t)dw * (uint32_t)dh;
-            uint32_t num_words = (num_pixels + 1) / 2;
-            for (uint32_t i = 0; i < num_words; i++) {
-                uint32_t w;
-                memcpy(&w, data_ptr + i * 4, 4);
-                gpu_submit_word(w);
-            }
-
-            cpu->v0 = 0; /* success */
-            return 1;
-        }
+        case 0x80060624u: { static uint32_t s_624 = 0; if (++s_624 <= 10) { printf("[TRACE] FUN_80060624 (LoadImage) call #%u a0=0x%08X a1=0x%08X\n", s_624, cpu->a0, cpu->a1); fflush(stdout); } break; }
         case 0x80060EF0u: { static uint32_t s_ef0 = 0; if (++s_ef0 <= 5) { printf("[TRACE] FUN_80060EF0 (GPU dispatch) call #%u\n", s_ef0); fflush(stdout); } break; }
         case 0x80067E84u: break; /* [TRACE] FUN_80067E84 (IRQ disable B) */
         case 0x8005DFD8u: {
@@ -8130,46 +5584,6 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 fflush(stdout);
             }
             break;
-        }
-        case 0x80012FECu: {
-            /* Trace-only: dump OT contents before DrawOTag body runs */
-            static uint32_t s_dot = 0;
-            if (++s_dot <= 10u) {
-                uint32_t ot_base = cpu->a0;
-                /* Walk first few OT entries to check if any have primitives */
-                uint32_t prim_count = 0;
-                uint32_t ptr = ot_base;
-                for (int i = 0; i < 100 && ptr >= 0x80010000u && ptr < 0x80200000u; i++) {
-                    uint8_t* p = addr_ptr(ptr);
-                    if (!p) break;
-                    uint32_t hdr; memcpy(&hdr, p, 4);
-                    uint8_t cnt = (uint8_t)(hdr >> 24);
-                    if (cnt > 0) prim_count += cnt;
-                    uint32_t nxt = hdr & 0xFFFFFFu;
-                    if (nxt == 0xFFFFFFu || nxt == 0u) break;
-                    ptr = nxt | 0x80000000u;
-                }
-                printf("[DRAWOTAG-PRE] #%u f%u a0=0x%08X gp0_words_in_ot=%u\n",
-                       s_dot, g_ps1_frame, ot_base, prim_count);
-                /* Also check the large OT at offset -0x40 from the small OT base */
-                uint32_t large_ot = ot_base + 0x414u;  /* 0x8005435C+0x414=0x80054770 or 0x8003CB68+0x414=0x8003CF7C */
-                uint32_t large_prims = 0;
-                ptr = large_ot;
-                for (int i = 0; i < 600 && ptr >= 0x80010000u && ptr < 0x80200000u; i++) {
-                    uint8_t* p = addr_ptr(ptr);
-                    if (!p) break;
-                    uint32_t hdr; memcpy(&hdr, p, 4);
-                    uint8_t cnt = (uint8_t)(hdr >> 24);
-                    if (cnt > 0) large_prims += cnt;
-                    uint32_t nxt = hdr & 0xFFFFFFu;
-                    if (nxt == 0xFFFFFFu || nxt == 0u) break;
-                    ptr = nxt | 0x80000000u;
-                }
-                printf("[DRAWOTAG-LARGE-OT] f%u ot=0x%08X gp0_words=%u\n",
-                       g_ps1_frame, large_ot, large_prims);
-                fflush(stdout);
-            }
-            return 0; /* let compiled body run */
         }
         case 0x80060B70u: {
             /* DrawOTag — log per-frame addPrim count + OT pointer */
@@ -8186,6 +5600,7 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                        g_ps1_frame, s_b70, cpu->a0, g_addprim_count);
                 fflush(stdout);
             }
+            /* [DrawOTag-PRE] if (s_b70 <= 10) printf("[DrawOTag-PRE] #%u f%u a0=0x%08X addPrim=%u\n", ...); */
             g_addprim_count = 0; /* reset per DrawOTag call */
             break;
         }
@@ -8265,8 +5680,34 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             cpu->t1 = 0x43; call_by_address(cpu, 0xB0); return 1;
         case 0x8005B4ACu: /* B(0x45) delete */
             cpu->t1 = 0x45; call_by_address(cpu, 0xB0); return 1;
-        case 0x8005B4CCu: /* FUN_8005B4CC: MC file-exists check — route to firstfile (B(0x42)) */
-            cpu->t1 = 0x42; call_by_address(cpu, 0xB0); return 1;
+        case 0x8005B4CCu: /* FUN_8005B4CC: MC file-exists check — searches BIOS dir table at
+                           * g_ram[0x150] which we never populate; return a1 (the info-struct ptr)
+                           * as a non-zero "file found" result so game proceeds to O_WRONLY.
+                           * Set s_nextfile_remain=2 so nextfile pretends 3 linked blocks exist.
+                           * Fill in DIRENTRY struct with valid MC data so game logic passes. */
+            cpu->v0 = cpu->a1 ? cpu->a1 : 1u;
+            s_nextfile_remain = 2;
+            if (cpu->a1 >= 0x80000000u) {
+                uint32_t _s = cpu->a1 - 0x80000000u;
+                /* Populate full DIRENTRY struct as firstfile() would:
+                 * name[0x00-0x13]: 20-byte PS1 filename (from last O_CREAT)
+                 * attr[0x14]: 0x51 = first linked block
+                 * size[0x18]: 0x6000 = 3×8KB
+                 * next[0x1C]: 0 (nextfile handles traversal)
+                 * count[0x20]: 0 */
+                memset(&g_ram[_s], 0, 0x24);
+                strncpy((char*)&g_ram[_s], s_last_mc_name, 20);
+                *(uint32_t*)&g_ram[_s + 0x14] = 0x51u;
+                *(uint32_t*)&g_ram[_s + 0x18] = 0x6000u;
+                *(uint32_t*)&g_ram[_s + 0x1C] = 0u;
+                *(uint32_t*)&g_ram[_s + 0x20] = 0u;
+                printf("[MEMCARD FUN_B4CC] a0='%s' -> name='%s' attr=0x51 size=0x6000\n",
+                       (cpu->a0 >= 0x80000000u) ? (char*)&g_ram[cpu->a0 - 0x80000000u] : "?",
+                       s_last_mc_name);
+            } else {
+                printf("[MEMCARD FUN_B4CC] a0=0x%08X a1=0x%08X -> v0=0x%08X\n", cpu->a0, cpu->a1, cpu->v0);
+            }
+            return 1;
         case 0x8005CCACu: /* B(0x4E) card_write */
             cpu->t1 = 0x4E; call_by_address(cpu, 0xB0); return 1;
         case 0x8005CCBCu: /* B(0x50) */
@@ -9033,7 +6474,6 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
  * We write ~buttons (active-low) to g_ram[0x9eb5a] so FUN_80028D70 returns
  * the correct active-high bitmask after inversion. */
 void psx_set_pad1(uint16_t buttons) {
-    g_pad1_state = buttons;
     /* Arm INTERP-CALL trace window on Circle (0x2000) or Square (0x8000) press */
     static uint16_t s_prev_buttons = 0;
     uint16_t newly_pressed = buttons & ~s_prev_buttons;
@@ -9110,13 +6550,13 @@ void cv_display_pump_frame(CPUState* cpu) {
 
     if (s_force_mode_tbl0 < 0) {
         const char* env = getenv("PSX_CV_FORCE_TBL0_MODE");
-        s_force_mode_tbl0 = (env && env[0] && env[0] != '0') ? 1 : 0;
+        s_force_mode_tbl0 = !(env && env[0] == '0');
         printf("[CV-SIG] force tbl0/mode=%d (PSX_CV_FORCE_TBL0_MODE)\n", s_force_mode_tbl0);
         fflush(stdout);
     }
     if (s_force_direct_a664 < 0) {
         const char* env = getenv("PSX_CV_FORCE_DIRECT_A664");
-        s_force_direct_a664 = (env && env[0] && env[0] != '0') ? 1 : 0;
+        s_force_direct_a664 = !(env && env[0] == '0');
         printf("[CV-SIG] force direct A664=%d (PSX_CV_FORCE_DIRECT_A664)\n", s_force_direct_a664);
         fflush(stdout);
     }
@@ -9173,7 +6613,7 @@ void cv_display_pump_frame(CPUState* cpu) {
     }
     if (s_emulate_19844_callbacks < 0) {
         const char* env = getenv("PSX_CV_EMULATE_19844_CALLBACKS");
-        s_emulate_19844_callbacks = (env && env[0] && env[0] != '0') ? 1 : 0;
+        s_emulate_19844_callbacks = !(env && env[0] == '0');
         printf("[CV-SIG] emulate 19844 callbacks=%d (PSX_CV_EMULATE_19844_CALLBACKS)\n", s_emulate_19844_callbacks);
         fflush(stdout);
     }
@@ -9238,7 +6678,7 @@ void cv_display_pump_frame(CPUState* cpu) {
     }
     if (s_seed_cb == 0u) {
         const char* env = getenv("PSX_CV_SEED_CB");
-        s_seed_cb = (env && env[0]) ? (uint32_t)strtoul(env, NULL, 0) : 0x8001A664u;
+        s_seed_cb = (env && env[0]) ? (uint32_t)strtoul(env, NULL, 0) : 0x8001A110u;
         printf("[CV-SIG] seed cb=0x%08X (PSX_CV_SEED_CB)\n", s_seed_cb);
         fflush(stdout);
     }
@@ -9253,81 +6693,12 @@ void cv_display_pump_frame(CPUState* cpu) {
 
     s_timer_counter += 1000000u;
 
-    /* One-time boot diagnostic: report fiber state and dispatch table */
-    {
-        static int s_boot_diag = 0;
-        if (!s_boot_diag) {
-            s_boot_diag = 1;
-            uint32_t cb_aa4 = 0, cb_aa8 = 0, cb_db8 = 0;
-            memcpy(&cb_aa4, &g_ram[0x32AA4], 4);
-            memcpy(&cb_aa8, &g_ram[0x32AA8], 4);
-            memcpy(&cb_db8, &g_ram[0x32DB8], 4);
-            printf("[BOOT-DIAG] Fiber state: display=%p loading=%p secondary=%p main=%p\n",
-                   g_fiber_display, g_fiber_loading, g_fiber_secondary, g_fiber_main);
-            printf("[BOOT-DIAG] CD callbacks: AA4=0x%08X AA8=0x%08X DB8=0x%08X\n",
-                   cb_aa4, cb_aa8, cb_db8);
-            printf("[BOOT-DIAG] Dispatch table first 4: [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X\n",
-                   *(uint32_t*)&g_ram[0x32A24], *(uint32_t*)&g_ram[0x32A28],
-                   *(uint32_t*)&g_ram[0x32A2C], *(uint32_t*)&g_ram[0x32A30]);
-            printf("[BOOT-DIAG] RAM[0x32D80]=0x%02X RAM[0x2C2BA]=0x%04X\n",
-                   g_ram[0x32D80], *(uint16_t*)&g_ram[0x2C2BA]);
-            /* Dump callback table area at 0x800106A4 and 0x800106B4 */
-            printf("[BOOT-DIAG] CallbackTbl 06A4: ");
-            for (int i = 0; i < 8; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0x106A4 + i*4]);
-            printf("\n");
-            /* Dump A110's callback table at 0x80032B48 */
-            printf("[BOOT-DIAG] A110-Tbl 2B48: ");
-            for (int i = 0; i < 8; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0x32B48 + i*4]);
-            printf("\n");
-            /* Dump RAM near 0x80032D80 (mode/state area used by A110/A664) */
-            printf("[BOOT-DIAG] State 2D80: ");
-            for (int i = 0; i < 16; i++)
-                printf("%02X ", g_ram[0x32D80 + i]);
-            printf("\n");
-            /* Dump DRA.BIN to verify it's loaded */
-            printf("[BOOT-DIAG] DRA.BIN @0xA0000: ");
-            for (int i = 0; i < 4; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0xA0000 + i*4]);
-            printf("\n");
-            /* Check DRA.BIN entry area (0x800E3988 = offset 0xE3988-0x80000=0x63988 into RAM) */
-            printf("[BOOT-DIAG] DRA.BIN entry @0xE3988: ");
-            for (int i = 0; i < 4; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0xE3988 + i*4]);
-            printf("\n");
-            /* Check CD callback at 0x80107460 (offset 0x107460) */
-            printf("[BOOT-DIAG] CD-CB @0x107460: ");
-            for (int i = 0; i < 4; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0x107460 + i*4]);
-            printf("\n");
-            /* Check dispatch table at 0x32A24 (8 entries) */
-            printf("[BOOT-DIAG] DispTbl @0x32A24: ");
-            for (int i = 0; i < 8; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0x32A24 + i*4]);
-            printf("\n");
-            /* Check RAM[0x32AA0-0x32AC0] — callback/state area */
-            printf("[BOOT-DIAG] CB-Area 32AA0: ");
-            for (int i = 0; i < 8; i++)
-                printf("[%d]=0x%08X ", i, *(uint32_t*)&g_ram[0x32AA0 + i*4]);
-            printf("\n");
-            fflush(stdout);
-        }
-    }
-
     if (s_force_mode_tbl0) {
         if ((g_ram[0x32AB4] & 0x10u) == 0u) {
             g_ram[0x32AB4] |= 0x10u;
         }
-        /* Force mode=0 (display path) since CD reads are synchronous.
-         * DRA.BIN sets mode=2 during init (CD loading), but since we
-         * already loaded the data synchronously, force mode=0 so the
-         * display callback takes the rendering path instead of CD path. */
-        if (g_ram[0x32D80] != 0u) {
-            if (g_ps1_frame < 5)
-                printf("[CV-MODE] f%u forcing RAM[0x32D80] from 0x%02X to 0x00 (display path)\n",
-                       g_ps1_frame, g_ram[0x32D80]);
-            g_ram[0x32D80] = 0u;
+        if ((g_ram[0x32D80] & 0x02u) == 0u) {
+            g_ram[0x32D80] |= 0x02u;
         }
         uint32_t tbl0 = 0;
         memcpy(&tbl0, &g_ram[0x32A24], 4);
@@ -9427,41 +6798,6 @@ void cv_display_pump_frame(CPUState* cpu) {
     uint32_t save_s6 = cpu->s6, save_s7 = cpu->s7;
     uint32_t save_fp = cpu->fp;
 
-    /* ---- MainGame fiber: run one frame of DRA.BIN game logic ----
-     * MainGame (0x800E3988) is an infinite loop that does:
-     *   UpdateGame → Render → AddPrim → DrawOTag → VSync
-     * VSync yields the fiber, returning control here. The fiber preserves
-     * the interpreter's entire host stack, so MainGame resumes at the next
-     * instruction after VSync on the subsequent pump frame. */
-    {
-        static int s_game_fiber_created = 0;
-        if (!s_game_fiber_created) {
-            s_game_fiber_created = 1;
-            if (!g_fiber_main)
-                g_fiber_main = ConvertThreadToFiber(NULL);
-            /* Initialize game regs: use a separate MIPS stack region */
-            memcpy(g_game_saved, cpu, MIPS_GP_REGS * sizeof(uint32_t));
-            g_game_saved[29] = 0x801FF800u;  /* sp — below main/display regions */
-            g_game_saved[31] = 0x80010EA4u;  /* ra — safe return address */
-            g_fiber_game = CreateFiber(4 * 1024 * 1024, fiber_game_func, (PVOID)cpu);
-            printf("[CV-PUMP] Created game fiber for MainGame (sp=0x801FF800)\n");
-            fflush(stdout);
-        }
-        if (g_fiber_game) {
-            /* Switch to game fiber — it resumes MainGame where VSync yielded,
-             * or starts fresh if this is the first frame */
-            SwitchToFiber(g_fiber_game);
-            /* Game fiber yielded at VSync — game regs saved in g_game_saved.
-             * Increment frame counter since one game frame completed. */
-            static uint32_t s_game_frames = 0;
-            if (++s_game_frames <= 20u || (s_game_frames % 240u) == 0u) {
-                printf("[CV-GAME] f%u game_frame=%u addPrim=%u\n",
-                       g_ps1_frame, s_game_frames, g_addprim_count);
-                fflush(stdout);
-            }
-        }
-    }
-
     if (s_pump_call_sched_mode & 1) {
         static uint32_t s_pump_sched_before = 0;
         ++s_pump_sched_before;
@@ -9522,32 +6858,6 @@ void cv_display_pump_frame(CPUState* cpu) {
         }
     }
 
-    /* A664 scheduler gate fix: RAM[0x32CE8 + (slot*4)] is the task-pending table.
-     * When slot 0xA4 (our VSync slot) has a non-zero entry, A664 takes the early
-     * exit path (A6C8→A6E8→A6F0→AA74) instead of calling A110 which processes
-     * callbacks and triggers rendering. On a real PS1, this entry is cleared by
-     * the interrupt handler after the task is dispatched. In our recompiler,
-     * interrupts don't fire, so clear it to allow A110 to be reached. */
-    {
-        uint32_t task_entry = 0;
-        uint32_t task_phys = 0x32CE8u + 0xA4u * 4u;  /* = 0x32F78 */
-        memcpy(&task_entry, &g_ram[task_phys], 4);
-        if (task_entry != 0) {
-            static uint32_t s_task_clears = 0;
-            if (++s_task_clears <= 5u) {
-                printf("[CV-TASK] f%u clearing task[0xA4] = 0x%08X → 0 (enable A110 path)\n",
-                       g_ps1_frame, task_entry);
-                fflush(stdout);
-            }
-            uint32_t zero = 0;
-            memcpy(&g_ram[task_phys], &zero, 4);
-        }
-    }
-
-    /* Set scheduler arguments — use the same a0 the committed version uses.
-     * a0 = 0x800988A4 → s3 = a0 & 0xFF = 0xA4 → dispatches through tbl[0xA4]
-     * which reaches DRA.BIN's MainGame loop. a0=0 would only reach tbl[0]. */
-    /* a0 already set to 0x800988A4 above, a1/a2/a3 already 0 */
     mips_interpret(cpu, 0x80019844u);
 
     if (!s_force_direct_a664 && s_emulate_19844_callbacks) {
@@ -9724,7 +7034,9 @@ void cv_display_pump_frame(CPUState* cpu) {
         if (s_force_direct_a8a8) {
             mips_interpret(cpu, 0x8001A8A8u);
         }
-        /* Don't force 0x32D80 = 0x02 — let the game control its own mode */
+        if ((g_ram[0x32D80] & 0x02u) == 0u) {
+            g_ram[0x32D80] |= 0x02u;
+        }
         if (cpu->v0 == 0u) {
             cpu->v0 = 0xFFFFFFFFu;
         }

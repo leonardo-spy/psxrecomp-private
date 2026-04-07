@@ -100,8 +100,9 @@ public:
     std::vector<ISOFileEntry> ListFiles(const std::string& path = "");
 
     /**
-     * Find a file by name in the root directory
-     * @param path Filename to search for (e.g., "SYSTEM.CNF" or "SCUS_942.36")
+     * Find a file by path or filename.
+     * Supports nested paths ("ST/SEL/F_SEL.BIN") and filename-only lookups.
+     * @param path Filename or path to search for
      * @param entry Output ISOFileEntry to populate with file info
      * @return true if found, false if not found
      */
@@ -151,6 +152,17 @@ private:
      * Used for subdirectory navigation
      */
     std::vector<ISOFileEntry> ListFilesByLBA(uint32_t lba, uint32_t dir_size);
+
+    /**
+     * Helper: Resolve a directory path to its LBA and size.
+     * Supports nested paths like "ST/SEL".
+     */
+    bool ResolveDirectory(const std::string& path, RootDirectoryInfo& dir);
+
+    /**
+     * Helper: Recursive filename-only search from a given directory.
+     */
+    bool FindFileRecursive(const std::string& file_name, uint32_t lba, uint32_t dir_size, ISOFileEntry& entry);
 
     std::ifstream file_;
     bool is_open_;

@@ -180,7 +180,7 @@ private:
     } cached_state_;
 
     // Display state
-    bool display_area_set_ = false;
+    bool display_area_valid_ = false;
     int display_area_x_ = 0;
     int display_area_y_ = 0;
     int display_width_ = 320;

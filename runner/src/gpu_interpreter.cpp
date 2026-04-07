@@ -3,6 +3,10 @@
 #include <cstring>
 
 extern "C" uint32_t g_ps1_frame;
+extern "C" int g_cv_left_cluts_uploaded;
+extern "C" int g_in_drawtag;
+extern "C" int g_gpu_linked_dma;
+extern "C" uint8_t* psx_get_ram(void);
 
 namespace PS1 {
 
@@ -65,6 +69,12 @@ void GPUInterpreter::Reset() {
 
 void GPUInterpreter::AbortStreaming() {
     if (state.vram_transfer.active && state.vram_transfer.is_cpu_to_vram) {
+        if (state.vram_transfer.x == 8 && state.vram_transfer.y == 480 &&
+            state.vram_transfer.width == 1024 && state.vram_transfer.height == 2) {
+            printf("[CPU2VRAM-DBG] abort rem=%u fifo=%d\n",
+                   state.vram_transfer.remaining_pixels, FIFOCount());
+            fflush(stdout);
+        }
         state.vram_transfer.active = false;
         state.vram_transfer.remaining_pixels = 0;
         cpu_vram_staging_.clear();
@@ -157,6 +167,10 @@ void GPUInterpreter::ProcessGP0FIFO() {
             if (t.remaining_pixels == 0) {
                 static uint32_t s_upload_done = 0;
                 ++s_upload_done;
+                if (t.x == 8 && t.y == 480 && t.width == 1024 && t.height == 2) {
+                    printf("[CPU2VRAM-DBG] complete staging=%zu\n", cpu_vram_staging_.size());
+                    fflush(stdout);
+                }
                 /* [CPUToVRAM] done — re-enable: if (s_upload_done <= 20) printf(...); */
                 t.active = false;
                 state.current_command = 0;
@@ -170,7 +184,26 @@ void GPUInterpreter::ProcessGP0FIFO() {
 
         /* === NORMAL MODE: accumulate header words then execute === */
         if (state.current_command == 0) {
-            state.current_command = PopFIFO();
+            uint32_t next_word = PopFIFO();
+            uint8_t next_type = (next_word >> 29) & 0x7;
+            uint8_t next_opcode = (next_word >> 24) & 0xFF;
+            bool linked_source = (g_in_drawtag != 0) || (g_gpu_linked_dma != 0);
+
+            if (linked_source && (next_type == 0x5 || next_type == 0x6)) {
+                static uint32_t s_skip_dma_cmd = 0;
+                ++s_skip_dma_cmd;
+                if (s_skip_dma_cmd <= 20) {
+                    printf("[GP0-LINKED-SKIP] f%u cmd=0x%08X type=%u\n",
+                           g_ps1_frame, next_word, next_type);
+                    fflush(stdout);
+                }
+                continue;
+            }
+            if (linked_source && next_type == 0x7 && next_opcode >= 0xE7) {
+                continue;
+            }
+
+            state.current_command = next_word;
             state.command_params[0] = state.current_command;
             state.params_received = 1;
             state.params_needed = GetGP0ParameterCount(state.current_command);
@@ -181,54 +214,89 @@ void GPUInterpreter::ProcessGP0FIFO() {
             }
         }
 
-        /* Accumulate parameters */
-        while (state.params_received < state.params_needed && !FIFOEmpty()) {
-            uint32_t word = PopFIFO();
-            if (state.params_received < 16) {
-                state.command_params[state.params_received] = word;
-            }
-            state.params_received++;
+        if (state.params_needed < 0) {
+            bool gouraud_polyline = (state.current_command >> 28) & 1;
+            int min_words = gouraud_polyline ? 4 : 3;
+            int max_words = (int)(sizeof(state.command_params) / sizeof(state.command_params[0]));
 
-            /* CPU→VRAM: after the 3-word header is complete, initialise streaming */
-            if ((state.current_command >> 29) == 0x5 && state.params_received == 3) {
-                uint32_t xy = state.command_params[1];
-                uint32_t wh = state.command_params[2];
-                uint16_t x = xy & 0x3FFu;
-                uint16_t y = (xy >> 16) & 0x1FFu;
-                uint16_t w = wh & 0xFFFFu;
-                uint16_t h = (wh >> 16) & 0xFFFFu;
-                if (w == 0 || h == 0) {
-                    /* Degenerate: nothing to transfer */
-                    state.current_command = 0;
-                    state.params_received = 0;
-                    state.params_needed   = 0;
+            while (!FIFOEmpty()) {
+                uint32_t word = PopFIFO();
+                if (state.params_received < max_words) {
+                    state.command_params[state.params_received] = word;
+                }
+                state.params_received++;
+
+                if (state.params_received > min_words &&
+                    (word == 0x55555555u || word == 0x50005000u)) {
+                    state.params_needed = state.params_received;
                     break;
                 }
-                if (w > 1024) w = 1024;
-                if (h > 512)  h = 512;
-                static uint32_t s_upload_start = 0;
-                ++s_upload_start;
-                /* [CPUToVRAM] start — re-enable: if (s_upload_start <= 20) printf(...); */
-                VRAMTransfer& t = state.vram_transfer;
-                t.active            = true;
-                t.is_cpu_to_vram    = true;
-                t.x                 = x;
-                t.y                 = y;
-                t.width             = w;
-                t.height            = h;
-                t.remaining_pixels  = (uint32_t)w * h;
-                /* Pre-allocate staging buffer to avoid repeated realloc */
-                cpu_vram_staging_.clear();
-                cpu_vram_staging_.reserve((uint32_t)w * h);
-                /* No more header words to read — break out to streaming mode */
-                state.params_needed = 3;  /* mark header done */
-                break;
+
+                if (state.params_received >= max_words) {
+                    fprintf(stderr, "Warning: GP0 polyline command too long, truncating\n");
+                    state.params_needed = state.params_received;
+                    break;
+                }
+            }
+        } else {
+            /* Accumulate parameters */
+            while (state.params_received < state.params_needed && !FIFOEmpty()) {
+                uint32_t word = PopFIFO();
+                state.command_params[state.params_received] = word;
+                state.params_received++;
+
+                /* CPU→VRAM: after the 3-word header is complete, initialise streaming */
+                if ((state.current_command >> 29) == 0x5 && state.params_received == 3) {
+                    uint32_t xy = state.command_params[1];
+                    uint32_t wh = state.command_params[2];
+                    uint16_t x = xy & 0x3FFu;
+                    uint16_t y = (xy >> 16) & 0x1FFu;
+                    uint16_t w = wh & 0x3FFu;
+                    uint16_t h = (wh >> 16) & 0x1FFu;
+                    if (w == 0) w = 1024;
+                    if (h == 0) h = 512;
+                    static uint32_t s_upload_start = 0;
+                    ++s_upload_start;
+                    if (x == 8 && y == 480 && w == 1024 && h == 2) {
+                        printf("[CPU2VRAM-DBG] start rem=%u first_fifo=%d\n",
+                               (uint32_t)w * h, FIFOCount());
+                        fflush(stdout);
+                    }
+                    /* Trace uploads that hit CLUT area (y >= 240) */
+                    if ((y + h) > 240 && g_ps1_frame <= 400u) {
+                        static uint32_t s_cpu2vram_clut_log = 0;
+                        if (s_cpu2vram_clut_log < 20) {
+                            printf("[CPU2VRAM-CLUT] f%u pos=(%d,%d) sz=%ux%u pixels=%u\n",
+                                   g_ps1_frame, x, y, w, h, (uint32_t)w * h);
+                            fflush(stdout);
+                            ++s_cpu2vram_clut_log;
+                        }
+                    }
+                    VRAMTransfer& t = state.vram_transfer;
+                    t.active            = true;
+                    t.is_cpu_to_vram    = true;
+                    t.x                 = x;
+                    t.y                 = y;
+                    t.width             = w;
+                    t.height            = h;
+                    t.remaining_pixels  = (uint32_t)w * h;
+                    /* Pre-allocate staging buffer to avoid repeated realloc */
+                    cpu_vram_staging_.clear();
+                    cpu_vram_staging_.reserve((uint32_t)w * h);
+                    /* No more header words to read — break out to streaming mode */
+                    state.params_needed = 3;  /* mark header done */
+                    break;
+                }
             }
         }
 
         /* If we just set up a streaming transfer, loop back to drain FIFO */
         if (state.vram_transfer.active && state.vram_transfer.is_cpu_to_vram) {
             continue;
+        }
+
+        if (state.params_needed < 0) {
+            break;
         }
 
         /* Execute command when all parameters received */
@@ -388,6 +456,17 @@ void GPUInterpreter::HandleGP0Miscellaneous(uint32_t cmd) {
             uint16_t w = wh & 0xFFFF;
             uint16_t h = (wh >> 16) & 0xFFFF;
 
+            /* Trace fill rects that hit the CLUT area (y >= 240) */
+            if (y + h > 240 && g_ps1_frame <= 400u) {
+                static uint32_t s_fill_clut_log = 0;
+                if (s_fill_clut_log < 20) {
+                    printf("[FILL-CLUT-HIT] f%u pos=(%d,%d) sz=%ux%u color=0x%04X (r=%u g=%u b=%u)\n",
+                           g_ps1_frame, x, y, w, h, color, r8, g8, b8);
+                    fflush(stdout);
+                    ++s_fill_clut_log;
+                }
+            }
+
             if (renderer) {
                 renderer->FillRectangle(x, y, w, h, color);
             }
@@ -456,13 +535,6 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
             // First vertex: CLUT info
             if (i == 0) {
                 ExtractCLUT(tex_word, verts[i].clut_x, verts[i].clut_y);
-                /* Remap CLUT(0,0) → CLUT(544,240): g_ClutIds (D_8003C104) defaults
-                 * to 0 when SIM data isn't loaded, causing entities to read
-                 * framebuffer origin as palette. Redirect to standard CLUT area. */
-                if (verts[i].clut_x == 0 && verts[i].clut_y == 0) {
-                    verts[i].clut_x = 544;
-                    verts[i].clut_y = 240;
-                }
                 verts[i].has_clut = true;
                 verts[i].has_texpage = false;
             }
@@ -484,27 +556,67 @@ void GPUInterpreter::HandleGP0Polygon(const uint32_t* params) {
         }
     }
 
+    if (textured && !raw_texture) {
+        bool all_black = true;
+        for (int i = 0; i < num_verts; i++) {
+            if (verts[i].r != 0 || verts[i].g != 0 || verts[i].b != 0) {
+                all_black = false;
+                break;
+            }
+        }
+        if (all_black) {
+            for (int i = 0; i < num_verts; i++) {
+                verts[i].r = 0x80;
+                verts[i].g = 0x80;
+                verts[i].b = 0x80;
+            }
+        }
+    }
+
+    if (textured && verts[0].has_clut &&
+        verts[0].clut_y >= 240 && verts[0].clut_y <= 255 &&
+        verts[0].clut_x < 256 && !g_cv_left_cluts_uploaded) {
+        uint32_t gs_val = 0;
+        uint8_t* ram = psx_get_ram();
+        if (ram) memcpy(&gs_val, &ram[0x3C734], 4);
+        if (gs_val >= 2) {
+            verts[0].clut_x = (uint16_t)(verts[0].clut_x + 512);
+        }
+    }
+
     // Build draw state
     DrawState draw_state = BuildDrawState(gouraud, textured, semi_transparent, raw_texture);
 
-    // DIAG: Log textured polygon texture page + CLUT references during peak rendering
-    if (textured && g_ps1_frame >= 95 && g_ps1_frame <= 100) {
-        static uint32_t s_tex_log = 0;
-        static uint32_t s_tex_log_frame = 0;
-        if (g_ps1_frame != s_tex_log_frame) { s_tex_log = 0; s_tex_log_frame = g_ps1_frame; }
-        if (++s_tex_log <= 30) {
-            printf("[TEX-REF] f%u #%u cmd=0x%02X quad=%d gouraud=%d",
-                   g_ps1_frame, s_tex_log, opcode, quad, gouraud);
-            if (verts[0].has_clut)
-                printf(" clut=(%d,%d)", verts[0].clut_x, verts[0].clut_y);
-            if (num_verts > 1 && verts[1].has_texpage)
-                printf(" tpage=(%d,%d,depth=%d)", verts[1].texpage_x, verts[1].texpage_y, verts[1].texpage_depth);
-            printf(" rgb=(%d,%d,%d) xy=(%d,%d)-(%d,%d)",
-                   verts[0].r, verts[0].g, verts[0].b,
-                   verts[0].x, verts[0].y, verts[1].x, verts[1].y);
-            for (int vi = 0; vi < num_verts; vi++)
-                printf(" uv%d=(%d,%d)", vi, verts[vi].u, verts[vi].v);
-            printf("\n"); fflush(stdout);
+    /* Title-phase 8-bit primitive diagnostic (first 15 only) */
+    if (textured && draw_state.texture_depth == 1 && g_ps1_frame >= 100u && g_ps1_frame <= 400u) {
+        static uint32_t s_title8_log = 0;
+        if (s_title8_log < 15) {
+            printf("[TITLE-8BIT-POLY] f%u tpx=%u tpy=%u depth=%u clut=(%u,%u) uv0=(%u,%u) v0=(%d,%d) gs=%u\n",
+                   g_ps1_frame,
+                   (unsigned)draw_state.texpage_x_base, (unsigned)draw_state.texpage_y_base,
+                   (unsigned)draw_state.texture_depth,
+                   verts[0].has_clut ? verts[0].clut_x : 0u, verts[0].has_clut ? verts[0].clut_y : 0u,
+                   verts[0].u, verts[0].v,
+                   verts[0].x, verts[0].y);
+            fflush(stdout);
+            ++s_title8_log;
+        }
+    }
+
+    /* Title-phase 4-bit textured primitive diagnostic */
+    if (textured && draw_state.texture_depth == 0 && g_ps1_frame >= 100u && g_ps1_frame <= 400u) {
+        static uint32_t s_title4_log = 0;
+        if (s_title4_log < 30) {
+            printf("[TITLE-4BIT-POLY] f%u tpx=%u tpy=%u depth=%u clut=(%u,%u) uv0=(%u,%u) v0=(%d,%d) v1=(%d,%d) sz=%s\n",
+                   g_ps1_frame,
+                   (unsigned)draw_state.texpage_x_base, (unsigned)draw_state.texpage_y_base,
+                   (unsigned)draw_state.texture_depth,
+                   verts[0].has_clut ? verts[0].clut_x : 0u, verts[0].has_clut ? verts[0].clut_y : 0u,
+                   verts[0].u, verts[0].v,
+                   verts[0].x, verts[0].y, verts[1].x, verts[1].y,
+                   quad ? "quad" : "tri");
+            fflush(stdout);
+            ++s_title4_log;
         }
     }
 
@@ -673,6 +785,11 @@ void GPUInterpreter::HandleGP0Rectangle(const uint32_t* params) {
     // For raw_texture mode vertex color bytes are ignored by the PS1 hardware.
     // Use neutral 0x80 so that texel * (0x80/255) * 2 ≈ texel (no modulation).
     if (raw_texture && textured) { r = 0x80; g = 0x80; b = 0x80; }
+    if (textured && !raw_texture && r == 0 && g == 0 && b == 0) {
+        r = 0x80;
+        g = 0x80;
+        b = 0x80;
+    }
 
     // Extract top-left position
     uint32_t coord_word = params[param_idx++];
@@ -689,7 +806,6 @@ void GPUInterpreter::HandleGP0Rectangle(const uint32_t* params) {
         uint32_t tex_word = params[param_idx++];
         ExtractUV(tex_word, u, v);
         ExtractCLUT(tex_word, clut_x, clut_y);
-        if (clut_x == 0 && clut_y == 0) { clut_x = 544; clut_y = 240; }
     }
 
     // Extract width and height
@@ -723,6 +839,29 @@ void GPUInterpreter::HandleGP0Rectangle(const uint32_t* params) {
 
     // Build draw state
     DrawState draw_state = BuildDrawState(false, textured, semi_transparent, raw_texture);
+    if (textured && clut_y >= 240 && clut_y <= 255 && clut_x < 256 &&
+        !g_cv_left_cluts_uploaded) {
+        uint32_t gs_val = 0;
+        uint8_t* ram = psx_get_ram();
+        if (ram) memcpy(&gs_val, &ram[0x3C734], 4);
+        if (gs_val >= 2) {
+            clut_x = (uint16_t)(clut_x + 512);
+        }
+    }
+
+    /* Title-phase 8-bit rect diagnostic (first 15 only) */
+    if (textured && draw_state.texture_depth == 1 && g_ps1_frame >= 100u && g_ps1_frame <= 400u) {
+        static uint32_t s_title8r_log = 0;
+        if (s_title8r_log < 15) {
+            printf("[TITLE-8BIT-RECT] f%u tpx=%u tpy=%u depth=%u clut=(%u,%u) uv=(%u,%u) pos=(%d,%d) sz=%ux%u\n",
+                   g_ps1_frame,
+                   (unsigned)draw_state.texpage_x_base, (unsigned)draw_state.texpage_y_base,
+                   (unsigned)draw_state.texture_depth,
+                   clut_x, clut_y, u, v, x, y, width, height);
+            fflush(stdout);
+            ++s_title8r_log;
+        }
+    }
 
     // For textured rectangles, copy texture info from texpage state
     // (This matches PS1 hardware behavior where texpage is set via GP0(E1h))
@@ -754,8 +893,27 @@ void GPUInterpreter::HandleGP0VRAMToVRAM(const uint32_t* params) {
     int16_t src_y = (src_xy >> 16) & 0x1FF;
     int16_t dst_x = dst_xy & 0x3FF;
     int16_t dst_y = (dst_xy >> 16) & 0x1FF;
-    uint16_t width = ((wh & 0x3FF) + 0xF) & ~0xF;  // Round up to multiple of 16
+    uint16_t width = wh & 0x3FF;
     uint16_t height = (wh >> 16) & 0x1FF;
+    if (width == 0) width = 1024;
+    if (height == 0) height = 512;
+
+    if ((g_ps1_frame >= 20u && g_ps1_frame <= 60u) ||
+        (g_ps1_frame >= 280u && g_ps1_frame <= 320u) ||
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
+        static uint32_t s_vram2vram_log_frame = 0;
+        static uint32_t s_vram2vram_log_count = 0;
+        if (s_vram2vram_log_frame != g_ps1_frame) {
+            s_vram2vram_log_frame = g_ps1_frame;
+            s_vram2vram_log_count = 0;
+        }
+        if (s_vram2vram_log_count < 12u) {
+            printf("[GP0:80] f%u #%u src=(%d,%d) dst=(%d,%d) wh=(%u,%u)\n",
+                   g_ps1_frame, ++s_vram2vram_log_count,
+                   src_x, src_y, dst_x, dst_y, width, height);
+            fflush(stdout);
+        }
+    }
 
     // Call renderer to perform the copy
     if (renderer) {
@@ -775,11 +933,29 @@ void GPUInterpreter::HandleGP0CPUToVRAM(const uint32_t* params) {
 
     int16_t dst_x = dst_xy & 0x3FF;
     int16_t dst_y = (dst_xy >> 16) & 0x1FF;
-    uint16_t width = wh & 0xFFFF;
-    uint16_t height = (wh >> 16) & 0xFFFF;
+    uint16_t width = wh & 0x3FF;
+    uint16_t height = (wh >> 16) & 0x1FF;
+    if (width == 0) width = 1024;
+    if (height == 0) height = 512;
 
-    // Guard against zero or overflow dimensions
-    if (width == 0 || height == 0) return;
+    // Guard against overflow dimensions
+
+    if ((g_ps1_frame >= 20u && g_ps1_frame <= 60u) ||
+        (g_ps1_frame >= 280u && g_ps1_frame <= 320u) ||
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
+        static uint32_t s_cpu2vram_log_frame = 0;
+        static uint32_t s_cpu2vram_log_count = 0;
+        if (s_cpu2vram_log_frame != g_ps1_frame) {
+            s_cpu2vram_log_frame = g_ps1_frame;
+            s_cpu2vram_log_count = 0;
+        }
+        if (s_cpu2vram_log_count < 16u) {
+            printf("[GP0:A0] f%u #%u dst=(%d,%d) wh=(%u,%u)\n",
+                   g_ps1_frame, ++s_cpu2vram_log_count,
+                   dst_x, dst_y, width, height);
+            fflush(stdout);
+        }
+    }
     uint32_t pixel_count = (uint32_t)width * (uint32_t)height;
     if (pixel_count > 1024u * 512u) {
         fprintf(stderr, "Warning: CPUToVRAM dimensions %dx%d overflow, skipping\n", width, height);
@@ -802,7 +978,28 @@ void GPUInterpreter::HandleGP0CPUToVRAM(const uint32_t* params) {
     }
 
     static uint32_t s_cpu2vram = 0; ++s_cpu2vram;
-    /* [GP0:A0] CPUToVRAM first 10 — re-enable: if (s_cpu2vram <= 10) printf(...); */
+
+    /* Trace ALL uploads touching CLUT area (y>=240) during title/boot */
+    if ((dst_y >= 240 || (dst_y + (int)height) > 240) && g_ps1_frame <= 500u) {
+        printf("[GP0:A0-CLUT] f%u dst=(%d,%d) wh=(%u,%u) first4hw=%04X,%04X,%04X,%04X\n",
+               g_ps1_frame, dst_x, dst_y, width, height,
+               pixel_count > 0 ? data[0] : 0,
+               pixel_count > 1 ? data[1] : 0,
+               pixel_count > 2 ? data[2] : 0,
+               pixel_count > 3 ? data[3] : 0);
+        fflush(stdout);
+    }
+
+    /* Trace uploads touching VRAM Y=4 (HUD CLUT row) */
+    if (dst_y <= 4 && (dst_y + (int)height) > 4) {
+        printf("[GP0:A0-Y4] f%u dst=(%d,%d) wh=(%u,%u) first4hw=%04X,%04X,%04X,%04X\n",
+               g_ps1_frame, dst_x, dst_y, width, height,
+               pixel_count > 0 ? data[0] : 0,
+               pixel_count > 1 ? data[1] : 0,
+               pixel_count > 2 ? data[2] : 0,
+               pixel_count > 3 ? data[3] : 0);
+        fflush(stdout);
+    }
 
     // Upload to VRAM via renderer
     if (renderer) {
@@ -823,11 +1020,12 @@ void GPUInterpreter::HandleGP0VRAMToCPU(const uint32_t* params) {
 
     int16_t src_x = src_xy & 0x3FF;
     int16_t src_y = (src_xy >> 16) & 0x1FF;
-    uint16_t width = wh & 0xFFFF;
-    uint16_t height = (wh >> 16) & 0xFFFF;
+    uint16_t width = wh & 0x3FF;
+    uint16_t height = (wh >> 16) & 0x1FF;
+    if (width == 0) width = 1024;
+    if (height == 0) height = 512;
 
-    // Guard against zero or overflow dimensions
-    if (width == 0 || height == 0) return;
+    // Guard against overflow dimensions
     uint32_t pixel_count = (uint32_t)width * (uint32_t)height;
     if (pixel_count > 1024u * 512u) {
         fprintf(stderr, "Warning: VRAMToCPU dimensions %dx%d overflow, skipping\n", width, height);
@@ -888,22 +1086,9 @@ void GPUInterpreter::HandleDrawMode(uint32_t cmd) {
     state.draw_mode.texture_depth = (cmd >> 7) & 3;
     state.draw_mode.dithering = (cmd >> 9) & 1;
     state.draw_mode.draw_to_display = (cmd >> 10) & 1;
-    state.draw_mode.texpage_y_base_bit1 = (cmd >> 11) & 1;
-    state.draw_mode.texture_disable = (cmd >> 12) & 1;
-    state.draw_mode.h_flip = (cmd >> 13) & 1;
-
-    // DIAG: Log E1h draw mode during peak frames
-    if (g_ps1_frame >= 93 && g_ps1_frame <= 95) {
-        static uint32_t s_e1_log = 0;
-        if (++s_e1_log <= 40) {
-            int tpx = state.draw_mode.texpage_x_base * 64;
-            int tpy = (state.draw_mode.texpage_y_base | (state.draw_mode.texpage_y_base_bit1 << 1)) * 256;
-            printf("[E1] f%u tpage(%d,%d) depth=%d semi=%d cmd=0x%08X\n",
-                   g_ps1_frame, tpx, tpy, state.draw_mode.texture_depth,
-                   state.draw_mode.semi_transparency, cmd);
-            fflush(stdout);
-        }
-    }
+    state.draw_mode.texpage_y_base_bit1 = 0;
+    state.draw_mode.texture_disable = (cmd >> 11) & 1;
+    state.draw_mode.h_flip = (cmd >> 12) & 1;
 
     // Update renderer state
     if (renderer) {
@@ -928,11 +1113,6 @@ void GPUInterpreter::HandleDrawingAreaTopLeft(uint32_t cmd) {
     state.drawing_area.x1 = cmd & 0x3FF;
     state.drawing_area.y1 = (cmd >> 10) & 0x3FF;
 
-    static uint32_t s_e3_count = 0; ++s_e3_count;
-    if (s_e3_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
-        printf("[GP0:E3] #%u f%u draw_area TL=(%d,%d)\n", s_e3_count, g_ps1_frame,
-               state.drawing_area.x1, state.drawing_area.y1);
-
     if (renderer) {
         renderer->SetDrawingArea(state.drawing_area);
     }
@@ -943,10 +1123,19 @@ void GPUInterpreter::HandleDrawingAreaBottomRight(uint32_t cmd) {
     state.drawing_area.x2 = cmd & 0x3FF;
     state.drawing_area.y2 = (cmd >> 10) & 0x3FF;
 
-    static uint32_t s_e4_count = 0; ++s_e4_count;
-    if (s_e4_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
-        printf("[GP0:E4] #%u f%u draw_area BR=(%d,%d)\n", s_e4_count, g_ps1_frame,
-               state.drawing_area.x2, state.drawing_area.y2);
+    static uint32_t s_da_count = 0; ++s_da_count;
+    /* Log draw areas that cover CLUT region (y2 >= 240 and x2 >= 512) */
+    if (g_ps1_frame <= 200u && state.drawing_area.y2 >= 240 && state.drawing_area.x2 >= 512) {
+        static uint32_t s_da_clut_log = 0;
+        if (s_da_clut_log < 15) {
+            printf("[DRAWAREA-CLUT] f%u area=(%d,%d)-(%d,%d)\n",
+                   g_ps1_frame,
+                   state.drawing_area.x1, state.drawing_area.y1,
+                   state.drawing_area.x2, state.drawing_area.y2);
+            fflush(stdout);
+            ++s_da_clut_log;
+        }
+    }
 
     if (renderer) {
         renderer->SetDrawingArea(state.drawing_area);
@@ -963,10 +1152,6 @@ void GPUInterpreter::HandleDrawingOffset(uint32_t cmd) {
 
     state.drawing_offset.x = x;
     state.drawing_offset.y = y;
-
-    static uint32_t s_e5_count = 0; ++s_e5_count;
-    if (s_e5_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
-        printf("[GP0:E5] #%u f%u draw_offset=(%d,%d)\n", s_e5_count, g_ps1_frame, x, y);
 
     if (renderer) {
         renderer->SetDrawingOffset(state.drawing_offset);
@@ -1049,9 +1234,6 @@ void GPUInterpreter::HandleGP1DisplayAreaStart(uint32_t param) {
 
     static uint32_t s_gp1_05_count = 0;
     ++s_gp1_05_count;
-    if (s_gp1_05_count <= 10 || (g_ps1_frame >= 90 && g_ps1_frame <= 96))
-        printf("[GP1:05] #%u f%u display_area=(%d,%d)\n", s_gp1_05_count, g_ps1_frame,
-               state.display_control.display_area_x, state.display_control.display_area_y);
 
     if (renderer) {
         renderer->SetDisplayArea(state.display_control.display_area_x,
@@ -1080,7 +1262,9 @@ void GPUInterpreter::HandleGP1VerticalDisplayRange(uint32_t param) {
 }
 
 void GPUInterpreter::HandleGP1DisplayMode(uint32_t param) {
-    state.display_control.h_resolution = param & 3;
+    state.display_control.h_resolution = EncodeDisplayHResolution(
+        static_cast<uint8_t>(param & 0x3u),
+        ((param >> 6) & 1u) != 0u);
     state.display_control.v_resolution = (param >> 2) & 1;
     state.display_control.video_mode = (param >> 3) & 1;
     state.display_control.color_depth_24bit = (param >> 4) & 1;
@@ -1088,9 +1272,8 @@ void GPUInterpreter::HandleGP1DisplayMode(uint32_t param) {
     state.display_control.reverse_flag = (param >> 7) & 1;
 
     // Calculate display dimensions
-    const int h_res_table[] = {256, 320, 512, 640};
-    int width = h_res_table[state.display_control.h_resolution];
-    int height = state.display_control.v_resolution ? 480 : 240;
+    int width = DecodeDisplayWidth(state.display_control.h_resolution);
+    int height = DecodeDisplayHeight(state.display_control.v_resolution);
 
     if (renderer) {
         renderer->SetDisplayMode(width, height,
@@ -1177,20 +1360,21 @@ void GPUInterpreter::ExtractCLUT(uint32_t word, uint16_t& x, uint16_t& y) {
 
 void GPUInterpreter::ExtractTexpage(uint32_t word, uint8_t& x, uint8_t& y, uint8_t& depth) {
     x = (word >> 16) & 0xF;          // Texpage X base (0-15)
-    y = ((word >> 20) & 1) | (((word >> 27) & 1) << 1);  // Texpage Y base (bits 20 and 27)
+    y = (word >> 20) & 1;            // Texpage Y base (0 or 1 => 0 or 256 lines)
     depth = (word >> 23) & 3;        // Texture depth (0=4bit, 1=8bit, 2=15bit)
 }
 
 DrawState GPUInterpreter::BuildDrawState(bool gouraud, bool textured, bool semi_transparent, bool raw_texture) const {
     DrawState ds;
     ds.gouraud = gouraud;
-    ds.textured = textured;
+    ds.textured = textured && !state.draw_mode.texture_disable;
     ds.semi_transparent = semi_transparent;
-    ds.raw_texture = raw_texture;
+    ds.raw_texture = raw_texture && ds.textured;
     ds.blend_mode = state.draw_mode.semi_transparency;
     ds.texpage_x_base = state.draw_mode.texpage_x_base;
-    ds.texpage_y_base = (state.draw_mode.texpage_y_base) | (state.draw_mode.texpage_y_base_bit1 << 1);
+    ds.texpage_y_base = state.draw_mode.texpage_y_base;
     ds.texture_depth = state.draw_mode.texture_depth;
+    ds.rectangle_x_flip = state.draw_mode.h_flip;
     ds.dithering = state.draw_mode.dithering;
     ds.check_mask_bit = state.mask_settings.check_mask_bit;
     ds.set_mask_bit = state.mask_settings.set_mask_bit;

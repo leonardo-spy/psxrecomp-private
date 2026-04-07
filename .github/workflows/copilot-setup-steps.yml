@@ -1,0 +1,92 @@
+# Copilot Cloud Agent — Environment Setup
+# Installs the working Windows/MSYS2 toolchain for this repository so the agent
+# can build the recompiler and warm the CastlevaniaRecomp configure step.
+#
+# Build targets:
+#   - recompiler (PSXRecomp tool): cmake + ninja in build/recompiler
+#   - runner / CastlevaniaRecomp: cmake + ninja in CastlevaniaRecomp/build
+#
+# Toolchain: MSYS2 UCRT64 GCC, CMake, Ninja, C17 / C++20
+# Graphics:  OpenGL (GLAD bundled, GLFW fetched via CMake FetchContent)
+# Deps fetched by CMake: GLFW 3.3.8, fmt 10.1.1
+
+name: "Copilot Setup Steps"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  copilot-setup-steps:
+    # This repository's working toolchain is Windows + MSYS2 UCRT64 + Ninja.
+    # If you use a larger or self-hosted Windows runner for Copilot, replace
+    # this label with your runner label or group.
+    runs-on: windows-2022
+    timeout-minutes: 59
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            git
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-pillow
+            mingw-w64-ucrt-x86_64-python-numpy
+
+      - name: Verify toolchain
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:/usr/bin:$PATH"
+          echo "=== Toolchain versions ==="
+          gcc --version | head -1
+          g++ --version | head -1
+          cmake --version | head -1
+          ninja --version
+          git --version
+          python3 --version
+          echo "=== Ready ==="
+
+      - name: Prime recompiler build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:/usr/bin:$PATH"
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+          tmp_dir="$workspace/CastlevaniaRecomp/build/.tmp"
+          mkdir -p "$tmp_dir"
+
+          TMP="$tmp_dir" TEMP="$tmp_dir" cmake -S "$workspace/recompiler" -B "$workspace/build/recompiler" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          TMP="$tmp_dir" TEMP="$tmp_dir" ninja -C "$workspace/build/recompiler"
+
+      - name: Prime CastlevaniaRecomp configure (best-effort)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:/usr/bin:$PATH"
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+          tmp_dir="$workspace/CastlevaniaRecomp/build/.tmp"
+          mkdir -p "$tmp_dir"
+
+          if [[ -f "$workspace/CastlevaniaRecomp/generated/castlevania_full.c" && \
+                -f "$workspace/CastlevaniaRecomp/generated/castlevania_dispatch.c" ]]; then
+            TMP="$tmp_dir" TEMP="$tmp_dir" cmake -S "$workspace/CastlevaniaRecomp" -B "$workspace/CastlevaniaRecomp/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          else
+            echo "Skipping CastlevaniaRecomp configure: generated sources are missing."
+          fi

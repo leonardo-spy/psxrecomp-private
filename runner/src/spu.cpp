@@ -465,7 +465,11 @@ static void key_on(uint16_t mask, int base_bit)
                            |  (uint32_t)g_spu_regs[vi * 8 + 4];
 
         static uint32_t s_kon = 0;
-        /* [SPU KON] first 30 — re-enable printf when investigating voice keying */
+        /* Log all real KON events (skip init-pattern ones after first 48) */
+        bool is_init_pattern = (start_reg == 0x200 && pitch == 0x3FFF && adsr32 == 0);
+        if (s_kon < 48 || !is_init_pattern)
+            fprintf(stderr, "[SPU-KON] #%u voice=%d start=0x%X pitch=0x%04X adsr=0x%08X\n",
+                    s_kon, vi, (uint32_t)start_reg * 8u, pitch, adsr32);
         ++s_kon;
 
         v->cur_addr    = (uint32_t)start_reg * 8u;

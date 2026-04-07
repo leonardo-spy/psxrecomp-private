@@ -1,4 +1,4 @@
-/* fmv_player.cpp — PS1 STR v2 FMV decoder
+/* fmv_player.cpp — PS1 STR v2/v3 FMV decoder
  *
  * MDEC decode ported directly from FFmpeg libavcodec/mdec.c
  * IDCT ported from FFmpeg libavcodec/simple_idct_template.c (BIT_DEPTH=8)
@@ -125,6 +125,24 @@ static const uint8_t zigzag_direct[64] = {
     53, 60, 61, 54, 47, 55, 62, 63,
 };
 
+struct DcVlcCode {
+    uint16_t code;
+    uint8_t len;
+    uint8_t size;
+};
+
+static const DcVlcCode dc_lum_codes[] = {
+    { 0x04, 3,  0 }, { 0x00, 2,  1 }, { 0x01, 2,  2 }, { 0x05, 3,  3 },
+    { 0x06, 3,  4 }, { 0x0E, 4,  5 }, { 0x1E, 5,  6 }, { 0x3E, 6,  7 },
+    { 0x7E, 7,  8 }, { 0xFE, 8,  9 }, { 0x1FE, 9, 10 }, { 0x1FF, 9, 11 },
+};
+
+static const DcVlcCode dc_chroma_codes[] = {
+    { 0x00, 2,  0 }, { 0x01, 2,  1 }, { 0x02, 2,  2 }, { 0x06, 3,  3 },
+    { 0x0E, 4,  4 }, { 0x1E, 5,  5 }, { 0x3E, 6,  6 }, { 0x7E, 7,  7 },
+    { 0xFE, 8,  8 }, { 0x1FE, 9,  9 }, { 0x3FE,10, 10 }, { 0x3FF,10, 11 },
+};
+
 /* YCbCr->RGB fixed-point coefficients ×2^16 */
 static const int64_t CR_R =  91893LL;
 static const int64_t CB_G = -22525LL;
@@ -200,39 +218,81 @@ static inline int32_t bc_gets(BitCtx* bc, int n) {
     return (int32_t)(v << (32 - n)) >> (32 - n);
 }
 
+static inline int bc_bits_left(const BitCtx* bc) {
+    return bc->cache_bits + (bc->buf_size - bc->byte_pos) * 8;
+}
+
+static inline int32_t bc_get_xbits(BitCtx* bc, int n) {
+    uint32_t v = bc_get(bc, n);
+    uint32_t threshold = 1u << (n - 1);
+    return (v < threshold) ? (int32_t)(v + 1u - (1u << n)) : (int32_t)v;
+}
+
+static int decode_dc(BitCtx* bc, int component) {
+    const DcVlcCode* table = (component == 0) ? dc_lum_codes : dc_chroma_codes;
+    const size_t table_count = 12;
+    if (bc_bits_left(bc) < 2) return 0xFFFF;
+
+    uint32_t peek = bc_show(bc, 11);
+    for (size_t i = 0; i < table_count; i++) {
+        const DcVlcCode& entry = table[i];
+        if ((peek >> (11 - entry.len)) != entry.code) continue;
+        if (bc_bits_left(bc) < entry.len + entry.size) return 0xFFFF;
+        bc_skip(bc, entry.len);
+        return entry.size ? (int)bc_get_xbits(bc, entry.size) : 0;
+    }
+    return 0xFFFF;
+}
+
+static int g_mdec_version = 0;
+static int g_mdec_last_dc[3] = { 128, 128, 128 };
+
 /* ============================================================================
  * mdec_decode_block — port of mdec_decode_block_intra() from FFmpeg mdec.c
  *
- * version <= 2:  block[0] = 2*get_sbits(10) + 1024  (absolute DC)
+ * version == 2:  block[0] = 2*get_sbits(10) + 1024  (absolute DC)
+ * version >  2:  block[0] = (last_dc[component] + decode_dc()) << 3
  * AC VLC:        scan mpeg1_vlc_table, read 1 sign bit after VLC code
  *                dequantize: (|level| * qscale * intra_matrix[j]) >> 3
  *                apply sign after dequant (FFmpeg order)
  * Escape:        run = UBITS(6)+1, level = SBITS(10)
  *                dequant abs value, (val-1)|1, restore sign
  * ============================================================================ */
-static void mdec_decode_block(BitCtx* bc, int16_t* block, int qscale) {
-    /* DC (version <= 2 path from mdec.c line 72) */
-    block[0] = (int16_t)(2 * bc_gets(bc, 10) + 1024);
+static bool mdec_decode_block(BitCtx* bc, int16_t* block, int qscale, int block_id) {
+    if (g_mdec_version == 2) {
+        if (bc_bits_left(bc) < 10) return false;
+        block[0] = (int16_t)(2 * bc_gets(bc, 10) + 1024);
+    } else {
+        int component = (block_id <= 3) ? 0 : (block_id - 3);
+        int diff = decode_dc(bc, component);
+        if (diff >= 0xFFFF) return false;
+        g_mdec_last_dc[component] += diff;
+        block[0] = (int16_t)(g_mdec_last_dc[component] << 3);
+    }
 
     int i = 0;   /* scan position; 0 = DC, AC starts at 1 */
+    int guard = 0;
 
     for (;;) {
+        if (bc_bits_left(bc) <= 0 || ++guard > 4096) return false;
         /* Peek 17 bits for EOB/escape/VLC check */
         uint32_t peek = bc_show(bc, 17);
 
         /* EOB: code=0x02, len=2 → top 2 bits = 10 = 2 */
         if ((peek >> 15) == 2u) {
+            if (bc_bits_left(bc) < 2) return false;
             bc_skip(bc, 2);
             break;
         }
 
         /* Escape: code=0x01, len=6 → top 6 bits = 000001 = 1 */
         if ((peek >> 11) == 1u) {
+            if (bc_bits_left(bc) < 22) return false;
             bc_skip(bc, 6);
             int run   = (int)bc_get(bc, 6) + 1;   /* UBITS(6) + 1 */
-            int level = (int)bc_gets(bc, 10);      /* SBITS(10)    */
+            int level = (int)bc_gets(bc, 10);     /* SBITS(10)    */
             i += run;
-            if (i > 63) break;
+            if (i > 63) return false;
             int j = zigzag_direct[i];
             /* Dequantize by absolute value, apply (val-1)|1, restore sign */
             if (level < 0) {
@@ -255,11 +315,12 @@ static void mdec_decode_block(BitCtx* bc, int16_t* block, int qscale) {
             int code = mpeg1_vlc_table[k][0];
             /* Compare top 'len' bits of peek against the right-justified code */
             if ((peek >> (17 - len)) == (uint32_t)code) {
+                if (bc_bits_left(bc) < len + 1) return false;
                 bc_skip(bc, len);
 
                 /* run = mpeg12_run[k] + 1 (FFmpeg ff_init_2d_vlc_rl adds +1) */
                 i += mpeg12_run[k] + 1;
-                if (i > 63) { found = true; break; }
+                if (i > 63) return false;
                 int j = zigzag_direct[i];
 
                 /* Dequantize the magnitude */
@@ -279,10 +340,13 @@ static void mdec_decode_block(BitCtx* bc, int16_t* block, int qscale) {
         }
 
         if (!found) {
+            if (bc_bits_left(bc) < 1) return false;
             /* Unrecognized VLC — skip 1 bit to attempt resync */
             bc_skip(bc, 1);
         }
     }
+
+    return true;
 }
 
 /* ============================================================================
@@ -474,16 +538,17 @@ static uint8_t g_plane_cr[160 * 128];
  *   for mb_x in [0, mb_width): for mb_y in [0, mb_height):
  *     decode_mb with block_index[] = {5,4,0,1,2,3} → idct_put
  * ============================================================================ */
-static void decode_frame(void) {
-    if (g_demux_bytes < FRAME_HDR_BYTES) return;
+static bool decode_frame(void) {
+    if (g_demux_bytes < FRAME_HDR_BYTES) return false;
 
     /* Read qscale from LE header bytes 4-5 (before bswap) */
     const int qscale = (int)(g_demux[4] | ((int)g_demux[5] << 8));
+    g_mdec_version = (int)(g_demux[6] | ((int)g_demux[7] << 8));
 
     const int w = g_fmv_width, h = g_fmv_height;
     if (w <= 0 || h <= 0 || w > FRAME_MAX_W || h > FRAME_MAX_H) {
         fprintf(stderr, "[FMV] Bad frame size %dx%d\n", w, h);
-        return;
+        return false;
     }
 
     const int mbW    = (w + 15) / 16;
@@ -494,11 +559,12 @@ static void decode_frame(void) {
     /* bswap16 the bitstream (everything after the 8-byte STR frame header).
      * Matches FFmpeg mdec.c: bbdsp.bswap16_buf on the entire input packet. */
     const int bs_len = g_demux_bytes - FRAME_HDR_BYTES;
-    if (bs_len <= 0) return;
+    if (bs_len <= 0) return false;
     bswap16_buf(g_bswap, g_demux + FRAME_HDR_BYTES, bs_len);
 
     BitCtx bc;
     bc_init(&bc, g_bswap, bs_len);
+    g_mdec_last_dc[0] = g_mdec_last_dc[1] = g_mdec_last_dc[2] = 128;
 
     /* Macroblock decode — column-major (mb_x outer, mb_y inner), matching FFmpeg */
     /* Block decode order {5,4,0,1,2,3} = Cr, Cb, Y_TL, Y_TR, Y_BL, Y_BR */
@@ -512,8 +578,14 @@ static void decode_frame(void) {
             memset(block, 0, sizeof(block));
 
             /* Decode 6 blocks in FFmpeg order */
-            for (int bi = 0; bi < 6; bi++)
-                mdec_decode_block(&bc, block[block_index[bi]], qscale);
+            for (int bi = 0; bi < 6; bi++) {
+                if (!mdec_decode_block(&bc, block[block_index[bi]], qscale, block_index[bi])) {
+                    fprintf(stderr,
+                            "[FMV] MDEC block decode failed ver=%d mb=(%d,%d) block=%d bits_left=%d\n",
+                            g_mdec_version, mbX, mbY, block_index[bi], bc_bits_left(&bc));
+                    return false;
+                }
+            }
 
             /* IDCT + place into planes — matches FFmpeg's idct_put() */
             /* Cr: block[5] → plane_cr at (mbX*8, mbY*8) */
@@ -573,6 +645,8 @@ static void decode_frame(void) {
             fflush(stdout);
         }
     }
+
+    return true;
 }
 
 /* ============================================================================
@@ -601,6 +675,8 @@ void fmv_player_seek(uint32_t lba) {
     g_fmv_width            = 0;
     g_fmv_height           = 0;
     g_fmv_debug_frames     = 0;
+    g_mdec_version         = 0;
+    g_mdec_last_dc[0] = g_mdec_last_dc[1] = g_mdec_last_dc[2] = 128;
     printf("[FMV] Seek to LBA %u\n", lba);
     fflush(stdout);
 }
@@ -628,12 +704,23 @@ int fmv_player_tick(void) {
         }
 
         uint8_t submode = raw[SUBHDR_OFF + 2];
+        const uint8_t* v = raw + STR_HDR_OFF;
+        uint16_t chunk_num   = (uint16_t)(v[4]  | (v[5]  << 8));
+        uint16_t chunk_total = (uint16_t)(v[6]  | (v[7]  << 8));
+        uint16_t width       = (uint16_t)(v[16] | (v[17] << 8));
+        uint16_t height      = (uint16_t)(v[18] | (v[19] << 8));
+        bool has_str_header =
+            chunk_total != 0 &&
+            chunk_total <= 16 &&
+            chunk_num < chunk_total &&
+            (width == 320 || width == 640) &&
+            (height == 240 || height == 256);
         bool is_eof   = (submode & 0x80) != 0;
-        bool is_video = (submode & 0x08) != 0;
+        bool is_video = ((submode & 0x08) != 0) || has_str_header;
 
         g_fmv_lba++;
 
-        if (is_eof) {
+        if (is_eof && !has_str_header) {
             printf("[FMV] EOD sector after %d frames\n", g_frame_count);
             fflush(stdout);
             g_fmv_active = false;
@@ -653,12 +740,6 @@ int fmv_player_tick(void) {
         }
         g_consecutive_nosector = 0;
 
-        const uint8_t* v = raw + STR_HDR_OFF;
-        uint16_t chunk_num   = (uint16_t)(v[4]  | (v[5]  << 8));
-        uint16_t chunk_total = (uint16_t)(v[6]  | (v[7]  << 8));
-        uint16_t width       = (uint16_t)(v[16] | (v[17] << 8));
-        uint16_t height      = (uint16_t)(v[18] | (v[19] << 8));
-
         if (chunk_num == 0) {
             g_demux_bytes      = 0;
             g_chunks_collected = 0;
@@ -675,7 +756,14 @@ int fmv_player_tick(void) {
         g_chunks_collected++;
 
         if (g_chunk_total > 0 && g_chunks_collected >= g_chunk_total) {
-            decode_frame();
+            if (!decode_frame()) {
+                printf("[FMV] Decode failed at frame %d ver=%d demux=%d\n",
+                       g_frame_count + 1, g_mdec_version, g_demux_bytes);
+                fflush(stdout);
+                g_fmv_active = false;
+                xa_audio_seek(0);
+                return 1;
+            }
             g_frame_count++;
 
             if (++g_frame_log <= 5)
