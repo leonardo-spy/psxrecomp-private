@@ -10,13 +10,13 @@
 # Graphics:  OpenGL (GLAD bundled, GLFW fetched via CMake FetchContent)
 # Deps fetched by CMake: GLFW 3.3.8, fmt 10.1.1
 
-name: "Copilot Setup Steps"
+name: "Copilot Setup Stepsa"
 
 on:
   workflow_dispatch:
 
 jobs:
-  copilot-setup-steps:
+  copilot-setup-stepsa:
     # This repository's working toolchain is Windows + MSYS2 UCRT64 + Ninja.
     # If you use a larger or self-hosted Windows runner for Copilot, replace
     # this label with your runner label or group.
