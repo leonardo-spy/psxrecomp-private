@@ -62,7 +62,7 @@ void GPUState::Reset() {
     display_control.h_display_range_x2 = 0xC00;
     display_control.v_display_range_y1 = 0x10;
     display_control.v_display_range_y2 = 0x100;
-    display_control.h_resolution = 0;     // 256 pixels
+    display_control.h_resolution = EncodeDisplayHResolution(0, false);  // 256 pixels
     display_control.v_resolution = false; // 240 lines
     display_control.video_mode = false;   // NTSC
     display_control.color_depth_24bit = false;  // 15-bit
@@ -124,21 +124,24 @@ void GPUState::UpdateGPUSTAT() {
     // Bit 13: Interlace field (always 0 for now)
     // gpustat |= (interlace_field & 1) << 13;
 
-    // Bit 14: Reverse flag
-    if (draw_mode.h_flip) gpustat |= (1 << 14);
+    // Bit 14: Display reverse flag
+    if (display_control.reverse_flag) gpustat |= (1 << 14);
 
     // Bit 15: Texture Y base bit 1
     gpustat |= (draw_mode.texpage_y_base_bit1 & 1) << 15;
 
-    // Bits 16-23: Video mode (from display_control)
+    // Bits 16-22: Video mode (from display_control)
     uint32_t video_mode_bits = 0;
-    video_mode_bits |= (display_control.h_resolution & 3);
+    video_mode_bits |= DecodeDisplayHResolutionBase(display_control.h_resolution);
     video_mode_bits |= (display_control.v_resolution ? 1 : 0) << 2;
     video_mode_bits |= (display_control.video_mode ? 1 : 0) << 3;
     video_mode_bits |= (display_control.color_depth_24bit ? 1 : 0) << 4;
     video_mode_bits |= (display_control.interlace ? 1 : 0) << 5;
-    // Bits 6-7 are h_resolution extended (for 368 pixel mode)
-    gpustat |= (video_mode_bits & 0xFF) << 16;
+    video_mode_bits |= (DecodeDisplayHResolution368(display_control.h_resolution) ? 1u : 0u) << 6;
+    gpustat |= (video_mode_bits & 0x7F) << 16;
+
+    // Bit 23: Display enable (0=on, 1=off)
+    if (!display_control.display_enable) gpustat |= (1 << 23);
 
     // Bit 24: Interrupt request (not yet implemented, always 0)
     // gpustat |= (irq_requested ? 1 : 0) << 24;

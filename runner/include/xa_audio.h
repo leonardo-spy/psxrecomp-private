@@ -13,6 +13,9 @@ void xa_audio_init(const char* bin_path);
  * If no audio sectors are found within a short scan window, playback stops. */
 void xa_audio_seek(uint32_t lba);
 
+/* Select the XA file/channel pair requested by CdlSetfilter. */
+void xa_audio_set_filter(uint8_t file, uint8_t channel);
+
 /* Set playback volume. 0.0 = silent, 1.0 = full scale. Default 0.5. */
 void xa_audio_set_volume(float v);
 

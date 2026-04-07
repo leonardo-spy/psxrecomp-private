@@ -45,6 +45,7 @@ struct DrawState {
     uint8_t texpage_x_base;  // Texture page X (0-15)
     uint8_t texpage_y_base;  // Texture page Y (0-1)
     uint8_t texture_depth;   // 0=4bit, 1=8bit, 2=15bit
+    bool rectangle_x_flip;   // GP0(E1h).12, textured rectangles only
 
     // Effects
     bool dithering;          // Dithering enabled?

@@ -1,7 +1,7 @@
 import struct
 import os
 
-iso_path = r"C:\Users\Leona\Documents\GitHub\psxrecomp\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA) (Track 1).bin"
+iso_path = r"C:\Users\Leona\Documents\GitHub\psxrecomp_copia\CastlevaniaRecomp\isos\Castlevania - Symphony of the Night (USA) (Track 1).bin"
 
 SECTOR_SIZE = 2352
 HEADER_OFFSET = 24

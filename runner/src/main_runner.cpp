@@ -119,6 +119,8 @@ static void record_tick(uint32_t frame, uint16_t pad, int turbo) {
 extern "C" void psx_interpret_from(CPUState* cpu, uint32_t start_pc);
 extern "C" void cv_display_pump_frame(CPUState* cpu);
 extern "C" uint8_t* psx_get_ram(void);
+extern "C" uint32_t g_interp_total_limit;
+extern "C" uint32_t g_interp_total_counter;
 
 /* ---------------------------------------------------------------------------
  * GPU hook — called by runtime when DMA submits GPU packets.
@@ -127,12 +129,42 @@ extern "C" uint8_t* psx_get_ram(void);
 static OpenGLRenderer* g_renderer = nullptr;
 static GPUInterpreter* g_gpu      = nullptr;
 
+static void shutdown_runner_once(void) {
+    static bool s_shutdown = false;
+    if (s_shutdown) return;
+    s_shutdown = true;
+
+    if (s_record_file) {
+        fprintf(s_record_file, "# Recording ended at frame %u\n", g_ps1_frame);
+        fclose(s_record_file);
+        s_record_file = NULL;
+        printf("[REC] Saved to %s\n", s_record_path);
+        fflush(stdout);
+    }
+
+    xa_audio_shutdown();
+    spu_shutdown();
+    debug_server_shutdown();
+    if (g_renderer) {
+        g_renderer->Shutdown();
+        g_renderer = nullptr;
+    }
+    g_gpu = nullptr;
+}
+
 /* Set to 1 while inside the DrawOTag (FUN_80060B70) OT walker. */
 extern "C" int g_in_drawtag = 0;
+/* Set to 1 while runtime is feeding GP0 words from DMA2 linked-list mode. */
+extern "C" int g_gpu_linked_dma = 0;
+
+/* Generic VRAM upload hook used by runtime-side fixes that need to seed VRAM. */
+extern "C" void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data) {
+    if (g_renderer) g_renderer->UploadToVRAM(x, y, w, h, data);
+}
 
 /* FMV decoder hook — uploads decoded RGB555 frame to VRAM */
 extern "C" void fmv_vram_upload(int x, int y, int w, int h, const uint16_t* data) {
-    if (g_renderer) g_renderer->UploadToVRAM(x, y, w, h, data);
+    psx_vram_upload(x, y, w, h, data);
 }
 
 /* FMV display area override — called before psx_present_frame() during FMV playback.
@@ -142,11 +174,37 @@ extern "C" void fmv_vram_upload(int x, int y, int w, int h, const uint16_t* data
 static bool g_fmv_presenting = false;  /* true only during FMV player's own present */
 static int  g_fmv_disp_x = 0, g_fmv_disp_y = 0;
 static int  g_fmv_disp_w = 0, g_fmv_disp_h = 0;
+static bool g_game_disp_area_valid = false;
+static bool g_game_disp_mode_valid = false;
+static bool g_game_disp_range_h_valid = false;
+static bool g_game_disp_range_v_valid = false;
+static int  g_game_disp_x = 0, g_game_disp_y = 0;
+static int  g_game_disp_w = 320, g_game_disp_h = 240;
+static bool g_game_disp_24bit = false, g_game_disp_interlace = false;
+static int  g_game_h_range_x1 = 0, g_game_h_range_x2 = 0;
+static int  g_game_v_range_y1 = 0, g_game_v_range_y2 = 0;
 
 extern "C" void fmv_force_display_area(int x, int y, int w, int h) {
     g_fmv_disp_x = x; g_fmv_disp_y = y;
     g_fmv_disp_w = w; g_fmv_disp_h = h;
     g_fmv_presenting = true;  /* next psx_present_frame is from FMV player */
+}
+
+static void restore_game_display_state() {
+    if (!g_renderer) return;
+    if (g_game_disp_area_valid) {
+        g_renderer->SetDisplayArea(g_game_disp_x, g_game_disp_y);
+    }
+    if (g_game_disp_range_h_valid) {
+        g_renderer->SetHorizontalDisplayRange(g_game_h_range_x1, g_game_h_range_x2);
+    }
+    if (g_game_disp_range_v_valid) {
+        g_renderer->SetVerticalDisplayRange(g_game_v_range_y1, g_game_v_range_y2);
+    }
+    if (g_game_disp_mode_valid) {
+        g_renderer->SetDisplayMode(g_game_disp_w, g_game_disp_h,
+                                   g_game_disp_24bit, g_game_disp_interlace);
+    }
 }
 
 extern "C" void gpu_submit_word(uint32_t word) {
@@ -168,6 +226,51 @@ extern "C" uint32_t gpu_read_word(void) {
 
 extern "C" void gpu_write_gp1(uint32_t cmd) {
     static uint32_t s_gp1_count = 0; ++s_gp1_count;
+    uint8_t op = (uint8_t)(cmd >> 24);
+    uint32_t param = cmd & 0x00FFFFFFu;
+    switch (op) {
+        case 0x05:
+            g_game_disp_x = (int)(param & 0x3FFu);
+            g_game_disp_y = (int)((param >> 10) & 0x1FFu);
+            g_game_disp_area_valid = true;
+            break;
+        case 0x06:
+            g_game_h_range_x1 = (int)(param & 0xFFFu);
+            g_game_h_range_x2 = (int)((param >> 12) & 0xFFFu);
+            g_game_disp_range_h_valid = true;
+            break;
+        case 0x07:
+            g_game_v_range_y1 = (int)(param & 0x3FFu);
+            g_game_v_range_y2 = (int)((param >> 10) & 0x3FFu);
+            g_game_disp_range_v_valid = true;
+            break;
+        case 0x08: {
+            uint8_t h_resolution = EncodeDisplayHResolution(
+                static_cast<uint8_t>(param & 0x3u),
+                ((param >> 6) & 1u) != 0u);
+            int v_resolution = (int)((param >> 2) & 1u);
+            g_game_disp_w = DecodeDisplayWidth(h_resolution);
+            g_game_disp_h = DecodeDisplayHeight(v_resolution != 0);
+            g_game_disp_24bit = ((param >> 4) & 1u) != 0;
+            g_game_disp_interlace = ((param >> 5) & 1u) != 0;
+            g_game_disp_mode_valid = true;
+            break;
+        }
+    }
+    if (((g_ps1_frame >= 280u && g_ps1_frame <= 320u) ||
+         (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) ||
+         (g_ps1_frame >= 2320u && g_ps1_frame <= 2520u)) &&
+        op >= 0x05u && op <= 0x08u) {
+        printf("[GP1-WIN] f%u op=0x%02X cmd=0x%08X area=(%d,%d) mode=%dx%d 24=%d ilace=%d hrange=(%d,%d) vrange=(%d,%d)\n",
+               g_ps1_frame, op, cmd,
+               g_game_disp_x, g_game_disp_y,
+               g_game_disp_w, g_game_disp_h,
+               g_game_disp_24bit ? 1 : 0,
+               g_game_disp_interlace ? 1 : 0,
+               g_game_h_range_x1, g_game_h_range_x2,
+               g_game_v_range_y1, g_game_v_range_y2);
+        fflush(stdout);
+    }
     /* [GP1] first 30 — re-enable: if (s_gp1_count <= 30) printf("[GP1] #%u 0x%08X\n", ...); */
     diag_track_gp1(cmd);
     if (g_gpu) g_gpu->WriteGP1(cmd);
@@ -356,6 +459,18 @@ extern "C" void psx_present_frame(void) {
     psx_watchdog_reset();
     static char s_pending_shot[512] = {};
 
+    {
+        uint8_t* ram = psx_get_ram();
+        uint32_t game_state = 0;
+        memcpy(&game_state, ram + 0x3C734u, sizeof(game_state));
+        if (game_state == 2u) {
+            memset(ram + 0x72FA0u, 0, 16u * 0xCu);
+        }
+        if (g_interp_total_limit > 0u) {
+            g_interp_total_counter = 0u;
+        }
+    }
+
     /* Debug server per-frame integration */
     debug_server_poll();
     debug_server_record_frame();
@@ -400,16 +515,7 @@ extern "C" void psx_present_frame(void) {
 
         if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS ||
             glfwWindowShouldClose(win)) {
-            if (s_record_file) {
-                fprintf(s_record_file, "# Recording ended at frame %u\n", g_ps1_frame);
-                fclose(s_record_file);
-                s_record_file = NULL;
-                printf("[REC] Saved to %s\n", s_record_path);
-                fflush(stdout);
-            }
-            xa_audio_shutdown();
-            debug_server_shutdown();
-            g_renderer->Shutdown();
+            shutdown_runner_once();
             exit(0);
         }
 
@@ -503,11 +609,13 @@ extern "C" void psx_present_frame(void) {
                     } else if (--s_exit_countdown <= 0) {
                         printf("[SCRIPT] Exit %d (timeout)\n", s_exit_code);
                         fflush(stdout);
+                        shutdown_runner_once();
                         exit(s_exit_code);
                     }
                 } else {
                     printf("[SCRIPT] Exit %d\n", ec);
                     fflush(stdout);
+                    shutdown_runner_once();
                     exit(ec);
                 }
             }
@@ -540,24 +648,42 @@ extern "C" void psx_present_frame(void) {
         g_renderer->SetDisplayMode(g_fmv_disp_w, g_fmv_disp_h, false, false);
     }
 
-    /* [PRESENT-DBG] FMV→normal transition — re-enable when debugging FMV:
     {
         static bool s_was_fmv = false;
         bool is_fmv = fmv_player_is_active() != 0;
         if (s_was_fmv && !is_fmv) {
-            printf("[PRESENT-DBG] FMV→normal transition, presenting frame %u\n", g_ps1_frame);
-            fflush(stdout);
+            restore_game_display_state();
         }
         s_was_fmv = is_fmv;
-    } */
+    }
+
+    if ((g_ps1_frame >= 280u && g_ps1_frame <= 320u) ||
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) ||
+        (g_ps1_frame >= 2320u && g_ps1_frame <= 2520u)) {
+        printf("[PRESENT-WIN] f%u fmv=%d game_area=(%d,%d) game_mode=%dx%d 24=%d ilace=%d hrange=(%d,%d) vrange=(%d,%d) renderer_area=(%d,%d)\n",
+               g_ps1_frame, fmv_player_is_active() ? 1 : 0,
+               g_game_disp_x, g_game_disp_y,
+               g_game_disp_w, g_game_disp_h,
+               g_game_disp_24bit ? 1 : 0,
+               g_game_disp_interlace ? 1 : 0,
+               g_game_h_range_x1, g_game_h_range_x2,
+               g_game_v_range_y1, g_game_v_range_y2,
+               g_renderer->GetDisplayAreaX(), g_renderer->GetDisplayAreaY());
+        fflush(stdout);
+    }
 
 
     g_renderer->Present();
 
-    /* Window screenshot: taken AFTER Present() so the front buffer holds the
-     * just-blitted frame.  SaveScreenshotBMP reads GL_FRONT explicitly. */
+    /* Script screenshots are taken AFTER Present(); PPM reads the front buffer,
+     * while BMP/PNG reads the resolved display rect from the VRAM FBO. */
     if (s_pending_shot[0] != '\0') {
-        g_renderer->SaveScreenshotBMP(s_pending_shot);
+        size_t shot_len = strlen(s_pending_shot);
+        if (shot_len >= 4 && _stricmp(s_pending_shot + shot_len - 4, ".ppm") == 0) {
+            g_renderer->SaveScreenshot(s_pending_shot);
+        } else {
+            g_renderer->SaveScreenshotBMP(s_pending_shot);
+        }
         s_pending_shot[0] = '\0';
     }
 
@@ -719,6 +845,11 @@ extern "C" void psx_present_frame(void) {
     }
     if (g_ps1_frame == 2500) {
         g_renderer->SaveScreenshotBMP("C:/temp/game_shot_03.png");
+        g_renderer->SaveVRAMDumpBMP("C:/temp/game_vram_03.png");
+        fflush(stdout);
+    }
+    if (g_ps1_frame == 2501) {
+        g_renderer->SaveScreenshotBMP("C:/temp/game_shot_03_alt.png");
         fflush(stdout);
     }
     if (g_ps1_frame == 3000) {
@@ -915,11 +1046,36 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
         printf("[BOOT-STATE] DRA.BIN entry=0x%08X loaded=%s\n",
                dra_entry, (dra_entry != 0) ? "yes" : "no");
 
-        /* Force mode=0 (display path) — CD loading is already complete */
-        if (ram[0x32D80] != 0) {
-            printf("[POST-BOOT] Forcing mode from 0x%02X to 0x00 (display path)\n",
-                   ram[0x32D80]);
-            ram[0x32D80] = 0;
+        /* Keep the old boot-time g_UseDisk force available only as an opt-in
+         * debug escape hatch. The default path should rely on the runtime and
+         * ISO lookup fixes rather than mutating state here. */
+        {
+            const char* env = getenv("PSX_CV_FORCE_BOOT_USEDISK");
+            if (env && env[0] != '\0' && env[0] != '0') {
+                uint32_t usedisk = 0;
+                const uint32_t one = 1u;
+                memcpy(&usedisk, ram + 0x978ACu, sizeof(usedisk));
+                if (usedisk != one) {
+                    memcpy(ram + 0x978ACu, &one, sizeof(one));
+                    printf("[BOOT-USEDISK] forced g_UseDisk: 0x%08X -> 0x%08X (PSX_CV_FORCE_BOOT_USEDISK)\n",
+                           usedisk, one);
+                }
+            }
+        }
+
+        /* Optional post-boot display-path force. Keep disabled by default so the
+         * canonical boot path can be validated without mutating RAM state. */
+        {
+            const char* env = getenv("PSX_CV_FORCE_POSTBOOT_MODE0");
+            int force_postboot_mode0 =
+                (env && *env != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+            printf("[POST-BOOT] force mode0=%d (PSX_CV_FORCE_POSTBOOT_MODE0)\n",
+                   force_postboot_mode0);
+            if (force_postboot_mode0 && ram[0x32D80] != 0) {
+                printf("[POST-BOOT] Forcing mode from 0x%02X to 0x00 (display path)\n",
+                       ram[0x32D80]);
+                ram[0x32D80] = 0;
+            }
         }
         fflush(stdout);
     }
@@ -935,7 +1091,6 @@ extern "C" void psxrecomp_runner_run(int argc, char** argv) {
         frame++;
     }
 
-    debug_server_shutdown();
-    renderer.Shutdown();
+    shutdown_runner_once();
     printf("\nDone. Frames: %d\n", frame);
 }

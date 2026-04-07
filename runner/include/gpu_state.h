@@ -21,7 +21,7 @@ struct DrawMode {
     bool dithering;              // 24bit→15bit dither enable
     bool draw_to_display;        // Allow drawing to display area
     bool texture_disable;        // Force untextured rendering
-    bool h_flip;                 // Horizontal flip (textured rectangles only)
+    bool h_flip;                 // X flip (textured rectangles only)
 };
 
 // Texture window settings (GP0(E2h))
@@ -57,13 +57,36 @@ struct DisplayControl {
     uint16_t display_area_y;   // GP1(05h) - VRAM Y (scanline)
     uint16_t h_display_range_x1, h_display_range_x2;  // GP1(06h) - horizontal range
     uint16_t v_display_range_y1, v_display_range_y2;  // GP1(07h) - vertical range
-    uint8_t h_resolution;      // GP1(08h) - 0=256, 1=320, 2=512, 3=640
+    uint8_t h_resolution;      // GP1(08h) - bits0-1=256/320/512/640, bit2 mirrors GP1(08h).6 for 368px mode
     bool v_resolution;         // GP1(08h) - 0=240, 1=480i
     bool video_mode;           // GP1(08h) - 0=NTSC, 1=PAL
     bool color_depth_24bit;    // GP1(08h) - 0=15bit, 1=24bit
     bool interlace;            // GP1(08h)
-    bool reverse_flag;         // GP1(08h) - horizontal flip
+    bool reverse_flag;         // GP1(08h) - display reverse flag
 };
+
+inline uint8_t EncodeDisplayHResolution(uint8_t h_resolution, bool h_resolution_368) {
+    return static_cast<uint8_t>((h_resolution & 0x3u) | (h_resolution_368 ? 0x4u : 0u));
+}
+
+inline uint8_t DecodeDisplayHResolutionBase(uint8_t h_resolution) {
+    return static_cast<uint8_t>(h_resolution & 0x3u);
+}
+
+inline bool DecodeDisplayHResolution368(uint8_t h_resolution) {
+    return (h_resolution & 0x4u) != 0;
+}
+
+inline int DecodeDisplayWidth(uint8_t h_resolution) {
+    static constexpr int kBaseWidths[] = {256, 320, 512, 640};
+    return DecodeDisplayHResolution368(h_resolution)
+        ? 368
+        : kBaseWidths[DecodeDisplayHResolutionBase(h_resolution)];
+}
+
+inline int DecodeDisplayHeight(bool v_resolution) {
+    return v_resolution ? 480 : 240;
+}
 
 // VRAM transfer state
 struct VRAMTransfer {
@@ -109,7 +132,7 @@ struct GPUState {
 
     // Current command processing
     uint32_t current_command;       // First word of current command (0 if none)
-    uint32_t command_params[16];    // Parameter buffer
+    uint32_t command_params[512];   // Parameter buffer (large enough for polylines)
     int params_received;            // Parameters received so far
     int params_needed;              // Total parameters needed for command
 

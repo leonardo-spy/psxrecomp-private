@@ -182,6 +182,7 @@ private:
     // Display state
     int display_area_x_ = 0;
     int display_area_y_ = 0;
+    bool display_area_valid_ = false;
     int display_width_ = 320;
     int display_height_ = 240;
     bool display_24bit_ = false;

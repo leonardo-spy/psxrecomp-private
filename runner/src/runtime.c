@@ -34,17 +34,125 @@
 static uint8_t g_ram[2 * 1024 * 1024];   /* 2MB main RAM */
 static uint8_t g_scratch[1024];           /* 1KB scratchpad */
 
+extern void psx_vram_upload(int x, int y, int w, int h, const uint16_t* data);
+extern int psx_debug_read_vram(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                               uint16_t* out, int max_pixels);
+const uint8_t* psx_krom2raw_lookup(uint16_t ch);
+int psx_font_render_4bpp(uint16_t ch, uint16_t kind, uint8_t out_bitmap[96]);
+
+static int suspicious_code_overlap(uint32_t phys, uint32_t size, const char** label_out);
+static void trace_suspicious_code_write(const char* tag, uint32_t phys, uint32_t size, uint32_t sample);
+
 /* Global CPU pointer for watchpoint diagnostics */
 CPUState* g_diag_cpu = NULL;
 
 /* Current pad1 button state (active-high), exposed for debug_server.c */
 uint16_t g_pad1_state = 0;
 
+static int cv_trace_pad_flow_enabled(void) {
+    static int s_trace_pad_flow = -1;
+    if (s_trace_pad_flow < 0) {
+        const char* env = getenv("PSX_CV_TRACE_PAD_FLOW");
+        s_trace_pad_flow = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+        if (s_trace_pad_flow) {
+            printf("[CV-SIG] trace pad flow=%d (PSX_CV_TRACE_PAD_FLOW)\n", s_trace_pad_flow);
+            fflush(stdout);
+        }
+    }
+    return s_trace_pad_flow;
+}
+
+static int cv_force_menu_engstep_clamp_enabled(void) {
+    static int s_force_menu_engstep_clamp = -1;
+    if (s_force_menu_engstep_clamp < 0) {
+        const char* env = getenv("PSX_CV_FORCE_MENU_ENGSTEP_CLAMP");
+        s_force_menu_engstep_clamp =
+            (env && env[0] && env[0] != '0') ? 1 : 0;
+        printf("[CV-SIG] force menu engstep clamp=%d (PSX_CV_FORCE_MENU_ENGSTEP_CLAMP)\n",
+               s_force_menu_engstep_clamp);
+        fflush(stdout);
+    }
+    return s_force_menu_engstep_clamp;
+}
+
+static int cv_force_gs8_sub7_enabled(void) {
+    static int s_force_gs8_sub7 = -1;
+    if (s_force_gs8_sub7 < 0) {
+        const char* env = getenv("PSX_CV_FORCE_GS8_SUB7");
+        s_force_gs8_sub7 = (env && env[0] && env[0] != '0') ? 1 : 0;
+        printf("[CV-SIG] force gs8 sub7=%d (PSX_CV_FORCE_GS8_SUB7)\n",
+               s_force_gs8_sub7);
+        fflush(stdout);
+    }
+    return s_force_gs8_sub7;
+}
+
+static int cv_force_gs8_roomready_enabled(void) {
+    static int s_force_gs8_roomready = -1;
+    if (s_force_gs8_roomready < 0) {
+        const char* env = getenv("PSX_CV_FORCE_GS8_ROOMREADY");
+        s_force_gs8_roomready = (env && env[0] && env[0] != '0') ? 1 : 0;
+        printf("[CV-SIG] force gs8 roomready=%d (PSX_CV_FORCE_GS8_ROOMREADY)\n",
+               s_force_gs8_roomready);
+        fflush(stdout);
+    }
+    return s_force_gs8_roomready;
+}
+
+static void cv_sync_game_pad1(uint16_t buttons) {
+    static uint16_t s_prev_pressed = 0;
+    static uint8_t s_repeat_timers[16];
+    static int s_repeat_init = 0;
+    /* DRA ReadPads() stores PadRead() in the non-PSP layout, which is the
+     * 16-bit raw controller mask with its bytes swapped. */
+    uint16_t pressed = (uint16_t)((buttons << 8) | (buttons >> 8));
+    uint16_t previous = s_prev_pressed;
+    uint16_t tapped = (pressed ^ previous) & pressed;
+    uint16_t repeat = 0;
+
+    if (!s_repeat_init) {
+        memset(s_repeat_timers, 0x10, sizeof(s_repeat_timers));
+        s_repeat_init = 1;
+    }
+
+    for (int i = 0; i < 16; ++i) {
+        uint16_t bit = (uint16_t)(1u << i);
+        if (pressed & bit) {
+            if (tapped & bit) {
+                repeat |= bit;
+                s_repeat_timers[i] = 0x10;
+            } else if (s_repeat_timers[i] == 0) {
+                repeat |= bit;
+                s_repeat_timers[i] = 5;
+            } else {
+                s_repeat_timers[i]--;
+            }
+        } else {
+            s_repeat_timers[i] = 0x10;
+        }
+    }
+
+    /* g_pads[0] sits between D_80097488 and g_StageId in DRA BSS:
+     * 0x80097490 pressed, 0x80097492 previous, 0x80097494 tapped, 0x80097496 repeat. */
+    memcpy(&g_ram[0x97490], &pressed, 2);
+    memcpy(&g_ram[0x97492], &previous, 2);
+    memcpy(&g_ram[0x97494], &tapped, 2);
+    memcpy(&g_ram[0x97496], &repeat, 2);
+    memset(&g_ram[0x97498], 0, 8);
+    if (g_ps1_frame >= 820u && g_ps1_frame <= 836u) {
+        printf("[PAD-SYNC] f%u raw=0x%04X pressed=0x%04X prev=0x%04X tapped=0x%04X repeat=0x%04X\n",
+               g_ps1_frame, buttons, pressed, previous, tapped, repeat);
+        fflush(stdout);
+    }
+    s_prev_pressed = pressed;
+}
+
 /* Scripting VM per-frame opcode counter(reset each VM entry, used to force yield) */
 uint32_t g_vm_ops_this_frame = 0;
 
 /* Current CDROM seek position (LBA), set by CdlSeekL intercept */
 static uint32_t g_cdrom_lba = 0;
+static uint32_t g_st0_player_init_entry_frame = 0;
 
 /* Dispatch miss tracking */
 #define MAX_DISPATCH_MISS_UNIQUE 256
@@ -305,8 +413,103 @@ typedef struct {
     uint32_t start_lba;   /* file's starting sector on disc */
     uint32_t file_size;   /* file size in bytes */
     uint32_t position;    /* current byte offset within file */
+    char     name[64];
 } cdrom_vfd_t;
 static cdrom_vfd_t s_cdrom_vfds[CDROM_MAX_VFD];
+
+#define CV_STAGE_CD_ENTRY_COUNT 0x80u
+#define CV_CD_SECTOR_BYTES 2048u
+#define CV_STAGE_CHR_BYTES 0x40000u
+#define CV_GAME_CHR_BYTES  0x42000u
+#define CV_SIM_PTR_PHYS    0x080000u
+#define CV_RIC_PRG_PHYS    0x13C000u
+#define CV_STAGE_PRG_PHYS  0x180000u
+#define CV_DRA_STAGE_LBA_PHYS       0x0A3C40u
+#define CV_DRA_STAGE_LBA_COUNT      80u
+#define CV_DRA_STAGE_LBA_STRIDE     0x2Au
+#define CV_DRA_STAGE_LBA_SEQ_IDX_OFF 0x29u
+#define CV_DRA_STAGE_SEQ_TABLE_PHYS 0x0ACCF8u
+#define CV_DRA_STAGE_SEQ_ENTRY_SIZE 12u
+#define CV_DRA_STAGE_SEQ_REG_ID_OFF 8u
+#define CV_DRA_APBAV2_PHYS          0x0B607Cu
+#define CV_DRA_APBAV2_ADDR          0x800B607Cu
+#define CV_DRA_APBAV2_BYTES         0x2000u
+#define CV_DRA_APQES1_PHYS          0x0BA07Cu
+#define CV_DRA_APQES1_ADDR          0x800BA07Cu
+#define CV_DRA_APQES1_BYTES         0x3000u
+#define CV_CD_STREAM_SCRATCH_PHYS   0x1EC000u
+#define CV_CD_STREAM_SCRATCH_ADDR   0x801EC000u
+#define CV_CD_STREAM_SCRATCH_BYTES  0x4000u
+#define CV_SPU_IN_TRANSFER_PHYS     0x033534u
+#define CV_SVM_VAB_USED_PHYS        0x0978E8u
+#define CV_SVM_VAB_VH_PHYS          0x03C914u
+#define CV_SVM_VAB_TOTAL_PHYS       0x0987CCu
+#define CV_SVM_VAB_START_PHYS       0x098810u
+#define CV_SVM_BRR_START_ADDR_PHYS  0x098854u
+#define CV_STAGE_SFX_VAB_ID         3u
+#define CV_STAGE_SFX_SPU_ADDR       0x00060A40u
+#define CV_FUNC_SSVABCLOSE          0x800211D0u
+#define CV_FUNC_SSVABOPENHEADSTICKY 0x80021350u
+#define CV_FUNC_SSVABTRANSBODYPARTLY 0x80021880u
+#define CV_FUNC_SSVABTRANSCOMPLETED 0x800219E0u
+#define CV_FUNC_REGISTER_SEQ        0x80131EBCu
+#define CV_G_CLUT0_PHYS    0x06CBCCu
+#define CV_G_CLUT1_PHYS    0x06EBCCu
+#define CV_G_CLUT2_PHYS    0x070BCCu
+#define CV_CLUT_RECT_W     0x0100u
+#define CV_CLUT_RECT_H     0x0010u
+
+typedef struct {
+    uint32_t gfx_sec;   /* F_*.BIN */
+    uint32_t ovl_sec;   /* *.BIN */
+    uint32_t ovl_size;  /* overlay/program size */
+    uint32_t vh_sec;    /* *.VH */
+    uint32_t vh_size;   /* VH size */
+    uint32_t vb_size;   /* VB size */
+    uint32_t flags;
+    uint32_t init;
+    uint32_t update;
+    uint32_t cleanup;
+    uint32_t misc;
+} cv_stage_cd_entry_t;
+
+static cv_stage_cd_entry_t g_cv_stage_cd_table[CV_STAGE_CD_ENTRY_COUNT];
+static uint8_t g_cv_stage_cd_valid[CV_STAGE_CD_ENTRY_COUNT];
+static int g_cv_stage_cd_cached = 0;
+
+static const cv_stage_cd_entry_t s_cv_stage_cd_fallback[CV_STAGE_CD_ENTRY_COUNT] = {
+    [3] = {
+        .gfx_sec = 0x7849u,
+        .ovl_sec = 0x7766u,
+        .ovl_size = 0x585C0u,
+        .vh_sec = 0x7817u,
+        .vh_size = 0x1A20u,
+        .vb_size = 0x16960u,
+    },
+    [0x0D] = {
+        .gfx_sec = 0x9415u,
+        .ovl_sec = 0x94CEu,
+        .ovl_size = 0x42340u,
+        .vh_sec = 0x9495u,
+        .vh_size = 0x1C20u,
+        .vb_size = 0x1A060u,
+    },
+    [0x45] = {
+        .gfx_sec = 0x74B6u,
+        .ovl_sec = 0x754Fu,
+        .ovl_size = 0x56B28u,
+        .vh_sec = 0x7516u,
+        .vh_size = 0x1A20u,
+        .vb_size = 0x1A3A0u,
+    },
+};
+
+static const int16_t s_cv_tileset_x[32] = {
+    0x200, 0x220, 0x200, 0x220, 0x240, 0x260, 0x240, 0x260,
+    0x280, 0x2A0, 0x280, 0x2A0, 0x2C0, 0x2E0, 0x2C0, 0x2E0,
+    0x300, 0x320, 0x300, 0x320, 0x340, 0x360, 0x340, 0x360,
+    0x380, 0x3A0, 0x380, 0x3A0, 0x3C0, 0x3E0, 0x3C0, 0x3E0,
+};
 
 static int is_cdrom_fd(int fd) {
     return fd >= CDROM_FD_BASE && fd < CDROM_FD_BASE + CDROM_MAX_VFD;
@@ -356,6 +559,10 @@ extern uint32_t g_ps1_frame;
 /* Per-frame addPrim counter — reset by DrawOTag override, incremented by addPrim override */
 uint32_t g_addprim_count = 0;
 
+/* Last OT head passed to the game's DrawOTag. The pump should prefer this over
+ * fixed RAM pointers because the game alternates OT buffers. */
+static uint32_t s_last_drawotag_a0 = 0;
+
 /* Button-triggered INTERP-CALL trace: set to g_ps1_frame+200 when Circle/Square pressed.
  * While g_ps1_frame < g_attack_trace_end_frame, all overlay→compiled calls are logged. */
 uint32_t g_attack_trace_end_frame = 0;
@@ -369,6 +576,7 @@ static int s_interp_a664 = 0;
 /* Global interpreter instruction limit — see psx_runtime.h for docs */
 uint32_t g_interp_total_limit = 0;
 uint32_t g_interp_total_counter = 0;
+static int g_vsync_frame_done = 0;  /* set by VSync to signal interpreter exit */
 
 
 /* ---------------------------------------------------------------------------
@@ -388,6 +596,7 @@ void psx_watchdog_reset(void) {
     g_wd_frame = g_ps1_frame;
     g_wd_reads = 0;
     g_wd_fired = 0;
+    g_vsync_frame_done = 0;
 
     /* BCA7 per-frame watchpoint — catches compiled code writes.
      * Also logs script VM state (ca04, ec30, script PC) every 200 frames after bca7=1. */
@@ -479,13 +688,16 @@ static void watchdog_check(uint32_t addr, int width) {
             if (width == 32) memcpy(&val, &g_scratch[off], 4);
             else { uint16_t h; memcpy(&h, &g_scratch[off], 2); val = h; }
         }
-        /* [WATCHDOG] — re-enable when debugging spin loops:
-        if (!g_wd_fired || (g_wd_reads & 0x3FFFFF) == 0) {
-            printf("[WATCHDOG] f%u  %.1fs  addr=0x%08X val=0x%08X w=%d  ra=0x%08X sp=0x%08X  reads=%llu\n",
-                   g_wd_frame, elapsed, addr, val, width,
-                   ra, sp, (unsigned long long)g_wd_reads);
-            fflush(stdout);
-        } */
+        if (g_ps1_frame >= 835u) {
+            static uint32_t s_watchdog_logs = 0;
+            if (++s_watchdog_logs <= 40u || (s_watchdog_logs % 20u) == 0u) {
+                printf("[WATCHDOG] f%u %.1fs addr=0x%08X val=0x%08X w=%d pc=0x%08X ra=0x%08X sp=0x%08X reads=%llu\n",
+                       g_wd_frame, elapsed, addr, val, width,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u,
+                       ra, sp, (unsigned long long)g_wd_reads);
+                fflush(stdout);
+            }
+        }
         g_wd_fired = 1;
     }
 }
@@ -713,6 +925,13 @@ static LPVOID g_fiber_loading   = NULL;  /* loading/CDROM thread fiber */
 static LPVOID g_fiber_secondary = NULL;  /* secondary processing thread (TCB[1]) */
 static LPVOID g_fiber_game      = NULL;  /* MainGame fiber (DRA.BIN 0x800E3988) */
 
+uint32_t g_last_fmv_poll_frame = 0;      /* last frame that FUN_8001EFE8 ran */
+uint32_t g_force_cd_idle_frame = 0;      /* force 15650/19B98 idle on a stalled FMV frame */
+
+/* Forward declaration — defined later in this file. */
+void call_by_address(CPUState* cpu, uint32_t addr);
+static void run_sel_stream_player(void);
+
 /* Saved MIPS GP register banks (one per thread) */
 static uint32_t g_main_saved[MIPS_GP_REGS];
 static uint32_t g_display_saved[MIPS_GP_REGS];
@@ -727,6 +946,316 @@ static uint32_t g_loading_entry = 0;             /* entry function address */
 /* Secondary fiber setup (TCB[1] — e.g. FUN_8001F1C0 game-state processor) */
 static uint32_t g_secondary_sp    = 0;
 static uint32_t g_secondary_entry = 0;
+
+#define BIOS_EVENT_MAX 64
+#define BIOS_EVENT_HANDLE_BASE 0xF1000000u
+#define BIOS_EVENT_MODE_INTR 0x1000u
+
+typedef struct BIOS_Event {
+    uint8_t used;
+    uint8_t enabled;
+    uint8_t pending;
+    uint8_t reserved;
+    uint32_t class_id;
+    uint32_t spec;
+    uint32_t mode;
+    uint32_t func;
+} BIOS_Event;
+
+static BIOS_Event g_bios_events[BIOS_EVENT_MAX];
+
+static void maybe_resolve_stalled_video_playback(void) {
+    static uint32_t s_stall_frame = 0;
+    static uint32_t s_stall_calls = 0;
+
+    uint32_t game_state = 0;
+    uint32_t video_busy = 0;
+    memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+    memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+
+    if (game_state != 5u || video_busy == 0u ||
+        g_last_fmv_poll_frame == g_ps1_frame) {
+        s_stall_frame = 0;
+        s_stall_calls = 0;
+        return;
+    }
+
+    if (s_stall_frame != g_ps1_frame) {
+        s_stall_frame = g_ps1_frame;
+        s_stall_calls = 0;
+    }
+
+    if (s_stall_calls == 0u) {
+        /* The canonical gs=5 path can spin inside CD status polling before the
+         * overlay streaming hooks get another chance to tick. Drive the host
+         * FMV shim once here before we fall back to forcibly clearing busy. */
+        run_sel_stream_player();
+        if (g_last_fmv_poll_frame == g_ps1_frame) {
+            return;
+        }
+    }
+
+    if (++s_stall_calls < 8192u) {
+        return;
+    }
+
+    {
+        uint32_t zero = 0;
+        uint32_t state_ready = 5u;
+        memcpy(&g_ram[0x3C728], &zero, sizeof(zero));
+        memcpy(&g_ram[0x32D80], &state_ready, sizeof(state_ready));
+    }
+    g_force_cd_idle_frame = g_ps1_frame;
+    printf("[FMV-FALLBACK] f%u clearing D_8003C728 after %u stalled CD polls in gs=5 (no FUN_8001EFE8)\n",
+           g_ps1_frame, s_stall_calls);
+    fflush(stdout);
+    s_stall_calls = 0;
+}
+
+typedef struct CVSelStreamInfo {
+    uint32_t lba;
+    uint32_t frame_count;
+    uint32_t rgb24;
+} CVSelStreamInfo;
+
+static const CVSelStreamInfo g_cv_sel_streams[] = {
+    { 0x5A49u, 0x008Fu, 1u },
+    { 0x3631u, 0x039Au, 1u },
+    { 0x207Du, 0x0221u, 1u },
+    { 0x036Fu, 0x02E4u, 1u },
+};
+
+/* SEL/TITLE0 FMV driver shim.
+ *
+ * The real 0x801B9C80 path uses libcd/libpress ring buffers and loops on
+ * StGetNext(). Our runtime already has a working STR player, but this
+ * particular title/menu/new-game path never reaches FUN_8001EFE8, so the
+ * compiled stream code sits in StGetNext forever and never clears D_8003C728.
+ *
+ * Run the existing host FMV player directly from the SEL draw/update entry,
+ * keep the stream globals coherent, and clear D_8003C728 when playback ends. */
+static void run_sel_stream_player(void) {
+    static int s_active_stream = -1;
+    static uint32_t s_tick_frame = UINT32_MAX;
+    static uint32_t s_frame_budget = 0;
+    static uint32_t s_frames_played = 0;
+    static uint32_t s_call_count = 0;
+
+    uint32_t video_busy = 0;
+    uint32_t current_stream = 0;
+
+    extern void fmv_player_seek(uint32_t lba);
+    extern int  fmv_player_tick(void);
+    extern int  fmv_player_is_active(void);
+    extern void fmv_player_stop(void);
+    extern void xa_audio_seek(uint32_t lba);
+
+    memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+    memcpy(&current_stream, &g_ram[0x3C100], sizeof(current_stream));
+
+    if (video_busy == 0u) {
+        if (s_active_stream >= 0) {
+            fmv_player_stop();
+            xa_audio_seek(0);
+            s_active_stream = -1;
+            s_tick_frame = UINT32_MAX;
+            s_frame_budget = 0;
+            s_frames_played = 0;
+            s_call_count = 0;
+        }
+        return;
+    }
+
+    if (current_stream >= (sizeof(g_cv_sel_streams) / sizeof(g_cv_sel_streams[0]))) {
+        current_stream = 0u;
+    }
+
+    g_last_fmv_poll_frame = g_ps1_frame;
+
+    if (s_active_stream != (int)current_stream) {
+        const CVSelStreamInfo* info = &g_cv_sel_streams[current_stream];
+        uint32_t end_frame = info->frame_count;
+        uint32_t rgb24 = info->rgb24;
+
+        memcpy(&g_ram[0x1BD034], &end_frame, sizeof(end_frame)); /* g_StreamEndFrame */
+        memcpy(&g_ram[0x1BD038], &rgb24, sizeof(rgb24));         /* g_StreamIsRGB24 */
+        g_cdrom_lba = info->lba;
+        xa_audio_seek(info->lba);
+        fmv_player_seek(info->lba);
+        s_active_stream = (int)current_stream;
+        s_tick_frame = UINT32_MAX;
+        s_frame_budget = info->frame_count;
+        s_frames_played = 0;
+        s_call_count = 0;
+        printf("[SEL-FMV] f%u start stream=%u lba=%u frames=%u rgb24=%u\n",
+               g_ps1_frame, current_stream, info->lba, info->frame_count, info->rgb24);
+        fflush(stdout);
+    }
+
+    ++s_call_count;
+    if (s_call_count <= 8u || (s_call_count % 256u) == 0u) {
+        printf("[SEL-FMV-CALL] f%u stream=%u call=%u played=%u/%u tick_frame=%u\n",
+               g_ps1_frame, current_stream, s_call_count,
+               s_frames_played, s_frame_budget, s_tick_frame);
+        fflush(stdout);
+    }
+
+    {
+        uint16_t raw = (uint16_t)(g_ram[0x9EB5Au] | ((uint16_t)g_ram[0x9EB5Bu] << 8));
+        uint16_t buttons = (uint16_t)~raw;
+        uint16_t pad_pressed = 0;
+        uint16_t pad_tapped = 0;
+        memcpy(&pad_pressed, &g_ram[0x97490u], sizeof(pad_pressed));
+        memcpy(&pad_tapped, &g_ram[0x97494u], sizeof(pad_tapped));
+        if (((buttons | pad_pressed | pad_tapped) & 0x4008u) != 0u) {
+            uint32_t zero = 0;
+            fmv_player_stop();
+            xa_audio_seek(0);
+            memcpy(&g_ram[0x3C728], &zero, sizeof(zero));
+            g_force_cd_idle_frame = g_ps1_frame;
+            s_active_stream = -1;
+            s_tick_frame = UINT32_MAX;
+            s_frame_budget = 0;
+            s_frames_played = 0;
+            s_call_count = 0;
+            printf("[SEL-FMV] f%u skip stream=%u buttons=0x%04X pad=0x%04X tapped=0x%04X\n",
+                   g_ps1_frame, current_stream, buttons, pad_pressed, pad_tapped);
+            fflush(stdout);
+            return;
+        }
+    }
+
+    {
+        uint32_t max_ticks = g_turbo ? 128u : (current_stream == 0u ? 4u : 1u);
+        for (uint32_t tick_index = 0; tick_index < max_ticks; ++tick_index) {
+            int tick_result = 0;
+            if (current_stream != 0u && s_tick_frame == g_ps1_frame) {
+                break;
+            }
+            s_tick_frame = g_ps1_frame;
+            tick_result = fmv_player_tick();
+            if (s_active_stream >= 0 &&
+                tick_result != 0 &&
+                fmv_player_is_active()) {
+                ++s_frames_played;
+                if (current_stream == 0u) {
+                    uint32_t state_ready = 5u;
+                    /* The boot-logo path keeps polling libcd inside the same
+                     * host/player handoff frame after we have already produced
+                     * the next video frame. Force the following PS1 frame
+                     * through the "idle/short exit" hooks so control returns
+                     * to the pump instead of stalling in CD timeout polling. */
+                    memcpy(&g_ram[0x32D80], &state_ready, sizeof(state_ready));
+                    g_force_cd_idle_frame = g_ps1_frame + 1u;
+                }
+                if (s_frames_played <= 8u || (s_frames_played % 60u) == 0u) {
+                    printf("[SEL-FMV-PROGRESS] f%u stream=%u frames=%u/%u\n",
+                           g_ps1_frame, current_stream, s_frames_played, s_frame_budget);
+                    fflush(stdout);
+                }
+            }
+            if (!g_turbo || tick_result == 0 || !fmv_player_is_active()) {
+                break;
+            }
+        }
+    }
+
+    if (s_active_stream >= 0 &&
+        (s_frame_budget != 0u && s_frames_played >= s_frame_budget)) {
+        uint32_t zero = 0;
+        fmv_player_stop();
+        xa_audio_seek(0);
+        memcpy(&g_ram[0x3C728], &zero, sizeof(zero));
+        g_force_cd_idle_frame = g_ps1_frame;
+        printf("[SEL-FMV] f%u end stream=%u frames=%u/%u (budget)\n",
+               g_ps1_frame, current_stream, s_frames_played, s_frame_budget);
+        fflush(stdout);
+        s_active_stream = -1;
+        s_tick_frame = UINT32_MAX;
+        s_frame_budget = 0;
+        s_frames_played = 0;
+        s_call_count = 0;
+        return;
+    }
+
+    if (s_active_stream >= 0 && !fmv_player_is_active()) {
+        uint32_t zero = 0;
+        memcpy(&g_ram[0x3C728], &zero, sizeof(zero));
+        g_force_cd_idle_frame = g_ps1_frame;
+        printf("[SEL-FMV] f%u end stream=%u\n", g_ps1_frame, current_stream);
+        fflush(stdout);
+        s_active_stream = -1;
+        s_tick_frame = UINT32_MAX;
+        s_frame_budget = 0;
+        s_frames_played = 0;
+        s_call_count = 0;
+    }
+}
+
+static int bios_event_index_from_handle(uint32_t handle) {
+    if ((handle & 0xFF000000u) != BIOS_EVENT_HANDLE_BASE) {
+        return -1;
+    }
+    uint32_t idx = handle & 0xFFFFu;
+    return idx < BIOS_EVENT_MAX ? (int)idx : -1;
+}
+
+static uint32_t bios_event_open(uint32_t class_id, uint32_t spec, uint32_t mode, uint32_t func) {
+    for (uint32_t i = 0; i < BIOS_EVENT_MAX; ++i) {
+        BIOS_Event* ev = &g_bios_events[i];
+        if (ev->used) {
+            continue;
+        }
+        memset(ev, 0, sizeof(*ev));
+        ev->used = 1;
+        ev->enabled = 1;
+        ev->class_id = class_id;
+        ev->spec = spec;
+        ev->mode = mode;
+        ev->func = func;
+        return BIOS_EVENT_HANDLE_BASE | i;
+    }
+    return 0;
+}
+
+static void bios_event_close(uint32_t handle) {
+    int idx = bios_event_index_from_handle(handle);
+    if (idx >= 0) {
+        memset(&g_bios_events[idx], 0, sizeof(g_bios_events[idx]));
+    }
+}
+
+static void bios_event_set_enabled(uint32_t handle, int enabled) {
+    int idx = bios_event_index_from_handle(handle);
+    if (idx >= 0 && g_bios_events[idx].used) {
+        g_bios_events[idx].enabled = enabled ? 1u : 0u;
+    }
+}
+
+static void bios_event_deliver(CPUState* cpu, uint32_t class_id, uint32_t spec) {
+    static uint32_t s_cd_event_logs = 0;
+    for (uint32_t i = 0; i < BIOS_EVENT_MAX; ++i) {
+        BIOS_Event* ev = &g_bios_events[i];
+        if (!ev->used || !ev->enabled) {
+            continue;
+        }
+        if (ev->class_id != class_id || ev->spec != spec) {
+            continue;
+        }
+        ev->pending = 1;
+        if (ev->mode == BIOS_EVENT_MODE_INTR &&
+            ev->func >= 0x80000000u && ev->func < 0x80200000u) {
+            if (class_id == 0xF0000003u &&
+                (s_cd_event_logs < 32u || (s_cd_event_logs % 128u) == 0u)) {
+                ++s_cd_event_logs;
+                printf("[EVENT-CB] f%u class=0x%08X spec=0x%04X func=0x%08X\n",
+                       g_ps1_frame, class_id, spec, ev->func);
+                fflush(stdout);
+            }
+            call_by_address(cpu, ev->func);
+        }
+    }
+}
 
 /* Display fiber entry — starts as FUN_800191E0, switches to FUN_80019844 after first load */
 static uint32_t g_display_entry = 0;  /* set by game_get_display_entry() in runtime_init */
@@ -749,6 +1278,35 @@ static int s_display_needs_restart = 0;
  * The second call double-flips the toggle (net zero) and wipes OT primitives.
  * This flag blocks any re-entrant call. */
 static int g_frame_flip_running = 0;
+
+/* Room overlay asset load state (ID 0x0D). We only need this to defer the
+ * 0x801C1688 fallback until after C778/C780 have had one real chance to
+ * initialize their CLUT-facing state from loaded room data. */
+static int g_room_clut_loaded = 0;
+static uint32_t g_room_clut_phys = 0;
+static uint32_t g_room_clut_bytes = 0;
+static int g_room_tile_cluts_uploaded = 0;
+int g_cv_left_cluts_uploaded = 0;
+static int g_room_sec3_loaded = 0;
+static uint32_t g_room_sec3_phys = 0;
+static uint32_t g_room_sec3_bytes = 0;
+static uint32_t g_room_ovl_tail_phys = 0;
+static uint32_t g_room_ovl_tail_size = 0;
+static int g_room_ovl_tail_restored = 0;
+static uint8_t g_room_ovl_tail_backup[0x3000];
+static uint32_t g_room_watch_slots[4];
+static uint32_t g_room_watch_count = 0;
+static uint8_t s_g_api_init_saved[0x140];
+static int s_g_api_init_captured = 0;
+static uint8_t s_dra_tele_saved[0x520];
+static int s_dra_tele_captured = 0;
+static int s_dra_tele_restore_pending = 0;
+static char s_dra_tele_restore_reason[64];
+static uint8_t s_dra_stage_lba_saved[0x1000];
+static int s_dra_stage_lba_captured = 0;
+static int s_dra_stage_lba_restore_pending = 0;
+static uint32_t s_state_97c98_saved = 0;
+static int s_state_97c98_captured = 0;
 
 /* Dispatch to compiled game functions — defined in tomba_dispatch.c */
 extern int psx_dispatch_compiled(CPUState* cpu, uint32_t addr);
@@ -820,11 +1378,1557 @@ static VOID WINAPI fiber_game_func(PVOID param) {
 
 /* Resolve a PS1 virtual address to a pointer into the right region.
  * Returns NULL for I/O ports (caller handles as stub). */
+static uint32_t cv_remap_palette_ops_phys(uint32_t phys) {
+    static uint32_t s_pal_ops_remap_logs = 0;
+    uint32_t pc = g_diag_cpu ? g_diag_cpu->pc : 0u;
+    if (pc >= 0x800EA538u && pc < 0x800EAD7Cu &&
+        phys >= 0x978E0u && phys < 0x980E0u) {
+        uint32_t remapped = phys - 0x2B51Cu;
+        if (++s_pal_ops_remap_logs <= 64u) {
+            printf("[PAL-BSS-REMAP] f%u pc=0x%08X phys=0x%05X -> 0x%05X ra=0x%08X\n",
+                   g_ps1_frame, pc, phys, remapped, g_diag_cpu ? g_diag_cpu->ra : 0u);
+            fflush(stdout);
+        }
+        return remapped;
+    }
+    return phys;
+}
+
+static void cv_trace_clobber_window(const char* op, uint32_t phys, uint32_t value) {
+    static uint32_t s_clobber_logs = 0;
+    int watch =
+        (phys >= 0xA8258u && phys < 0xA83DCu) ||
+        phys == 0x973ECu ||
+        (phys >= 0x13799Cu && phys < 0x1379ACu);
+    if (!watch) {
+        return;
+    }
+    if (g_ps1_frame < 1740u &&
+        value != 0x01010101u &&
+        value != 0x00000001u) {
+        return;
+    }
+    if (++s_clobber_logs <= 256u) {
+        printf("[CLB-%s] f%u addr=0x%08X val=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+               op, g_ps1_frame, 0x80000000u | phys, value,
+               g_diag_cpu ? g_diag_cpu->pc : 0u,
+               g_diag_cpu ? g_diag_cpu->ra : 0u,
+               g_diag_cpu ? g_diag_cpu->sp : 0u);
+        fflush(stdout);
+    }
+}
+
+static int cv_read_ram_u32(uint32_t addr, uint32_t* out) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys + 4u > sizeof(g_ram)) {
+        return 0;
+    }
+    memcpy(out, &g_ram[phys], 4);
+    return 1;
+}
+
+static void cv_write_ram_u32_phys(uint32_t phys, uint32_t value) {
+    if (phys + 4u <= sizeof(g_ram)) {
+        memcpy(&g_ram[phys], &value, 4);
+    }
+}
+
+static void cv_write_ram_u16_phys(uint32_t phys, uint16_t value) {
+    if (phys + 2u <= sizeof(g_ram)) {
+        memcpy(&g_ram[phys], &value, 2);
+    }
+}
+
 static uint8_t* addr_ptr(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFF;  /* strip KSEG bits */
+    phys = cv_remap_palette_ops_phys(phys);
     if (phys < 0x200000)                 return &g_ram[phys];
     if (phys >= 0x1F800000 && phys < 0x1F800400) return &g_scratch[phys & 0x3FF];
     return NULL;  /* I/O or unmapped */
+}
+
+static void cv_cache_stage_cd_table_from_ram(void) {
+    if (g_cv_stage_cd_cached) {
+        return;
+    }
+
+    memset(g_cv_stage_cd_table, 0, sizeof(g_cv_stage_cd_table));
+    memset(g_cv_stage_cd_valid, 0, sizeof(g_cv_stage_cd_valid));
+    for (uint32_t stage_id = 0; stage_id < CV_STAGE_CD_ENTRY_COUNT; stage_id++) {
+        uint32_t phys = 0xA3C40u + stage_id * (uint32_t)sizeof(cv_stage_cd_entry_t);
+        const cv_stage_cd_entry_t* e;
+        if (phys + sizeof(cv_stage_cd_entry_t) > sizeof(g_ram)) {
+            break;
+        }
+        memcpy(&g_cv_stage_cd_table[stage_id], &g_ram[phys], sizeof(cv_stage_cd_entry_t));
+        e = &g_cv_stage_cd_table[stage_id];
+        if (e->gfx_sec != 0u || e->ovl_sec != 0u || e->vh_sec != 0u) {
+            g_cv_stage_cd_valid[stage_id] = 1u;
+        }
+    }
+    g_cv_stage_cd_cached = 1;
+}
+
+static const cv_stage_cd_entry_t* cv_get_stage_cd_entry(uint32_t stage_id) {
+    if (stage_id < CV_STAGE_CD_ENTRY_COUNT && g_cv_stage_cd_valid[stage_id]) {
+        return &g_cv_stage_cd_table[stage_id];
+    }
+    if (stage_id < CV_STAGE_CD_ENTRY_COUNT) {
+        const cv_stage_cd_entry_t* e = &s_cv_stage_cd_fallback[stage_id];
+        if (e->gfx_sec != 0u || e->ovl_sec != 0u || e->vh_sec != 0u) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static uint32_t s_recent_stage_id = 0xFFFFFFFFu;
+static uint32_t s_recent_stage_frame = 0u;
+static uint32_t s_recent_stage_game_state = 0u;
+static uint32_t s_sound_tick_called_frame = UINT32_MAX;
+
+static int cv_stage_word_is_clean(uint32_t stage_word) {
+    return (stage_word & 0xFFFFFF00u) == 0u;
+}
+
+static void cv_note_recent_stage_id(uint32_t stage_id, uint32_t game_state) {
+    stage_id &= 0xFFu;
+    if (cv_get_stage_cd_entry(stage_id) == NULL) {
+        return;
+    }
+    s_recent_stage_id = stage_id;
+    s_recent_stage_frame = g_ps1_frame;
+    s_recent_stage_game_state = game_state;
+}
+
+static uint32_t cv_get_recent_stage_id(uint32_t game_state, uint32_t max_age) {
+    if (s_recent_stage_id > 0xFFu || cv_get_stage_cd_entry(s_recent_stage_id) == NULL) {
+        return 0xFFFFFFFFu;
+    }
+    if (s_recent_stage_game_state != game_state) {
+        return 0xFFFFFFFFu;
+    }
+    if ((uint32_t)(g_ps1_frame - s_recent_stage_frame) > max_age) {
+        return 0xFFFFFFFFu;
+    }
+    return s_recent_stage_id;
+}
+
+static uint32_t cv_resolve_stage_asset_id(uint32_t requested_stage, uint32_t fallback_stage) {
+    requested_stage &= 0xFFu;
+    fallback_stage &= 0xFFu;
+    if (cv_get_stage_cd_entry(requested_stage) != NULL) {
+        return requested_stage;
+    }
+    if (cv_get_stage_cd_entry(fallback_stage) != NULL) {
+        return fallback_stage;
+    }
+    return 0x45u;
+}
+
+static uint32_t cv_resolve_stage_prg_id(uint32_t stage_id_raw, uint32_t load_ovl_idx,
+                                        uint16_t tele_stage, uint32_t recent_stage_id) {
+    uint32_t stage_id = stage_id_raw & 0xFFu;
+    uint32_t load_ovl = load_ovl_idx & 0xFFu;
+    uint32_t tele = tele_stage & 0xFFu;
+    recent_stage_id &= 0xFFu;
+    if (cv_stage_word_is_clean(stage_id_raw) &&
+        cv_get_stage_cd_entry(stage_id) != NULL) {
+        return stage_id;
+    }
+    if (cv_get_stage_cd_entry(recent_stage_id) != NULL) {
+        return recent_stage_id;
+    }
+    if (cv_stage_word_is_clean(load_ovl_idx) &&
+        cv_get_stage_cd_entry(load_ovl) != NULL) {
+        return load_ovl;
+    }
+    if (cv_get_stage_cd_entry(tele) != NULL) {
+        return tele;
+    }
+    return 0x45u;
+}
+
+static int cv_is_valid_cd_file_value(uint32_t value) {
+    uint32_t type = value & 0x7FFFu;
+    if ((value & 0xFFFF0000u) != 0u) {
+        return 0;
+    }
+    return type <= 0x100u || type == 0xFFu;
+}
+
+static int cv_is_valid_cd_step_value(uint32_t value) {
+    if ((value & 0xFFFFFF00u) != 0u) {
+        return 0;
+    }
+    return value <= 10u ||
+           (value >= 0xC0u && value <= 0xC2u) ||
+           value == 0xD0u ||
+           value == 0xD1u ||
+           (value >= 0xF0u && value <= 0xF3u);
+}
+
+static int cv_should_sanitize_st0_gameplay_state(void) {
+    uint32_t game_state = 0;
+    uint32_t stage_id = 0;
+    uint32_t game_step = 0;
+    uint32_t eng_step = 0;
+
+    memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+    memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+    memcpy(&game_step, &g_ram[0x73060u], sizeof(game_step));
+    memcpy(&eng_step, &g_ram[0x3C9A4u], sizeof(eng_step));
+    return game_state == 2u &&
+           (stage_id & 0xFFu) == 0x1Fu &&
+           game_step == 3u &&
+           eng_step == 1u;
+}
+
+static void cv_dump_entity_prim_state(const char* tag, uint32_t ent_ptr) {
+    uint8_t* ent = addr_ptr(ent_ptr);
+    int32_t slot = -1;
+    if (ent_ptr >= 0x800733D8u && ent_ptr < (0x800733D8u + 0xBCu * 256u)) {
+        slot = (int32_t)((ent_ptr - 0x800733D8u) / 0xBCu);
+    }
+    if (!ent) {
+        printf("[%s] f%u ent=0x%08X slot=%d <invalid>\n", tag, g_ps1_frame, ent_ptr, slot);
+        fflush(stdout);
+        return;
+    }
+
+    float pos_x = 0.0f;
+    float pos_y = 0.0f;
+    uint32_t pfn = 0;
+    uint32_t flags = 0;
+    uint32_t parent = 0;
+    uint32_t next_part = 0;
+    int32_t prim_index = -1;
+    uint16_t z = 0;
+    uint16_t id = 0;
+    uint16_t step = 0;
+    uint16_t params = 0;
+    uint16_t palette = 0;
+    uint16_t anim_set = 0;
+    uint16_t anim_frame = 0;
+    uint8_t draw = 0;
+
+    memcpy(&pos_x, ent + 0x00, sizeof(pos_x));
+    memcpy(&pos_y, ent + 0x04, sizeof(pos_y));
+    memcpy(&palette, ent + 0x16, sizeof(palette));
+    draw = ent[0x19];
+    memcpy(&z, ent + 0x24, sizeof(z));
+    memcpy(&id, ent + 0x26, sizeof(id));
+    memcpy(&pfn, ent + 0x28, sizeof(pfn));
+    memcpy(&step, ent + 0x2C, sizeof(step));
+    memcpy(&params, ent + 0x30, sizeof(params));
+    memcpy(&flags, ent + 0x34, sizeof(flags));
+    memcpy(&anim_set, ent + 0x54, sizeof(anim_set));
+    memcpy(&anim_frame, ent + 0x56, sizeof(anim_frame));
+    memcpy(&parent, ent + 0x5C, sizeof(parent));
+    memcpy(&next_part, ent + 0x60, sizeof(next_part));
+    memcpy(&prim_index, ent + 0x64, sizeof(prim_index));
+
+    printf("[%s] f%u ent=0x%08X slot=%d id=%u step=%u params=0x%04X draw=0x%02X z=%u flags=0x%08X pfn=0x%08X prim=%d parent=0x%08X next=0x%08X pos=(%.1f,%.1f) pal=0x%04X animSet=0x%04X frame=0x%04X\n",
+           tag, g_ps1_frame, ent_ptr, slot, id, step, params, draw, z, flags, pfn,
+           prim_index, parent, next_part, pos_x, pos_y, palette, anim_set, anim_frame);
+    fflush(stdout);
+
+    if (prim_index >= 0 && prim_index < 0x500) {
+        uint32_t prim_ptr = 0x8009CE78u + (uint32_t)prim_index * 0x34u;
+        uint8_t* prim = addr_ptr(prim_ptr);
+        if (prim) {
+            uint32_t next = 0;
+            uint16_t clut = 0;
+            uint16_t tpage = 0;
+            uint16_t priority = 0;
+            uint16_t draw_mode = 0;
+            uint8_t type = 0;
+            int16_t x0 = 0, y0 = 0, x1 = 0, y1 = 0, x2 = 0, y2 = 0, x3 = 0, y3 = 0;
+
+            memcpy(&next, prim + 0x00, sizeof(next));
+            type = prim[0x07];
+            memcpy(&x0, prim + 0x08, sizeof(x0));
+            memcpy(&y0, prim + 0x0A, sizeof(y0));
+            memcpy(&clut, prim + 0x0E, sizeof(clut));
+            memcpy(&x1, prim + 0x14, sizeof(x1));
+            memcpy(&y1, prim + 0x16, sizeof(y1));
+            memcpy(&tpage, prim + 0x1A, sizeof(tpage));
+            memcpy(&x2, prim + 0x20, sizeof(x2));
+            memcpy(&y2, prim + 0x22, sizeof(y2));
+            memcpy(&priority, prim + 0x26, sizeof(priority));
+            memcpy(&x3, prim + 0x2C, sizeof(x3));
+            memcpy(&y3, prim + 0x2E, sizeof(y3));
+            memcpy(&draw_mode, prim + 0x32, sizeof(draw_mode));
+
+            printf("[%s-PRIM] f%u primPtr=0x%08X next=0x%08X type=%u pri=0x%04X draw=0x%04X clut=0x%04X tpage=0x%04X xy=(%d,%d)(%d,%d)(%d,%d)(%d,%d)\n",
+                   tag, g_ps1_frame, prim_ptr, next, type, priority, draw_mode, clut, tpage,
+                   x0, y0, x1, y1, x2, y2, x3, y3);
+            fflush(stdout);
+        }
+    }
+}
+
+static int cv_cd_read_overlaps_usedisk(uint32_t dst_begin, uint32_t byte_count);
+static void cv_force_usedisk(const char* reason);
+static int cv_should_force_usedisk_for_cd_tag(const char* tag);
+
+static int cv_read_cd_bytes(uint32_t start_sector, uint32_t byte_count, uint8_t* dest, size_t dest_capacity, const char* tag) {
+    uint8_t sec_buf[CV_CD_SECTOR_BYTES];
+    uint32_t sectors_needed = (byte_count + CV_CD_SECTOR_BYTES - 1u) / CV_CD_SECTOR_BYTES;
+
+    if (byte_count > dest_capacity) {
+        fprintf(stderr, "[%s] destination too small: need 0x%X, have 0x%zX\n",
+                tag, byte_count, dest_capacity);
+        fflush(stderr);
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < sectors_needed; i++) {
+        uint32_t copy_size = CV_CD_SECTOR_BYTES;
+        if (!psx_cdrom_read_sector(start_sector + i, sec_buf)) {
+            fprintf(stderr, "[%s] FAILED reading sector %u\n", tag, start_sector + i);
+            fflush(stderr);
+            return 0;
+        }
+        if (i == sectors_needed - 1u) {
+            uint32_t rem = byte_count % CV_CD_SECTOR_BYTES;
+            if (rem != 0u) {
+                copy_size = rem;
+            }
+        }
+        memcpy(dest + i * CV_CD_SECTOR_BYTES, sec_buf, copy_size);
+    }
+    if (cv_cd_read_overlaps_usedisk((uint32_t)(dest - g_ram), byte_count) &&
+        cv_should_force_usedisk_for_cd_tag(tag)) {
+        cv_force_usedisk(tag);
+    }
+    return 1;
+}
+
+static void cv_upload_tileset_blocks(const uint8_t* data, uint32_t byte_count, int y_base) {
+    uint32_t block_count = byte_count / 0x2000u;
+    if (block_count > 32u) {
+        block_count = 32u;
+    }
+    for (uint32_t i = 0; i < block_count; i++) {
+        int tile_y = y_base + ((i & 2u) ? 0x80 : 0x00);
+        psx_vram_upload(s_cv_tileset_x[i], tile_y, 32, 128,
+                        (const uint16_t*)(data + i * 0x2000u));
+    }
+}
+
+static const uint16_t s_cv_post_clut_row[16] = {
+    0x0000, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+};
+
+static int cv_store_vram_rect_to_ram(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                     uint32_t dst_phys, const char* tag) {
+    static uint32_t s_vram_store_fail_logs = 0;
+    static uint32_t s_vram_store_ok_logs = 0;
+    uint32_t pixels = (uint32_t)w * (uint32_t)h;
+    uint64_t bytes = (uint64_t)pixels * sizeof(uint16_t);
+    if ((uint64_t)dst_phys + bytes > sizeof(g_ram)) {
+        if (++s_vram_store_fail_logs <= 8u) {
+            fprintf(stderr,
+                    "[VRAM-STORE] %s dst overflow phys=0x%X rect=(%u,%u,%u,%u) bytes=0x%llX\n",
+                    tag, dst_phys, (unsigned)x, (unsigned)y, (unsigned)w, (unsigned)h,
+                    (unsigned long long)bytes);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    int copied = psx_debug_read_vram(x, y, w, h, (uint16_t*)&g_ram[dst_phys], (int)pixels);
+    if (copied != (int)pixels) {
+        if (++s_vram_store_fail_logs <= 8u) {
+            fprintf(stderr,
+                    "[VRAM-STORE] %s readback short rect=(%u,%u,%u,%u) copied=%d expected=%u\n",
+                    tag, (unsigned)x, (unsigned)y, (unsigned)w, (unsigned)h, copied,
+                    (unsigned)pixels);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    if (++s_vram_store_ok_logs <= 8u) {
+        fprintf(stderr,
+                "[VRAM-STORE] %s rect=(%u,%u,%u,%u) -> RAM 0x%08X\n",
+                tag, (unsigned)x, (unsigned)y, (unsigned)w, (unsigned)h,
+                dst_phys + 0x80000000u);
+        fflush(stderr);
+    }
+    return 1;
+}
+
+static int cv_is_title_like_cdrom_file(const cdrom_vfd_t* vfd) {
+    return strcmp(vfd->name, "BIN/F_TITLE0.BIN") == 0 ||
+           strcmp(vfd->name, "BIN/F_PROLO0.BIN") == 0;
+}
+
+static int cv_should_restore_dra_tele_after_leave_menu(const cdrom_vfd_t* vfd) {
+    return strcmp(vfd->name, "F_SEL.BIN") == 0;
+}
+
+static void cv_upload_title_like_cd_file(const uint8_t* data, uint32_t byte_count, const char* name) {
+    uint32_t first_half = byte_count;
+    if (first_half > 0x40000u) {
+        first_half = 0x40000u;
+    }
+    if (first_half != 0u) {
+        cv_upload_tileset_blocks(data, first_half, 0);
+    }
+    if (byte_count > 0x40000u) {
+        cv_upload_tileset_blocks(data + 0x40000u, byte_count - 0x40000u, 0x100);
+    }
+    /* CdCallback_0 finalization: LoadImage(&g_Vram.D_800ACD98, D_800A04CC). */
+    psx_vram_upload(0x380, 0x180, 16, 1, s_cv_post_clut_row);
+    fprintf(stderr,
+            "[CD-TITLE-BIN] %s bytes=0x%X -> VRAM blocks uploaded\n",
+            name, byte_count);
+    fflush(stderr);
+}
+
+static uint8_t s_cd_title_ram_preserve[0x40000u];
+static uint32_t s_cd_title_restore_addr = 0u;
+static uint32_t s_cd_title_restore_size = 0u;
+static int s_cd_title_restore_pending = 0;
+static uint8_t s_stage_chr_sim_preserve[CV_STAGE_CHR_BYTES];
+static uint8_t s_menu_stage_regs_preserve[0x524u];
+static uint8_t s_menu_stage_table_preserve[0x190u];
+
+static void cv_capture_stage_chr_sim_state(void) {
+    memcpy(s_stage_chr_sim_preserve, &g_ram[CV_SIM_PTR_PHYS], sizeof(s_stage_chr_sim_preserve));
+}
+
+static void cv_restore_stage_chr_sim_state(const char* reason) {
+    memcpy(&g_ram[CV_SIM_PTR_PHYS], s_stage_chr_sim_preserve, sizeof(s_stage_chr_sim_preserve));
+
+    {
+        static uint32_t s_stage_chr_sim_restore_logs = 0;
+        if (++s_stage_chr_sim_restore_logs <= 16u || (s_stage_chr_sim_restore_logs % 64u) == 0u) {
+            uint32_t usedisk = 0;
+            memcpy(&usedisk, &g_ram[0x978ACu], sizeof(usedisk));
+            fprintf(stderr,
+                    "[STAGE-CHR-SIM-RESTORE] %s usedisk=0x%08X\n",
+                    reason ? reason : "<unknown>", usedisk);
+            fflush(stderr);
+        }
+    }
+}
+
+static void cv_capture_menu_stage_state(void) {
+    memcpy(s_menu_stage_regs_preserve, &g_ram[0x973ECu], sizeof(s_menu_stage_regs_preserve));
+    memcpy(s_menu_stage_table_preserve, &g_ram[0xA8258u], sizeof(s_menu_stage_table_preserve));
+}
+
+static void cv_restore_menu_stage_state(const char* reason) {
+    memcpy(&g_ram[0x973ECu], s_menu_stage_regs_preserve, sizeof(s_menu_stage_regs_preserve));
+    memcpy(&g_ram[0xA8258u], s_menu_stage_table_preserve, sizeof(s_menu_stage_table_preserve));
+
+    {
+        static uint32_t s_menu_stage_restore_logs = 0;
+        if (++s_menu_stage_restore_logs <= 16u || (s_menu_stage_restore_logs % 64u) == 0u) {
+            uint32_t menu_step = 0;
+            uint32_t menu_vis = 0;
+            memcpy(&menu_step, &g_ram[0x978F8u], sizeof(menu_step));
+            memcpy(&menu_vis, &g_ram[0x973ECu], sizeof(menu_vis));
+            fprintf(stderr,
+                    "[MENU-STAGE-RESTORE] %s menustep=0x%08X menuvis=0x%08X\n",
+                    reason ? reason : "<unknown>", menu_step, menu_vis);
+            fflush(stderr);
+        }
+    }
+}
+
+static int cv_cd_read_overlaps_usedisk(uint32_t dst_begin, uint32_t byte_count) {
+    const uint64_t usedisk_begin = 0x978ACu;
+    const uint64_t usedisk_end = usedisk_begin + 4u;
+    const uint64_t begin = dst_begin;
+    const uint64_t end = begin + byte_count;
+
+    if (byte_count != 0u && begin < usedisk_end && end > usedisk_begin) {
+        return 1;
+    }
+    return 0;
+}
+
+static void cv_force_usedisk(const char* reason) {
+    uint32_t old_value = 0;
+    const uint32_t usedisk_phys = 0x978ACu;
+    const uint32_t one = 1u;
+
+    memcpy(&old_value, &g_ram[usedisk_phys], sizeof(old_value));
+    if (old_value == one) {
+        return;
+    }
+
+    memcpy(&g_ram[usedisk_phys], &one, sizeof(one));
+
+    {
+        static uint32_t s_usedisk_logs = 0;
+        if (++s_usedisk_logs <= 16u || (s_usedisk_logs % 64u) == 0u) {
+            fprintf(stderr,
+                    "[USEDISK-FORCE] %s old=0x%08X new=0x%08X\n",
+                    reason ? reason : "<unknown>", old_value, one);
+            fflush(stderr);
+        }
+    }
+}
+
+static int cv_should_force_usedisk_for_cd_tag(const char* tag) {
+    return tag != NULL && strcmp(tag, "CD-STAGE-CHR") == 0;
+}
+
+static int cv_should_force_usedisk_for_cdrom_file(const cdrom_vfd_t* vfd) {
+    if (vfd == NULL) {
+        return 0;
+    }
+    return cv_is_title_like_cdrom_file(vfd) ||
+           strcmp(vfd->name, "BIN/F_SEL.BIN") == 0;
+}
+
+static int cv_load_stage_chr_cd_file(uint32_t stage_id, int is_preload) {
+    const cv_stage_cd_entry_t* e = cv_get_stage_cd_entry(stage_id);
+    uint8_t* sim_ptr = &g_ram[CV_SIM_PTR_PHYS];
+    const int preserve_menu_stage_state = (stage_id == 0x45u);
+
+    if (e == NULL || e->gfx_sec == 0u) {
+        fprintf(stderr, "[CD-STAGE-CHR] stage=0x%02X missing gfx entry\n", stage_id);
+        fflush(stderr);
+        return 0;
+    }
+    if (preserve_menu_stage_state) {
+        cv_capture_stage_chr_sim_state();
+        cv_capture_menu_stage_state();
+    }
+    if (!cv_read_cd_bytes(e->gfx_sec, CV_STAGE_CHR_BYTES,
+                          sim_ptr, sizeof(g_ram) - CV_SIM_PTR_PHYS, "CD-STAGE-CHR")) {
+        return 0;
+    }
+
+    cv_upload_tileset_blocks(sim_ptr, CV_STAGE_CHR_BYTES, 0);
+    cv_store_vram_rect_to_ram(0x200u, 0x0F0u, CV_CLUT_RECT_W, CV_CLUT_RECT_H,
+                              CV_G_CLUT0_PHYS, "CD-STAGE-CLUT0");
+    if (preserve_menu_stage_state) {
+        cv_restore_stage_chr_sim_state("CD-STAGE-CHR");
+        cv_restore_menu_stage_state("CD-STAGE-CHR");
+    }
+    fprintf(stderr,
+            "[CD-STAGE-CHR] %s stage=0x%02X gfxSec=0x%X bytes=0x%X sim=0x%08X -> VRAM tiles uploaded\n",
+            is_preload ? "PRELOAD" : "LOAD", stage_id, e->gfx_sec, CV_STAGE_CHR_BYTES,
+            CV_SIM_PTR_PHYS + 0x80000000u);
+    fflush(stderr);
+    return 1;
+}
+
+static int cv_load_game_chr_cd_file(uint32_t stage_id, uint32_t playable_character) {
+    const uint32_t start_sector = (stage_id == 0x1Fu || playable_character != 0u)
+        ? 0x6252u
+        : 0x61CEu;
+    const int is_richter = (stage_id == 0x1Fu || playable_character != 0u);
+    const uint32_t prg_sector = is_richter ? 0x64D6u : 0x616Au;
+    const uint32_t prg_bytes = is_richter ? 0x39A58u : 0x31BECu;
+    const uint32_t prg_phys = CV_RIC_PRG_PHYS;
+    uint8_t* stage_prg_ptr = &g_ram[CV_STAGE_PRG_PHYS];
+
+    if (!cv_read_cd_bytes(start_sector, CV_GAME_CHR_BYTES,
+                          stage_prg_ptr, sizeof(g_ram) - CV_STAGE_PRG_PHYS, "CD-GAME-CHR")) {
+        return 0;
+    }
+    if (prg_phys + prg_bytes > sizeof(g_ram)) {
+        fprintf(stderr,
+                "[CD-GAME-PRG] player=%u stage=0x%02X dst overflow phys=0x%X bytes=0x%X\n",
+                playable_character, stage_id, prg_phys, prg_bytes);
+        fflush(stderr);
+        return 0;
+    }
+    if (!cv_read_cd_bytes(prg_sector, prg_bytes,
+                          &g_ram[prg_phys], sizeof(g_ram) - prg_phys,
+                          is_richter ? "CD-RICHTER-PRG" : "CD-ALUCARD-PRG")) {
+        return 0;
+    }
+
+    cv_upload_tileset_blocks(stage_prg_ptr, CV_STAGE_CHR_BYTES, 0x100);
+    psx_vram_upload(0x380, 0x180, 16, 1, s_cv_post_clut_row);
+    psx_vram_upload(0, 240, CV_CLUT_RECT_W, CV_CLUT_RECT_H,
+                    (const uint16_t*)(stage_prg_ptr + CV_STAGE_CHR_BYTES));
+    cv_store_vram_rect_to_ram(0x000u, 0x0F0u, CV_CLUT_RECT_W, CV_CLUT_RECT_H,
+                              CV_G_CLUT1_PHYS, "CD-GAME-CLUT1");
+    fprintf(stderr,
+            "[CD-GAME-CHR] stage=0x%02X player=%u chrSec=0x%X chrBytes=0x%X stagePrg=0x%08X tail=0x%08X prgSec=0x%X prgBytes=0x%X -> canonical VRAM+CLUT+player PRG loaded\n",
+            stage_id, playable_character, start_sector, CV_GAME_CHR_BYTES,
+            CV_STAGE_PRG_PHYS + 0x80000000u,
+            CV_STAGE_PRG_PHYS + CV_STAGE_CHR_BYTES + 0x80000000u,
+            prg_sector, prg_bytes);
+    fflush(stderr);
+    return 1;
+}
+
+static uint32_t cv_call_preserve_cpu_state(CPUState* cpu, uint32_t addr,
+                                           uint32_t a0, uint32_t a1,
+                                           uint32_t a2, uint32_t a3) {
+    CPUState saved_cpu = *cpu;
+    uint32_t ret = 0;
+
+    cpu->a0 = a0;
+    cpu->a1 = a1;
+    cpu->a2 = a2;
+    cpu->a3 = a3;
+    call_by_address(cpu, addr);
+    ret = cpu->v0;
+    *cpu = saved_cpu;
+    return ret;
+}
+
+static int cv_wait_for_vab_transfer(CPUState* cpu, const char* tag) {
+    uint32_t ret = 0;
+
+    for (uint32_t attempt = 0; attempt < 4096u; ++attempt) {
+        ret = cv_call_preserve_cpu_state(cpu, CV_FUNC_SSVABTRANSCOMPLETED, 0u, 0u, 0u, 0u);
+        if ((int32_t)ret == 1) {
+            return 1;
+        }
+    }
+
+    fprintf(stderr,
+            "[%s] timed out waiting for SsVabTransCompleted ret=0x%08X\n",
+            tag ? tag : "CD-STAGE-SFX", ret);
+    fflush(stderr);
+    return 0;
+}
+
+static int cv_get_stage_seq_info(uint32_t stage_id, int8_t* seq_idx_out,
+                                 uint32_t* loc_out, uint32_t* size_out,
+                                 uint32_t* seq_reg_id_out) {
+    uint32_t stage_phys = 0;
+    uint32_t seq_phys = 0;
+    int8_t seq_idx = -1;
+    uint32_t stage_idx = stage_id & 0xFFu;
+
+    if (stage_idx >= CV_DRA_STAGE_LBA_COUNT) {
+        return 0;
+    }
+
+    stage_phys = CV_DRA_STAGE_LBA_PHYS + stage_idx * CV_DRA_STAGE_LBA_STRIDE;
+    if (stage_phys + CV_DRA_STAGE_LBA_STRIDE > sizeof(g_ram)) {
+        return 0;
+    }
+
+    seq_idx = (int8_t)g_ram[stage_phys + CV_DRA_STAGE_LBA_SEQ_IDX_OFF];
+    if (seq_idx < 0) {
+        return 0;
+    }
+
+    seq_phys = CV_DRA_STAGE_SEQ_TABLE_PHYS +
+               (uint32_t)(uint8_t)seq_idx * CV_DRA_STAGE_SEQ_ENTRY_SIZE;
+    if (seq_phys + CV_DRA_STAGE_SEQ_ENTRY_SIZE > sizeof(g_ram)) {
+        return 0;
+    }
+
+    if (seq_idx_out != NULL) {
+        *seq_idx_out = seq_idx;
+    }
+    if (loc_out != NULL) {
+        memcpy(loc_out, &g_ram[seq_phys + 0u], 4);
+    }
+    if (size_out != NULL) {
+        memcpy(size_out, &g_ram[seq_phys + 4u], 4);
+    }
+    if (seq_reg_id_out != NULL) {
+        memcpy(seq_reg_id_out, &g_ram[seq_phys + CV_DRA_STAGE_SEQ_REG_ID_OFF], 4);
+    }
+    return 1;
+}
+
+static int cv_complete_stage_seq_cd_file(CPUState* cpu, uint32_t stage_id) {
+    int8_t seq_idx = -1;
+    uint32_t seq_loc = 0;
+    uint32_t seq_size = 0;
+    uint32_t seq_reg_id = 0;
+
+    if (!cv_get_stage_seq_info(stage_id, &seq_idx, &seq_loc, &seq_size, &seq_reg_id)) {
+        return 1;
+    }
+    if (seq_size == 0u) {
+        fprintf(stderr,
+                "[CD-STAGE-SEQ] stage=0x%02X seqIdx=%d has zero size\n",
+                stage_id, (int)seq_idx);
+        fflush(stderr);
+        return 0;
+    }
+    if (seq_size > CV_DRA_APQES1_BYTES) {
+        fprintf(stderr,
+                "[CD-STAGE-SEQ] stage=0x%02X seqIdx=%d size=0x%X exceeds aPqes_1 buffer 0x%X\n",
+                stage_id, (int)seq_idx, seq_size, CV_DRA_APQES1_BYTES);
+        fflush(stderr);
+        return 0;
+    }
+    if (!cv_read_cd_bytes(seq_loc, seq_size,
+                          &g_ram[CV_DRA_APQES1_PHYS], sizeof(g_ram) - CV_DRA_APQES1_PHYS,
+                          "CD-STAGE-SEQ")) {
+        return 0;
+    }
+
+    (void)cv_call_preserve_cpu_state(cpu, CV_FUNC_REGISTER_SEQ,
+                                     CV_DRA_APQES1_ADDR, seq_reg_id, 0u, 0u);
+    fprintf(stderr,
+            "[CD-STAGE-SEQ] stage=0x%02X seqIdx=%d loc=0x%X size=0x%X reg=0x%X buf=0x%08X -> registered\n",
+            stage_id, (int)seq_idx, seq_loc, seq_size, seq_reg_id, CV_DRA_APQES1_ADDR);
+    fflush(stderr);
+    return 1;
+}
+
+static int cv_complete_stage_sfx_cd_file(CPUState* cpu, uint32_t stage_id) {
+    const cv_stage_cd_entry_t* e = cv_get_stage_cd_entry(stage_id);
+    const uint32_t vb_scratch_capacity = CV_CD_STREAM_SCRATCH_BYTES;
+    uint32_t vb_sec = 0;
+    uint32_t open_ret = 0;
+    uint32_t trans_ret = 0;
+    uint32_t vh_magic = 0;
+    uint32_t in_transfer_before = 0;
+    uint32_t in_transfer_after_close = 0;
+    uint32_t vab_start_before = 0;
+    uint32_t vab_start_after_close = 0;
+    uint8_t vab_used_before = 0;
+    uint8_t vab_used_after_close = 0;
+
+    if (e == NULL || e->vh_sec == 0u) {
+        fprintf(stderr, "[CD-STAGE-SFX] stage=0x%02X missing VH/VB entry\n", stage_id);
+        fflush(stderr);
+        return 0;
+    }
+    if (e->vh_size == 0u || e->vb_size == 0u) {
+        fprintf(stderr,
+                "[CD-STAGE-SFX] stage=0x%02X invalid sizes vhLen=0x%X vbLen=0x%X\n",
+                stage_id, e->vh_size, e->vb_size);
+        fflush(stderr);
+        return 0;
+    }
+    if (e->vh_size > CV_DRA_APBAV2_BYTES) {
+        fprintf(stderr,
+                "[CD-STAGE-SFX] stage=0x%02X vhLen=0x%X exceeds aPbav_2 buffer 0x%X\n",
+                stage_id, e->vh_size, CV_DRA_APBAV2_BYTES);
+        fflush(stderr);
+        return 0;
+    }
+    if (vb_scratch_capacity == 0u) {
+        fprintf(stderr,
+                "[CD-STAGE-SFX] stage=0x%02X has no safe VB scratch capacity\n",
+                stage_id);
+        fflush(stderr);
+        return 0;
+    }
+
+    if (!cv_wait_for_vab_transfer(cpu, "CD-STAGE-SFX-WAIT-BEFORE")) {
+        return 0;
+    }
+    memcpy(&in_transfer_before, &g_ram[CV_SPU_IN_TRANSFER_PHYS], 4);
+    vab_used_before = g_ram[CV_SVM_VAB_USED_PHYS + CV_STAGE_SFX_VAB_ID];
+    memcpy(&vab_start_before, &g_ram[CV_SVM_VAB_START_PHYS + CV_STAGE_SFX_VAB_ID * 4u], 4);
+    (void)cv_call_preserve_cpu_state(cpu, CV_FUNC_SSVABCLOSE, CV_STAGE_SFX_VAB_ID, 0u, 0u, 0u);
+    memcpy(&in_transfer_after_close, &g_ram[CV_SPU_IN_TRANSFER_PHYS], 4);
+    vab_used_after_close = g_ram[CV_SVM_VAB_USED_PHYS + CV_STAGE_SFX_VAB_ID];
+    memcpy(&vab_start_after_close, &g_ram[CV_SVM_VAB_START_PHYS + CV_STAGE_SFX_VAB_ID * 4u], 4);
+    if (vab_used_after_close != 0u) {
+        uint32_t zero = 0;
+        uint32_t one = 1u;
+        uint8_t old_used = vab_used_after_close;
+        uint32_t old_start = vab_start_after_close;
+
+        g_ram[CV_SVM_VAB_USED_PHYS + CV_STAGE_SFX_VAB_ID] = 0u;
+        memcpy(&g_ram[CV_SVM_VAB_VH_PHYS + CV_STAGE_SFX_VAB_ID * 4u], &zero, 4);
+        memcpy(&g_ram[CV_SVM_VAB_TOTAL_PHYS + CV_STAGE_SFX_VAB_ID * 4u], &zero, 4);
+        memcpy(&g_ram[CV_SVM_VAB_START_PHYS + CV_STAGE_SFX_VAB_ID * 4u], &zero, 4);
+        memcpy(&g_ram[CV_SVM_BRR_START_ADDR_PHYS + CV_STAGE_SFX_VAB_ID * 4u], &zero, 4);
+        memcpy(&g_ram[CV_SPU_IN_TRANSFER_PHYS], &one, 4);
+        vab_used_after_close = 0u;
+        vab_start_after_close = 0u;
+        in_transfer_after_close = one;
+        fprintf(stderr,
+                "[CD-STAGE-SFX] repaired libsnd slot vab=%u oldUsed=%u oldStart=0x%X\n",
+                CV_STAGE_SFX_VAB_ID, (unsigned)old_used, old_start);
+        fflush(stderr);
+    }
+
+    if (!cv_read_cd_bytes(e->vh_sec, e->vh_size,
+                          &g_ram[CV_DRA_APBAV2_PHYS], sizeof(g_ram) - CV_DRA_APBAV2_PHYS,
+                          "CD-STAGE-SFX-VH")) {
+        return 0;
+    }
+    memcpy(&vh_magic, &g_ram[CV_DRA_APBAV2_PHYS], 4);
+    open_ret = cv_call_preserve_cpu_state(cpu, CV_FUNC_SSVABOPENHEADSTICKY,
+                                          CV_DRA_APBAV2_ADDR, CV_STAGE_SFX_VAB_ID,
+                                          CV_STAGE_SFX_SPU_ADDR, 0u);
+    if ((int32_t)open_ret < 0) {
+        fprintf(stderr,
+                "[CD-STAGE-SFX] stage=0x%02X SsVabOpenHeadSticky failed ret=%d vhMagic=0x%08X inTransfer=%u->%u used=%u->%u start=0x%X->0x%X\n",
+                stage_id, (int32_t)open_ret, vh_magic,
+                in_transfer_before, in_transfer_after_close,
+                (unsigned)vab_used_before, (unsigned)vab_used_after_close,
+                vab_start_before, vab_start_after_close);
+        fflush(stderr);
+        return 0;
+    }
+
+    vb_sec = e->vh_sec + ((e->vh_size + CV_CD_SECTOR_BYTES - 1u) / CV_CD_SECTOR_BYTES);
+    {
+        uint32_t vb_bytes_remaining = e->vb_size;
+        uint32_t vb_bytes_loaded = 0;
+
+        while (vb_bytes_remaining != 0u) {
+            uint32_t vb_chunk_bytes =
+                (vb_bytes_remaining > vb_scratch_capacity) ? vb_scratch_capacity
+                                                           : vb_bytes_remaining;
+            uint32_t vb_chunk_lba = vb_sec + (vb_bytes_loaded / CV_CD_SECTOR_BYTES);
+
+            if (!cv_read_cd_bytes(vb_chunk_lba, vb_chunk_bytes,
+                                  &g_ram[CV_CD_STREAM_SCRATCH_PHYS], vb_scratch_capacity,
+                                  "CD-STAGE-SFX-VB")) {
+                return 0;
+            }
+            trans_ret = cv_call_preserve_cpu_state(cpu, CV_FUNC_SSVABTRANSBODYPARTLY,
+                                                   CV_CD_STREAM_SCRATCH_ADDR,
+                                                   vb_chunk_bytes,
+                                                   CV_STAGE_SFX_VAB_ID, 0u);
+            if ((int32_t)trans_ret == -1) {
+                uint32_t vab_start_now = 0;
+                memcpy(&vab_start_now,
+                       &g_ram[CV_SVM_VAB_START_PHYS + CV_STAGE_SFX_VAB_ID * 4u], 4);
+                fprintf(stderr,
+                        "[CD-STAGE-SFX] stage=0x%02X SsVabTransBodyPartly failed ret=%d chunkOff=0x%X chunkLen=0x%X used=%u start=0x%X\n",
+                        stage_id, (int32_t)trans_ret, vb_bytes_loaded, vb_chunk_bytes,
+                        (unsigned)g_ram[CV_SVM_VAB_USED_PHYS + CV_STAGE_SFX_VAB_ID],
+                        vab_start_now);
+                fflush(stderr);
+                return 0;
+            }
+            vb_bytes_loaded += vb_chunk_bytes;
+            vb_bytes_remaining -= vb_chunk_bytes;
+        }
+
+        if ((int32_t)trans_ret == -2) {
+            fprintf(stderr,
+                    "[CD-STAGE-SFX] stage=0x%02X VB transfer ended incomplete after 0x%X bytes\n",
+                    stage_id, e->vb_size);
+            fflush(stderr);
+            return 0;
+        }
+    }
+    if (!cv_wait_for_vab_transfer(cpu, "CD-STAGE-SFX-WAIT-AFTER")) {
+        return 0;
+    }
+
+    fprintf(stderr,
+            "[CD-STAGE-SFX] stage=0x%02X vh=0x%X vhLen=0x%X vb=0x%X vbLen=0x%X vab=%u spu=0x%X -> loaded via SsVab*\n",
+            stage_id, e->vh_sec, e->vh_size, vb_sec, e->vb_size,
+            CV_STAGE_SFX_VAB_ID, CV_STAGE_SFX_SPU_ADDR);
+    fflush(stderr);
+    return 1;
+}
+
+static void cv_install_room_clut_terminator(void) {
+    uint32_t term_addr_phys = 0x1C4000u;
+    uint16_t term_val = 0xFFFEu;
+    memcpy(&g_ram[term_addr_phys], &term_val, 2);
+    term_val = 0xFFFFu;
+    memcpy(&g_ram[term_addr_phys + 2], &term_val, 2);
+    {
+        uint32_t term_ptr = 0x801C4000u;
+        memcpy(&g_ram[0x1C1688], &term_ptr, 4);
+        memcpy(&g_ram[0x1C168C], &term_ptr, 4);
+    }
+}
+
+static void cv_seed_left_entity_cluts(void) {
+    static int s_left_cluts_attempted = 0;
+    static uint16_t s_left_clut_vram[256 * 16];
+
+    if (g_cv_left_cluts_uploaded || s_left_cluts_attempted) {
+        return;
+    }
+    s_left_cluts_attempted = 1;
+
+    uint32_t start_lba = 0;
+    uint32_t file_size = 0;
+    if (!psx_cdrom_find_file("BIN/F_GAME.BIN", &start_lba, &file_size)) {
+        printf("[CLUT-FIX] F_GAME.BIN not found; left CLUT upload skipped\n");
+        fflush(stdout);
+        return;
+    }
+    if (file_size < 0x2000u) {
+        printf("[CLUT-FIX] F_GAME.BIN too small for left CLUT upload (size=0x%X)\n", file_size);
+        fflush(stdout);
+        return;
+    }
+
+    uint32_t clut_lba = start_lba + ((file_size - 0x2000u) / 2048u);
+    for (uint32_t si = 0; si < 4u; si++) {
+        uint8_t sec_buf[2048];
+        if (!psx_cdrom_read_sector(clut_lba + si, sec_buf)) {
+            printf("[CLUT-FIX] Failed reading F_GAME.BIN CLUT sector %u\n", clut_lba + si);
+            fflush(stdout);
+            return;
+        }
+        memcpy((uint8_t*)s_left_clut_vram + si * 2048u, sec_buf, 2048u);
+    }
+
+    psx_vram_upload(0, 240, 256, 16, s_left_clut_vram);
+    g_cv_left_cluts_uploaded = 1;
+    printf("[CLUT-FIX] Uploaded F_GAME.BIN left CLUTs to VRAM (0,240)-(255,255)\n");
+    fflush(stdout);
+}
+
+static int cv_load_weapon_cd_file(uint32_t slot, int32_t raw_weapon_id) {
+    enum {
+        CV_WEAPON_SECTOR_STRIDE = 14u,
+        CV_WEAPON_CHR_SECTORS = 8u,
+        CV_WEAPON_PRG_SECTORS = 6u,
+        CV_WEAPON_CHR_BYTES = CV_WEAPON_CHR_SECTORS * 2048u,
+        CV_WEAPON_PRG_BYTES = CV_WEAPON_PRG_SECTORS * 2048u,
+    };
+    /* US disc layout from sotn-decomp src\dra\cd.c:
+     * CdFile_Weapon0 base LBA = 0x6582, CdFile_Weapon1 base LBA = 0x68BC.
+     * Each weapon occupies 14 sectors: 8 sectors of CHR followed by 6 sectors of PRG. */
+    const uint32_t base_sector = (slot == 0u) ? 0x6582u : 0x68BCu;
+    const uint32_t chr_phys = (slot == 0u) ? 0x7EFE4u : 0x82FE4u;   /* g_Pix[0] / g_Pix[2] */
+    const uint32_t prg_phys = (slot == 0u) ? 0x17A000u : 0x17D000u; /* WEAPON0_PTR / WEAPON1_PTR */
+    const int vram_y = (slot == 0u) ? 0x100 : 0x180;
+    uint32_t weapon_id = 1u;
+    uint32_t start_sector;
+    uint8_t sec_buf[2048];
+
+    if (raw_weapon_id >= 0 && (uint32_t)raw_weapon_id != 0xFFu) {
+        weapon_id = (uint32_t)raw_weapon_id;
+    }
+    start_sector = base_sector + weapon_id * CV_WEAPON_SECTOR_STRIDE;
+
+    for (uint32_t i = 0; i < CV_WEAPON_CHR_SECTORS; i++) {
+        if (!psx_cdrom_read_sector(start_sector + i, sec_buf)) {
+            fprintf(stderr,
+                    "[CD-WEAPON] slot=%u id=%u FAILED reading CHR sector %u\n",
+                    slot, weapon_id, start_sector + i);
+            fflush(stderr);
+            return 0;
+        }
+        trace_suspicious_code_write("CD-WEAPON-CHR", chr_phys + i * 2048u, (uint32_t)sizeof(sec_buf), *(const uint32_t*)sec_buf);
+        memcpy(&g_ram[chr_phys + i * 2048u], sec_buf, sizeof(sec_buf));
+    }
+    for (uint32_t i = 0; i < CV_WEAPON_PRG_SECTORS; i++) {
+        if (!psx_cdrom_read_sector(start_sector + CV_WEAPON_CHR_SECTORS + i, sec_buf)) {
+            fprintf(stderr,
+                    "[CD-WEAPON] slot=%u id=%u FAILED reading PRG sector %u\n",
+                    slot, weapon_id, start_sector + CV_WEAPON_CHR_SECTORS + i);
+            fflush(stderr);
+            return 0;
+        }
+        trace_suspicious_code_write("CD-WEAPON-PRG", prg_phys + i * 2048u, (uint32_t)sizeof(sec_buf), *(const uint32_t*)sec_buf);
+        memcpy(&g_ram[prg_phys + i * 2048u], sec_buf, sizeof(sec_buf));
+    }
+
+    psx_vram_upload(0x240, vram_y, 64, 128, (const uint16_t*)&g_ram[chr_phys]);
+    fprintf(stderr,
+            "[CD-WEAPON] slot=%u raw=%d id=%u sectors=%u..%u chr=0x%08X(%u) prg=0x%08X(%u)\n",
+            slot, raw_weapon_id, weapon_id, start_sector,
+            start_sector + CV_WEAPON_SECTOR_STRIDE - 1u,
+            0x80000000u | chr_phys, CV_WEAPON_CHR_BYTES,
+            0x80000000u | prg_phys, CV_WEAPON_PRG_BYTES);
+    fflush(stderr);
+    return 1;
+}
+
+static int cv_load_servant_cd_file(int32_t raw_servant_idx) {
+    static const uint32_t s_servant_chr_lba[] = {
+        0x7248u, 0x728Bu, 0x72CEu, 0x7311u, 0x7350u, 0x7392u, 0x73D5u,
+    };
+    enum {
+        CV_SERVANT_CHR0_SECTORS = 8u,
+        CV_SERVANT_CHR1_SECTORS = 4u,
+        CV_SERVANT_PRG_SECTORS = 20u,
+    };
+    uint32_t servant_idx = 0u;
+    uint32_t start_sector;
+    uint8_t sec_buf[2048];
+
+    if (raw_servant_idx >= 0 && (uint32_t)raw_servant_idx < (sizeof(s_servant_chr_lba) / sizeof(s_servant_chr_lba[0]))) {
+        servant_idx = (uint32_t)raw_servant_idx;
+    }
+    start_sector = s_servant_chr_lba[servant_idx];
+
+    for (uint32_t i = 0; i < CV_SERVANT_CHR0_SECTORS; i++) {
+        if (!psx_cdrom_read_sector(start_sector + i, sec_buf)) {
+            fprintf(stderr,
+                    "[CD-SERVANT] idx=%u FAILED reading CHR0 sector %u\n",
+                    servant_idx, start_sector + i);
+            fflush(stderr);
+            return 0;
+        }
+        memcpy(&g_ram[0x7EFE4u + i * 2048u], sec_buf, sizeof(sec_buf));  /* g_Pix[0..1] */
+    }
+    for (uint32_t i = 0; i < CV_SERVANT_CHR1_SECTORS; i++) {
+        if (!psx_cdrom_read_sector(start_sector + CV_SERVANT_CHR0_SECTORS + i, sec_buf)) {
+            fprintf(stderr,
+                    "[CD-SERVANT] idx=%u FAILED reading CHR1 sector %u\n",
+                    servant_idx, start_sector + CV_SERVANT_CHR0_SECTORS + i);
+            fflush(stderr);
+            return 0;
+        }
+        memcpy(&g_ram[0x82FE4u + i * 2048u], sec_buf, sizeof(sec_buf));  /* g_Pix[2] */
+    }
+    for (uint32_t i = 0; i < CV_SERVANT_PRG_SECTORS; i++) {
+        if (!psx_cdrom_read_sector(start_sector + CV_SERVANT_CHR0_SECTORS + CV_SERVANT_CHR1_SECTORS + i, sec_buf)) {
+            fprintf(stderr,
+                    "[CD-SERVANT] idx=%u FAILED reading PRG sector %u\n",
+                    servant_idx, start_sector + CV_SERVANT_CHR0_SECTORS + CV_SERVANT_CHR1_SECTORS + i);
+            fflush(stderr);
+            return 0;
+        }
+        memcpy(&g_ram[0x170000u + i * 2048u], sec_buf, sizeof(sec_buf)); /* FAMILIAR_PTR */
+    }
+
+    psx_vram_upload(0x2C0, 0x100, 64, 128, (const uint16_t*)&g_ram[0x7EFE4u]);
+    psx_vram_upload(0x2C0, 0x180, 32, 128, (const uint16_t*)&g_ram[0x82FE4u]);
+    fprintf(stderr,
+            "[CD-SERVANT] idx=%u sectors=%u..%u chr0=0x8007EFE4(0x4000) chr1=0x80082FE4(0x2000) prg=0x80170000(0xA000)\n",
+            servant_idx, start_sector, start_sector + CV_SERVANT_CHR0_SECTORS + CV_SERVANT_CHR1_SECTORS + CV_SERVANT_PRG_SECTORS - 1u);
+    fflush(stderr);
+    return 1;
+}
+
+static int cv_is_dra_fn_addr(uint32_t addr) {
+    return addr >= 0x800A0000u && addr < 0x80180000u;
+}
+
+static int cv_restore_saved_g_api_slice(const char* reason) {
+    uint32_t saved_first = 0;
+    int diff_count = 0;
+    int invalid_count = 0;
+
+    if (!s_g_api_init_captured) {
+        return 0;
+    }
+
+    memcpy(&saved_first, &s_g_api_init_saved[0x40], 4);
+    if (!cv_is_dra_fn_addr(saved_first)) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < 0x40u; i++) {
+        uint32_t cur = 0;
+        uint32_t saved = 0;
+        memcpy(&cur, &g_ram[0x3C7B4u + i * 4u], 4);
+        memcpy(&saved, &s_g_api_init_saved[0x40u + i * 4u], 4);
+        if (!cv_is_dra_fn_addr(saved)) {
+            continue;
+        }
+        if (cur != saved && !(i == 1u && cur == 0x8017FF10u)) {
+            diff_count++;
+        }
+        if (cur == 0u ||
+            (!cv_is_dra_fn_addr(cur) && !(i == 1u && cur == 0x8017FF10u))) {
+            invalid_count++;
+        }
+    }
+
+    if (diff_count == 0 || (diff_count < 8 && invalid_count == 0)) {
+        return 0;
+    }
+
+    {
+        uint32_t prev_alloc_primitives = 0;
+        static uint32_t s_restore_logs = 0;
+        memcpy(&prev_alloc_primitives, &g_ram[0x3C7B8], 4);
+        for (uint32_t i = 0; i < 0x40u; i++) {
+            uint32_t saved = 0;
+            memcpy(&saved, &s_g_api_init_saved[0x40u + i * 4u], 4);
+            if (!cv_is_dra_fn_addr(saved)) {
+                continue;
+            }
+            memcpy(&g_ram[0x3C7B4u + i * 4u], &saved, 4);
+        }
+        if (prev_alloc_primitives == 0x8017FF10u) {
+            memcpy(&g_ram[0x3C7B8], &prev_alloc_primitives, 4);
+        }
+        if (++s_restore_logs <= 16u || (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
+            uint32_t current_first = 0;
+            memcpy(&current_first, &g_ram[0x3C7B4], 4);
+            printf("[GAPI-RESTORE] f%u %s diff=%d invalid=%d first=0x%08X\n",
+                   g_ps1_frame, reason, diff_count, invalid_count, current_first);
+            fflush(stdout);
+        }
+    }
+
+    return 1;
+}
+
+static int cv_can_read_ram_ptr(uint32_t ram_ptr, uint32_t size) {
+    uint32_t phys = ram_ptr & 0x1FFFFFu;
+    return (ram_ptr & 0x80000000u) != 0u &&
+           size <= sizeof(g_ram) &&
+           phys <= sizeof(g_ram) - size;
+}
+
+static int cv_should_trace_gfx_window(void) {
+    return g_ps1_frame >= 2320u && g_ps1_frame <= 2400u;
+}
+
+static void cv_log_gfx_entry_preview(const char* tag, uint32_t entry_ptr, uint32_t max_entries) {
+    if (!cv_can_read_ram_ptr(entry_ptr, 0xCu)) {
+        fprintf(stderr, "[%s] entries=0x%08X invalid\n", tag, entry_ptr);
+        fflush(stderr);
+        return;
+    }
+
+    for (uint32_t i = 0; i < max_entries; i++) {
+        uint32_t base = (entry_ptr & 0x1FFFFFu) + i * 0xCu;
+        uint32_t xy = 0;
+        uint32_t wh = 0;
+        uint32_t data = 0;
+        if (base + 0xCu > sizeof(g_ram)) {
+            break;
+        }
+        memcpy(&xy, &g_ram[base + 0], 4);
+        memcpy(&wh, &g_ram[base + 4], 4);
+        memcpy(&data, &g_ram[base + 8], 4);
+        if (xy == 0xFFFFFFFFu) {
+            fprintf(stderr, "[%s] entry[%u] END @0x%08X\n",
+                    tag, i, entry_ptr + i * 0xCu);
+            fflush(stderr);
+            break;
+        }
+        fprintf(stderr,
+                "[%s] entry[%u] @0x%08X xy=0x%08X wh=0x%08X data=0x%08X -> x=%u y=%u w=%u h=%u\n",
+                tag, i, entry_ptr + i * 0xCu, xy, wh, data,
+                (unsigned)(xy >> 16), (unsigned)(uint16_t)xy,
+                (unsigned)(wh >> 16), (unsigned)(uint16_t)wh);
+        fflush(stderr);
+    }
+}
+
+static void cv_log_gfxload_slot(const char* tag, uint32_t slot) {
+    uint32_t base = 0x72FA0u + slot * 0xCu;
+    uint32_t next = 0;
+    uint16_t kind = 0;
+    int16_t unk6 = 0, unk8 = 0, unkA = 0;
+
+    if (slot >= 16u || base + 0xCu > sizeof(g_ram)) {
+        return;
+    }
+
+    memcpy(&next, &g_ram[base + 0], 4);
+    memcpy(&kind, &g_ram[base + 4], 2);
+    memcpy(&unk6, &g_ram[base + 6], 2);
+    memcpy(&unk8, &g_ram[base + 8], 2);
+    memcpy(&unkA, &g_ram[base + 10], 2);
+
+    fprintf(stderr,
+            "[%s] f%u slot=%u next=0x%08X kind=0x%04X u6=%d u8=%d uA=%d pc=0x%08X ra=0x%08X\n",
+            tag, g_ps1_frame, slot, next, (unsigned)kind, unk6, unk8, unkA,
+            g_diag_cpu ? g_diag_cpu->pc : 0u,
+            g_diag_cpu ? g_diag_cpu->ra : 0u);
+    fflush(stderr);
+
+    if (next != 0u && kind != 0u && kind != 0xFFFFu) {
+        cv_log_gfx_entry_preview("GFXLOAD-ENTRY", next, (kind == 4u) ? 4u : 2u);
+    }
+}
+
+static void cv_log_overlay_gfx_banks(const char* tag) {
+    static uint32_t s_overlay_gfx_logs = 0;
+    uint32_t gfx_banks = 0;
+    uint32_t table_phys = 0;
+
+    if (++s_overlay_gfx_logs > 12u) {
+        return;
+    }
+
+    memcpy(&gfx_banks, &g_ram[0x3C798], 4);
+    fprintf(stderr, "[OVL-GFXBANKS] %s ptr=0x%08X", tag, gfx_banks);
+    if (!cv_can_read_ram_ptr(gfx_banks, 8u * 4u)) {
+        fprintf(stderr, " (invalid table)\n");
+        fflush(stderr);
+        return;
+    }
+
+    table_phys = gfx_banks & 0x1FFFFFu;
+    for (uint32_t i = 0; i < 8u; i++) {
+        uint32_t bank_ptr = 0;
+        memcpy(&bank_ptr, &g_ram[table_phys + i * 4u], 4);
+        fprintf(stderr, " i%u=0x%08X", i, bank_ptr);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+
+    for (uint32_t i = 0; i < 8u; i++) {
+        uint32_t bank_ptr = 0;
+        int32_t kind = 0;
+        memcpy(&bank_ptr, &g_ram[table_phys + i * 4u], 4);
+        if (bank_ptr == 0u) {
+            continue;
+        }
+        if (!cv_can_read_ram_ptr(bank_ptr, 4u)) {
+            fprintf(stderr, "[OVL-GFXBANK] idx=%u bank=0x%08X invalid\n", i, bank_ptr);
+            fflush(stderr);
+            continue;
+        }
+        memcpy(&kind, &g_ram[bank_ptr & 0x1FFFFFu], 4);
+        fprintf(stderr,
+                "[OVL-GFXBANK] idx=%u bank=0x%08X kind=%d entries=0x%08X\n",
+                i, bank_ptr, kind, bank_ptr + 4u);
+        fflush(stderr);
+        if (kind > 0 && kind <= 4) {
+            cv_log_gfx_entry_preview("OVL-GFXENTRY", bank_ptr + 4u,
+                                     (kind == 4) ? 4u : 2u);
+        }
+    }
+}
+
+static void cv_copy_overlay_data_fields(uint32_t load_phys) {
+    static uint32_t s_overlay_data_logs = 0;
+    uint32_t hdr[16];
+    uint32_t before_rooms = 0, before_obj_layout = 0, before_tile_layers = 0;
+    memcpy(hdr, &g_ram[load_phys], sizeof(hdr));
+    memcpy(&before_rooms, &g_ram[0x3C784], 4);
+    memcpy(&before_obj_layout, &g_ram[0x3C790], 4);
+    memcpy(&before_tile_layers, &g_ram[0x3C794], 4);
+
+    if (hdr[2] >= 0x80180000u && hdr[2] <= 0x801FFFFFu) {
+        memcpy(&g_ram[0x3C77C], &hdr[2], 4);
+    }
+
+    for (uint32_t i = 4; i < 16; i++) {
+        uint32_t val = hdr[i];
+        uint32_t dest = 0x3C774u + i * 4u;
+        if (val == 0u || (val >= 0x80180000u && val <= 0x801FFFFFu)) {
+            memcpy(&g_ram[dest], &val, 4);
+        }
+    }
+
+    {
+        uint32_t update_room = 0;
+        uint32_t rooms = 0;
+        uint32_t tile_layers = 0;
+        memcpy(&update_room, &g_ram[0x3C77C], 4);
+        memcpy(&rooms, &g_ram[0x3C784], 4);
+        memcpy(&tile_layers, &g_ram[0x3C794], 4);
+        if (update_room == 0x801B9C80u &&
+            (rooms < 0x80100000u || rooms >= 0x80200000u ||
+             tile_layers < 0x80100000u || tile_layers >= 0x80200000u)) {
+            static uint32_t s_overlay_repairs = 0;
+            const uint32_t title_rooms = 0x8018233Cu;
+            const uint32_t title_obj_layout = 0x00000000u;
+            const uint32_t title_tile_layers = 0x801804E0u;
+            memcpy(&g_ram[0x3C784], &title_rooms, 4);
+            memcpy(&g_ram[0x3C790], &title_obj_layout, 4);
+            memcpy(&g_ram[0x3C794], &title_tile_layers, 4);
+            if (++s_overlay_repairs <= 8u) {
+                printf("[OVL-REPAIR] title rooms 0x%08X->0x%08X obj 0x%08X->0x%08X tileLayers 0x%08X->0x%08X\n",
+                       rooms, title_rooms,
+                       before_obj_layout, title_obj_layout,
+                       tile_layers, title_tile_layers);
+                fflush(stdout);
+            }
+        }
+    }
+
+    if (++s_overlay_data_logs <= 12u) {
+        uint32_t after_rooms = 0, after_obj_layout = 0, after_tile_layers = 0;
+        memcpy(&after_rooms, &g_ram[0x3C784], 4);
+        memcpy(&after_obj_layout, &g_ram[0x3C790], 4);
+        memcpy(&after_tile_layers, &g_ram[0x3C794], 4);
+        printf("[OVL-DATA] C77C=0x%08X rooms=0x%08X spriteBanks=0x%08X cluts=0x%08X "
+               "objLayout=0x%08X tileLayers=0x%08X gfxBanks=0x%08X stageEnts=0x%08X "
+               "before=(0x%08X,0x%08X,0x%08X) after=(0x%08X,0x%08X,0x%08X)\n",
+               hdr[2], hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10],
+               before_rooms, before_obj_layout, before_tile_layers,
+               after_rooms, after_obj_layout, after_tile_layers);
+        fflush(stdout);
+    }
+
+    cv_log_overlay_gfx_banks("overlay-data");
+    cv_restore_saved_g_api_slice("overlay-data");
+}
+
+static void cv_seed_clut_ids(void) {
+    static int s_clut_ids_seeded = 0;
+
+    if (!s_clut_ids_seeded) {
+        uint32_t index = 0u;
+        for (uint32_t y = 0xF0u; y < 0x100u; y++) {
+            for (uint32_t x = 0x200u; x < 0x300u; x += 0x10u) {
+                uint16_t clut = (uint16_t)(((y & 0x1FFu) << 6) | ((x >> 4) & 0x3Fu));
+                memcpy(&g_ram[0x3C104u + index * 2u], &clut, 2);
+                index++;
+            }
+        }
+        for (uint32_t y = 0xF0u; y < 0x100u; y++) {
+            for (uint32_t x = 0u; x < 0x100u; x += 0x10u) {
+                uint16_t clut = (uint16_t)(((y & 0x1FFu) << 6) | ((x >> 4) & 0x3Fu));
+                memcpy(&g_ram[0x3C104u + index * 2u], &clut, 2);
+                index++;
+            }
+        }
+        for (uint32_t y = 0xF0u; y < 0x100u; y++) {
+            for (uint32_t x = 0x100u; x < 0x200u; x += 0x10u) {
+                uint16_t clut = (uint16_t)(((y & 0x1FFu) << 6) | ((x >> 4) & 0x3Fu));
+                memcpy(&g_ram[0x3C104u + index * 2u], &clut, 2);
+                index++;
+            }
+        }
+        s_clut_ids_seeded = 1;
+        printf("[CLUT-FIX] Seeded D_8003C104 with %u CLUT coordinates\n", index);
+        fflush(stdout);
+    }
+}
+
+static void cv_seed_default_cluts(void) {
+    static int s_default_palettes_uploaded = 0;
+    static int s_use_test_palette = -1;
+
+    cv_seed_clut_ids();
+
+    if (!s_default_palettes_uploaded) {
+        static uint16_t s_default_clut_vram[256 * 16];
+        if (s_use_test_palette < 0) {
+            const char* env = getenv("PSX_CV_TEST_PALETTE");
+            s_use_test_palette = (env && env[0] && env[0] != '0') ? 1 : 0;
+        }
+        if (!s_use_test_palette) {
+            cv_seed_left_entity_cluts();
+        }
+        if (g_room_tile_cluts_uploaded && !s_use_test_palette) {
+            return;
+        }
+        if (s_use_test_palette) {
+            static const uint16_t s_test_palette[16] = {
+                0x7C1F, 0x001F, 0x03E0, 0x7C00,
+                0x03FF, 0x7C1F, 0x7FE0, 0x7FFF,
+                0x4210, 0x02BF, 0x56B5, 0x7D60,
+                0x5294, 0x294A, 0x18C6, 0x6739,
+            };
+            for (int row = 0; row < 16; row++) {
+                for (int pal = 0; pal < 16; pal++) {
+                    memcpy(&s_default_clut_vram[row * 256 + pal * 16], s_test_palette, sizeof(s_test_palette));
+                }
+            }
+            printf("[CLUT-FIX] Using vivid test palette in VRAM fallback\n");
+            fflush(stdout);
+        } else {
+            for (int row = 0; row < 16; row++) {
+                memcpy(&s_default_clut_vram[row * 256], &g_ram[0xD8994], 256u * sizeof(uint16_t));
+            }
+        }
+        psx_vram_upload(512, 240, 256, 16, s_default_clut_vram);
+        s_default_palettes_uploaded = 1;
+        printf("[CLUT-FIX] Uploaded default DRA palettes to VRAM (512,240)-(767,255)\n");
+        fflush(stdout);
+    }
+}
+
+static void cv_try_manual_room_layer_init(const char* reason) {
+    uint32_t tile_flags = 0;
+    uint32_t bg0_flags = 0;
+    uint32_t room_load_def = 0;
+    uint32_t tile_layers_ptr = 0;
+    uint32_t fg_ptr = 0;
+    uint32_t bg_ptr = 0;
+    uint32_t zero32 = 0;
+    static uint32_t s_room_layer_fix_logs = 0;
+    static uint32_t s_room_layer_skip_logs = 0;
+    int layer_index = 0;
+    int need_tile = 0;
+    int need_bg0 = 0;
+
+    memcpy(&tile_flags, &g_ram[0x730A0], 4);
+    memcpy(&bg0_flags, &g_ram[0x730F4], 4);
+    need_tile = (tile_flags == 0u);
+    need_bg0 = (bg0_flags == 0u);
+    if (!need_tile && !need_bg0) {
+        return;
+    }
+
+    memcpy(&room_load_def, &g_ram[0x1375BC], 4);
+    if (room_load_def >= 0x80000000u && room_load_def <= 0x801FFFFFu) {
+        uint8_t* def_ptr = addr_ptr(room_load_def);
+        if (def_ptr) {
+            layer_index = def_ptr[0];
+        }
+    }
+    if (layer_index < 0 || layer_index >= 64) {
+        layer_index = 0;
+    }
+
+    memcpy(&tile_layers_ptr, &g_ram[0x3C794], 4);
+    if (tile_layers_ptr < 0x80100000u || tile_layers_ptr > 0x801FFFFFu) {
+        if (++s_room_layer_skip_logs <= 16u || (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
+            uint32_t saved_rooms = 0;
+            uint32_t saved_obj_layout = 0;
+            uint32_t saved_tile_layers = 0;
+            if (s_g_api_init_captured) {
+                memcpy(&saved_rooms, &s_g_api_init_saved[0x10], 4);
+                memcpy(&saved_obj_layout, &s_g_api_init_saved[0x1C], 4);
+                memcpy(&saved_tile_layers, &s_g_api_init_saved[0x20], 4);
+            }
+            printf("[ROOM-LAYER-SKIP] f%u %s needTile=%d needBg0=%d def=0x%08X tileLayers=0x%08X savedRooms=0x%08X savedObj=0x%08X savedTileLayers=0x%08X\n",
+                   g_ps1_frame, reason, need_tile, need_bg0, room_load_def, tile_layers_ptr,
+                   saved_rooms, saved_obj_layout, saved_tile_layers);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    {
+        uint8_t* tile_layers = addr_ptr(tile_layers_ptr + (uint32_t)layer_index * 8u);
+        if (!tile_layers) {
+            if (++s_room_layer_skip_logs <= 16u || (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
+                printf("[ROOM-LAYER-SKIP] f%u %s needTile=%d needBg0=%d def=0x%08X tileLayers=0x%08X layer=%d ptr=NULL\n",
+                       g_ps1_frame, reason, need_tile, need_bg0, room_load_def, tile_layers_ptr, layer_index);
+                fflush(stdout);
+            }
+            return;
+        }
+        memcpy(&fg_ptr, tile_layers + 0, 4);
+        memcpy(&bg_ptr, tile_layers + 4, 4);
+    }
+
+    if (need_tile && fg_ptr >= 0x80100000u && fg_ptr <= 0x801FFFFFu) {
+        uint8_t* fg = addr_ptr(fg_ptr);
+        if (fg) {
+            uint32_t ld_layout = 0;
+            uint32_t ld_tile_def = 0;
+            uint32_t ld_rect = 0;
+            uint32_t order = 0;
+            uint32_t flags32 = 0;
+            uint32_t left = 0;
+            uint32_t top = 0;
+            uint32_t right = 0;
+            uint32_t bottom = 0;
+            uint32_t hsize = 0;
+            uint32_t vsize = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint16_t ld_z_pri = 0;
+            uint16_t ld_flags = 0;
+            uint8_t rect_params = 0;
+
+            memcpy(&ld_layout, fg + 0, 4);
+            memcpy(&ld_tile_def, fg + 4, 4);
+            memcpy(&ld_rect, fg + 8, 4);
+            memcpy(&ld_z_pri, fg + 12, 2);
+            memcpy(&ld_flags, fg + 14, 2);
+
+            left = ld_rect & 0x3Fu;
+            top = (ld_rect >> 6) & 0x3Fu;
+            right = (ld_rect >> 12) & 0x3Fu;
+            bottom = (ld_rect >> 18) & 0x3Fu;
+            rect_params = (uint8_t)((ld_rect >> 24) & 0xFFu);
+
+            memcpy(&g_ram[0x3C708], &zero32, 4);
+            memcpy(&g_ram[0x73088], &ld_tile_def, 4);
+            memcpy(&g_ram[0x730A0], &zero32, 4);
+
+            if (ld_tile_def != 0u) {
+                memcpy(&g_ram[0x73084], &ld_layout, 4);
+                order = (uint32_t)ld_z_pri;
+                memcpy(&g_ram[0x7309C], &order, 4);
+
+                if ((rect_params & 0x40u) != 0u || (rect_params & 0x20u) != 0u) {
+                    uint32_t params32 = (uint32_t)rect_params;
+                    order = 0x60u;
+                    memcpy(&g_ram[0x7309C], &order, 4);
+                    memcpy(&g_ram[0x3C708], &params32, 4);
+                } else if ((rect_params & 0x80u) != 0u) {
+                    order = 0x60u;
+                    memcpy(&g_ram[0x7309C], &order, 4);
+                }
+
+                flags32 = (uint32_t)ld_flags;
+                hsize = right - left + 1u;
+                vsize = bottom - top + 1u;
+                width = hsize << 8;
+                height = vsize << 8;
+
+                memcpy(&g_ram[0x730A0], &flags32, 4);
+                memcpy(&g_ram[0x730A4], &hsize, 4);
+                memcpy(&g_ram[0x730A8], &vsize, 4);
+                memcpy(&g_ram[0x730AC], &(uint32_t){1u}, 4);
+                memcpy(&g_ram[0x730B0], &left, 4);
+                memcpy(&g_ram[0x730B4], &top, 4);
+                memcpy(&g_ram[0x730B8], &right, 4);
+                memcpy(&g_ram[0x730BC], &bottom, 4);
+                memcpy(&g_ram[0x730C0], &zero32, 4);
+                memcpy(&g_ram[0x730C4], &zero32, 4);
+                memcpy(&g_ram[0x730C8], &width, 4);
+                memcpy(&g_ram[0x730CC], &height, 4);
+            }
+        }
+    }
+
+    if (need_bg0 && bg_ptr >= 0x80100000u && bg_ptr <= 0x801FFFFFu) {
+        uint8_t* bg = addr_ptr(bg_ptr);
+        if (bg) {
+            uint32_t ld_layout = 0;
+            uint32_t ld_tile_def = 0;
+            uint32_t ld_rect = 0;
+            uint32_t order = 0;
+            uint32_t flags32 = 0;
+            uint32_t left = 0;
+            uint32_t top = 0;
+            uint32_t right = 0;
+            uint32_t bottom = 0;
+            uint32_t w = 0;
+            uint32_t h = 0;
+            uint32_t scroll_kind = 0;
+            uint16_t ld_z_pri = 0;
+            uint16_t ld_flags = 0;
+            uint8_t rect_params = 0;
+
+            memcpy(&ld_layout, bg + 0, 4);
+            memcpy(&ld_tile_def, bg + 4, 4);
+            memcpy(&ld_rect, bg + 8, 4);
+            memcpy(&ld_z_pri, bg + 12, 2);
+            memcpy(&ld_flags, bg + 14, 2);
+
+            left = ld_rect & 0x3Fu;
+            top = (ld_rect >> 6) & 0x3Fu;
+            right = (ld_rect >> 12) & 0x3Fu;
+            bottom = (ld_rect >> 18) & 0x3Fu;
+            rect_params = (uint8_t)((ld_rect >> 24) & 0xFFu);
+
+            memcpy(&g_ram[0x730D8], &ld_layout, 4);
+            memcpy(&g_ram[0x730DC], &ld_tile_def, 4);
+            memcpy(&g_ram[0x730F4], &zero32, 4);
+
+            if (ld_tile_def != 0u) {
+                order = (uint32_t)ld_z_pri;
+                flags32 = (uint32_t)ld_flags;
+                w = right - left + 1u;
+                h = bottom - top + 1u;
+                scroll_kind = (uint32_t)rect_params;
+
+                memcpy(&g_ram[0x730F0], &order, 4);
+                memcpy(&g_ram[0x730F4], &flags32, 4);
+                memcpy(&g_ram[0x730F8], &w, 4);
+                memcpy(&g_ram[0x730FC], &h, 4);
+                memcpy(&g_ram[0x73100], &(uint32_t){1u}, 4);
+                memcpy(&g_ram[0x73104], &scroll_kind, 4);
+            }
+        }
+    }
+
+    for (uint32_t i = 1; i < 16u; i++) {
+        uint32_t base = 0x730D8u + i * 0x30u;
+        memcpy(&g_ram[base + 0x1Cu], &zero32, 4);
+    }
+
+    memcpy(&tile_flags, &g_ram[0x730A0], 4);
+    memcpy(&bg0_flags, &g_ram[0x730F4], 4);
+    if (++s_room_layer_fix_logs <= 16u || (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
+        printf("[ROOM-LAYER-FIX] f%u %s needTile=%d needBg0=%d def=0x%08X layer=%d tileLayers=0x%08X fg=0x%08X bg=0x%08X tile=0x%08X bg0=0x%08X\n",
+               g_ps1_frame, reason, need_tile, need_bg0, room_load_def, layer_index,
+               tile_layers_ptr, fg_ptr, bg_ptr, tile_flags, bg0_flags);
+        fflush(stdout);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -937,8 +3041,313 @@ static int trace_cv_othead_writes_enabled(void) {
     return s_trace_cv_othead_writes;
 }
 
+static int trace_cv_code_watch_writes_enabled(void) {
+    static int s_trace_cv_code_watch_writes = -1;
+    if (s_trace_cv_code_watch_writes < 0) {
+        const char* env = getenv("PSX_CV_TRACE_CODE_WATCH_WRITES");
+        s_trace_cv_code_watch_writes = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return s_trace_cv_code_watch_writes;
+}
+
+static int trace_cv_split_interpret_enabled(void) {
+    static int s_trace_cv_split_interpret = -1;
+    if (s_trace_cv_split_interpret < 0) {
+        const char* env = getenv("PSX_CV_TRACE_SPLIT_INTERPRET");
+        s_trace_cv_split_interpret = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return s_trace_cv_split_interpret;
+}
+
+static int suspicious_code_overlap(uint32_t phys, uint32_t size, const char** label_out) {
+    static const struct {
+        uint32_t start;
+        uint32_t end;
+        const char* label;
+    } watched[] = {
+        { 0x1A664u, 0x1A864u, "A664" },
+        { 0x2A7A0u, 0x2A840u, "A7A0" },
+    };
+    uint32_t end = phys + size;
+    for (size_t i = 0; i < (sizeof(watched) / sizeof(watched[0])); i++) {
+        if (phys < watched[i].end && end > watched[i].start) {
+            if (label_out) {
+                *label_out = watched[i].label;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void trace_suspicious_code_write(const char* tag, uint32_t phys, uint32_t size, uint32_t sample) {
+    static uint32_t s_code_watch_hits = 0;
+    const char* label = NULL;
+    uint32_t current_buffer = 0u;
+    uint32_t gpu_usage_sp = 0u;
+    uint32_t sprite_base = 0u;
+    if (!suspicious_code_overlap(phys, size, &label)) {
+        return;
+    }
+    if (!trace_cv_code_watch_writes_enabled()) {
+        return;
+    }
+    current_buffer = read_word(0x8006C37Cu);
+    gpu_usage_sp = read_word(0x80097948u);
+    if (current_buffer != 0u) {
+        sprite_base = current_buffer + 0x14FF4u + (gpu_usage_sp * 0x14u);
+    }
+    if (++s_code_watch_hits <= 200u || (s_code_watch_hits % 200u) == 0u) {
+        printf("[CODE-WATCH] f%u #%u tag=%s range=%s phys=0x%05X size=0x%X sample=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X s3=0x%08X curbuf=0x%08X gpu_sp=0x%08X sprite_base=0x%08X\n",
+               g_ps1_frame, s_code_watch_hits, tag, label, phys, size, sample,
+               g_diag_cpu ? g_diag_cpu->pc : 0u,
+               g_diag_cpu ? g_diag_cpu->ra : 0u,
+               g_diag_cpu ? g_diag_cpu->sp : 0u,
+               g_diag_cpu ? g_diag_cpu->a0 : 0u,
+               g_diag_cpu ? g_diag_cpu->a1 : 0u,
+               g_diag_cpu ? g_diag_cpu->a2 : 0u,
+               g_diag_cpu ? g_diag_cpu->a3 : 0u,
+               g_diag_cpu ? g_diag_cpu->s0 : 0u,
+               g_diag_cpu ? g_diag_cpu->s1 : 0u,
+               g_diag_cpu ? g_diag_cpu->s2 : 0u,
+               g_diag_cpu ? g_diag_cpu->s3 : 0u,
+               current_buffer,
+               gpu_usage_sp,
+               sprite_base);
+        fflush(stdout);
+    }
+}
+
+static void cv_zero_gpu_usage_counters(void) {
+    static const uint32_t usage_offsets[] = {
+        0x9792Cu, /* drawModes */
+        0x97930u, /* gt4 */
+        0x97934u, /* g4 */
+        0x97938u, /* gt3 */
+        0x9793Cu, /* line */
+        0x97940u, /* sp16 */
+        0x97944u, /* tile */
+        0x97948u, /* sp */
+        0x9794Cu, /* env */
+    };
+    uint32_t zero = 0u;
+    for (size_t i = 0; i < (sizeof(usage_offsets) / sizeof(usage_offsets[0])); ++i) {
+        memcpy(&g_ram[usage_offsets[i]], &zero, sizeof(zero));
+    }
+}
+
+static void cv_prepare_sel_gpu_state(void) {
+    const uint32_t buf0 = 0x8003CB08u;
+    const uint32_t buf1 = 0x800542FCu;
+    static uint32_t s_last_valid_curbuf = 0x8003CB08u;
+    static uint32_t s_fix_logs = 0u;
+    uint32_t next0 = 0u;
+    uint32_t next1 = 0u;
+    uint32_t curbuf = 0u;
+    int repaired = 0;
+
+    memcpy(&next0, &g_ram[0x3CB08], sizeof(next0));
+    memcpy(&next1, &g_ram[0x542FC], sizeof(next1));
+    memcpy(&curbuf, &g_ram[0x6C37C], sizeof(curbuf));
+
+    if (next0 != buf1) {
+        memcpy(&g_ram[0x3CB08], &buf1, sizeof(buf1));
+        next0 = buf1;
+        repaired = 1;
+    }
+    if (next1 != buf0) {
+        memcpy(&g_ram[0x542FC], &buf0, sizeof(buf0));
+        next1 = buf0;
+        repaired = 1;
+    }
+
+    if (curbuf == buf0 || curbuf == buf1) {
+        s_last_valid_curbuf = curbuf;
+    } else {
+        uint32_t fallback = (s_last_valid_curbuf == buf0) ? buf1 : buf0;
+        memcpy(&g_ram[0x6C37C], &fallback, sizeof(fallback));
+        curbuf = fallback;
+        s_last_valid_curbuf = fallback;
+        repaired = 1;
+    }
+
+    cv_zero_gpu_usage_counters();
+
+    if ((repaired || s_fix_logs < 5u) && ++s_fix_logs <= 20u) {
+        printf("[GS8-GPUFIX] f%u repaired=%d curbuf=0x%08X next0=0x%08X next1=0x%08X\n",
+               g_ps1_frame, repaired, curbuf, next0, next1);
+        fflush(stdout);
+    }
+}
+
 static void write_word(uint32_t addr, uint32_t value) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys == 0x6C374u) {
+        uint32_t game_state = 0;
+        uint32_t stage_id = 0;
+        uint32_t mode_3c730 = 0;
+        uint32_t state_97c98 = 0;
+        uint32_t expected_unk28 = 0x7Fu;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&stage_id, &g_ram[0x974A0], sizeof(stage_id));
+        memcpy(&mode_3c730, &g_ram[0x3C730], sizeof(mode_3c730));
+        memcpy(&state_97c98, &g_ram[0x97C98], sizeof(state_97c98));
+        if (s_dra_stage_lba_captured) {
+            expected_unk28 = s_dra_stage_lba_saved[0x1Fu * 44u];
+        }
+        if (game_state == 4u &&
+            stage_id == 0x1Fu &&
+            mode_3c730 == 0u &&
+            (value & 0xFFu) != (expected_unk28 & 0xFFu)) {
+            static uint32_t s_st0_tele_fix_logs = 0;
+            uint32_t old_value = value;
+            value = expected_unk28 & 0xFFu;
+            if (++s_st0_tele_fix_logs <= 12u) {
+                printf("[ST0-TELE-FIX] f%u forcing D_8006C374 0x%02X->0x%02X for ST0 now-loading pc=0x%08X ra=0x%08X\n",
+                       g_ps1_frame,
+                       old_value & 0xFFu,
+                       value & 0xFFu,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u);
+                fflush(stdout);
+            }
+        }
+        if (game_state == 4u &&
+            stage_id == 0x1Fu &&
+            mode_3c730 == 0u &&
+            s_dra_tele_captured &&
+            s_dra_stage_lba_captured) {
+            const uint32_t tele_index = value & 0xFFu;
+            const uint32_t tele_count = (uint32_t)sizeof(s_dra_tele_saved) / 10u;
+            if (tele_index < tele_count) {
+                const uint32_t tele_off = tele_index * 10u;
+                const uint32_t tele_phys = 0xA245Cu + tele_off;
+                const uint32_t stage_lba_phys = 0xA3C68u;
+                if (memcmp(&g_ram[tele_phys], &s_dra_tele_saved[tele_off], 10u) != 0 ||
+                    memcmp(&g_ram[stage_lba_phys], s_dra_stage_lba_saved,
+                           sizeof(s_dra_stage_lba_saved)) != 0) {
+                    static uint32_t s_dra_static_repair_logs = 0;
+                    memcpy(&g_ram[0xA245C], s_dra_tele_saved, sizeof(s_dra_tele_saved));
+                    memcpy(&g_ram[0xA3C68], s_dra_stage_lba_saved, sizeof(s_dra_stage_lba_saved));
+                    if (++s_dra_static_repair_logs <= 12u) {
+                        uint16_t exp_x = 0, exp_y = 0, exp_room = 0, exp_unk6 = 0, exp_stage = 0;
+                        memcpy(&exp_x, &s_dra_tele_saved[tele_off + 0u], 2);
+                        memcpy(&exp_y, &s_dra_tele_saved[tele_off + 2u], 2);
+                        memcpy(&exp_room, &s_dra_tele_saved[tele_off + 4u], 2);
+                        memcpy(&exp_unk6, &s_dra_tele_saved[tele_off + 6u], 2);
+                        memcpy(&exp_stage, &s_dra_tele_saved[tele_off + 8u], 2);
+                        printf("[DRA-STATIC-REPAIR] f%u restored D_800A245C/g_StagesLba for ST0 idx=0x%02X expectedTele={x=%u y=%u room=0x%04X unk6=0x%04X stage=0x%04X}\n",
+                               g_ps1_frame, tele_index, exp_x, exp_y, exp_room, exp_unk6, exp_stage);
+                        fflush(stdout);
+                    }
+                }
+            }
+        }
+    }
+    if ((phys == 0x6BAFCu || phys == 0x6C398u || phys == 0x6C3B0u || phys == 0x6C374u) &&
+        cv_should_sanitize_st0_gameplay_state()) {
+        uint32_t old_value = 0;
+        const char* name = NULL;
+        uint32_t fallback = 0;
+        int invalid = 0;
+
+        memcpy(&old_value, &g_ram[phys], sizeof(old_value));
+        if (phys == 0x6BAFCu) {
+            invalid = !cv_is_valid_cd_file_value(value);
+            fallback = cv_is_valid_cd_file_value(old_value) ? old_value : 0u;
+            name = "LoadFile";
+        } else if (phys == 0x6C398u || phys == 0x6C3B0u) {
+            invalid = !cv_is_valid_cd_step_value(value);
+            fallback = cv_is_valid_cd_step_value(old_value) ? old_value : 0u;
+            name = (phys == 0x6C398u) ? "CdStep" : "IsUsingCd";
+        } else {
+            invalid = (value & 0xFFFFFF00u) != 0u;
+            fallback = ((old_value & 0xFFFFFF00u) == 0u)
+                ? old_value
+                : (s_dra_stage_lba_captured ? (uint32_t)(s_dra_stage_lba_saved[0x1Fu * 44u] & 0xFFu) : 0u);
+            name = "TeleIdx";
+        }
+
+        if (invalid) {
+            static uint32_t s_st0_state_sanitize_logs = 0;
+            uint32_t bad_value = value;
+            value = fallback;
+            if (++s_st0_state_sanitize_logs <= 32u) {
+                printf("[ST0-STATE-SANITIZE] f%u %s old=0x%08X bad=0x%08X keep=0x%08X pc=0x%08X ra=0x%08X\n",
+                       g_ps1_frame, name, old_value, bad_value, value,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u);
+                fflush(stdout);
+            }
+        }
+    }
+    trace_suspicious_code_write("W32", phys, 4u, value);
+    cv_trace_clobber_window("W32", phys, value);
+    if (phys >= 0x978F0u && phys < 0x97910u) {
+        static uint32_t s_menu_region_w32 = 0;
+        if (++s_menu_region_w32 <= 128u) {
+            printf("[MENUREG-W32] f%u addr=0x%08X val=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                   g_ps1_frame, 0x80000000u | phys, value,
+                   g_diag_cpu ? g_diag_cpu->pc : 0u,
+                   g_diag_cpu ? g_diag_cpu->ra : 0u,
+                   g_diag_cpu ? g_diag_cpu->sp : 0u);
+            fflush(stdout);
+        }
+    }
+    {
+        static uint32_t s_trace_gpu_state_writes = 0;
+        int watch_gpu_state = (phys == 0x6C37Cu || phys == 0x97948u);
+        if (watch_gpu_state) {
+            ++s_trace_gpu_state_writes;
+        }
+        if (watch_gpu_state &&
+            (s_trace_gpu_state_writes <= 80u || (g_ps1_frame >= 100u && g_ps1_frame <= 110u))) {
+            printf("[GPU-STATE-W32] f%u phys=0x%05X val=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                   g_ps1_frame, phys, value,
+                   g_diag_cpu ? g_diag_cpu->pc : 0u,
+                   g_diag_cpu ? g_diag_cpu->ra : 0u,
+                   g_diag_cpu ? g_diag_cpu->sp : 0u);
+            fflush(stdout);
+        }
+    }
+    {
+        static uint32_t s_trace_gpu_next_writes = 0;
+        int watch_gpu_next = (phys == 0x3CB08u || phys == 0x542FCu);
+        if (watch_gpu_next) {
+            ++s_trace_gpu_next_writes;
+        }
+        if (watch_gpu_next &&
+            (s_trace_gpu_next_writes <= 40u || (g_ps1_frame >= 90u && g_ps1_frame <= 105u))) {
+            printf("[GPU-NEXT-W32] f%u phys=0x%05X val=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                   g_ps1_frame, phys, value,
+                   g_diag_cpu ? g_diag_cpu->pc : 0u,
+                   g_diag_cpu ? g_diag_cpu->ra : 0u,
+                   g_diag_cpu ? g_diag_cpu->sp : 0u);
+            fflush(stdout);
+        }
+    }
+    {
+        static uint32_t s_sound_w32_writes = 0;
+        int watch_sound_w32 = (phys == 0x13B61Cu || phys == 0x0BD1C4u);
+        if (watch_sound_w32) {
+            uint32_t old_val = 0;
+            uint8_t* p_check = addr_ptr(addr);
+            if (p_check) {
+                memcpy(&old_val, p_check, sizeof(old_val));
+            }
+            if (old_val != value) {
+                ++s_sound_w32_writes;
+                if (s_sound_w32_writes <= 80u || (g_ps1_frame >= 140u && g_ps1_frame <= 170u)) {
+                    printf("[SOUND-W32] f%u phys=0x%05X old=0x%08X new=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                           g_ps1_frame, phys, old_val, value,
+                           g_diag_cpu ? g_diag_cpu->pc : 0u,
+                           g_diag_cpu ? g_diag_cpu->ra : 0u,
+                           g_diag_cpu ? g_diag_cpu->sp : 0u);
+                    fflush(stdout);
+                }
+            }
+        }
+    }
     
     /* Trace writes to OT region 0x8001072C-0x80010768 */
     {
@@ -1067,14 +3476,254 @@ static void write_word(uint32_t addr, uint32_t value) {
                 fflush(stdout);
             }
         }
+        if (phys >= 0x1375BCu && phys < 0x1375C8u) {
+            static uint32_t s_roomdef_writes = 0;
+            uint32_t oldv = 0;
+            memcpy(&oldv, p, 4);
+            if (++s_roomdef_writes <= 80u) {
+                printf("[ROOMDEF-W32] f%u addr=0x%08X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       g_ps1_frame, 0x80000000u | phys, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        if (phys >= 0x0A245Cu && phys < 0x0A247Cu) {
+            static uint32_t s_dra_tele_writes = 0;
+            uint32_t oldv = 0;
+            memcpy(&oldv, p, 4);
+            if (++s_dra_tele_writes <= 80u) {
+                printf("[DRA-TELE-W] f%u addr=0x%08X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       g_ps1_frame, 0x80000000u | phys, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        if (phys == 0x73084u || phys == 0x73088u || phys == 0x730A0u ||
+            phys == 0x730D8u || phys == 0x730DCu || phys == 0x730F4u) {
+            static uint32_t s_tile_state_writes = 0;
+            uint32_t oldv = 0;
+            const char* name =
+                (phys == 0x73084u) ? "TILE-LAYOUT-W" :
+                (phys == 0x73088u) ? "TILE-TILEDEF-W" :
+                (phys == 0x730A0u) ? "TILE-FLAGS-W" :
+                (phys == 0x730D8u) ? "BG0-LAYOUT-W" :
+                (phys == 0x730DCu) ? "BG0-TILEDEF-W" : "BG0-FLAGS-W";
+            memcpy(&oldv, p, 4);
+            if (++s_tile_state_writes <= 160u) {
+                printf("[%s] f%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       name, g_ps1_frame, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        if (phys == 0x3C784u || phys == 0x3C790u || phys == 0x3C794u) {
+            static uint32_t s_gapi_data_writes = 0;
+            uint32_t oldv = 0;
+            const char* name =
+                (phys == 0x3C784u) ? "GAPI-ROOMS-W" :
+                (phys == 0x3C790u) ? "GAPI-OBJLAYOUT-W" : "GAPI-TILELAYERS-W";
+            memcpy(&oldv, p, 4);
+            if (++s_gapi_data_writes <= 120u) {
+                printf("[%s] f%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       name, g_ps1_frame, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        if ((phys >= 0x72EE8u && phys <= 0x72EFCu) &&
+            ((phys - 0x72EE8u) % 4u) == 0u) {
+            uint32_t oldv = 0;
+            uint32_t game_state = 0;
+            uint32_t stage_id = 0;
+            uint32_t cutscene_control = 0;
+            memcpy(&oldv, p, 4);
+            memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+            memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+            memcpy(&cutscene_control, &g_ram[0x3C704u], sizeof(cutscene_control));
+            if (oldv != value && game_state == 2u && (stage_id & 0xFFu) == 0x1Fu) {
+                static uint32_t s_st0_player_ctrl_w32 = 0;
+                const char* name =
+                    (phys == 0x72EE8u) ? "PADPRESSED" :
+                    (phys == 0x72EECu) ? "PADTAPPED" :
+                    (phys == 0x72EF0u) ? "PADHELD" :
+                    (phys == 0x72EF4u) ? "PADSIM" : "DEMO";
+                if (++s_st0_player_ctrl_w32 <= 160u || (s_st0_player_ctrl_w32 % 120u) == 0u) {
+                    printf("[ST0-%s-W32] f%u old=0x%08X new=0x%08X cut=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                           name, g_ps1_frame, oldv, value, cutscene_control,
+                           g_diag_cpu ? g_diag_cpu->pc : 0u,
+                           g_diag_cpu ? g_diag_cpu->ra : 0u,
+                           g_diag_cpu ? g_diag_cpu->sp : 0u);
+                    fflush(stdout);
+                }
+            }
+        }
+        if (phys == 0x6C3B8u || phys == 0x13C000u || phys == 0x13C004u ||
+            phys == 0x13C008u || phys == 0x73400u || phys == 0x73408u ||
+            phys == 0x7343Cu) {
+            uint32_t oldv = 0;
+            uint32_t game_state = 0;
+            uint32_t stage_id = 0;
+            const char* name =
+                (phys == 0x6C3B8u) ? "CURRENTENT" :
+                (phys == 0x13C000u) ? "PLOVL-ENT" :
+                (phys == 0x13C004u) ? "PLOVL-INIT" :
+                (phys == 0x13C008u) ? "PLOVL-STEP" :
+                (phys == 0x73400u) ? "PLAYERPFN" :
+                (phys == 0x73408u) ? "PLAYERPARAM" : "PLAYERPRIM";
+            memcpy(&oldv, p, 4);
+            memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+            memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+            if (oldv != value &&
+                (game_state == 4u || (game_state == 2u && (stage_id & 0xFFu) == 0x1Fu))) {
+                static uint32_t s_st0_init_ptr_w32 = 0;
+                if (++s_st0_init_ptr_w32 <= 200u || (s_st0_init_ptr_w32 % 160u) == 0u) {
+                    printf("[ST0-%s-W32] f%u gs=0x%08X st=0x%08X old=0x%08X new=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                           name, g_ps1_frame, game_state, stage_id, oldv, value,
+                           g_diag_cpu ? g_diag_cpu->pc : 0u,
+                           g_diag_cpu ? g_diag_cpu->ra : 0u,
+                           g_diag_cpu ? g_diag_cpu->sp : 0u);
+                    fflush(stdout);
+                }
+            }
+        }
         /* Trap writes to D_8006BAFC (phys 0x6BAFC) — loading status register */
         if (phys == 0x6BAFCu) {
             static uint32_t s_bafc_writes = 0;
             uint32_t oldv = 0;
+            uint32_t stage_id = 0;
+            uint32_t load_ovl_idx = 0;
+            uint32_t mode_3c730 = 0;
+            uint32_t state_97c98 = 0;
             memcpy(&oldv, p, 4);
-            if (++s_bafc_writes <= 40u) {
-                printf("[D6BAFC-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+            memcpy(&stage_id, &g_ram[0x974A0], 4);
+            memcpy(&load_ovl_idx, &g_ram[0x97918], 4);
+            memcpy(&mode_3c730, &g_ram[0x3C730], 4);
+            memcpy(&state_97c98, &g_ram[0x97C98], 4);
+            if (++s_bafc_writes <= 80u) {
+                printf("[D6BAFC-W] f%u #%u old=0x%08X new=0x%08X stage=0x%08X loadOvl=0x%08X mode730=0x%08X state7C98=0x%08X ra=0x%08X pc=0x%08X\n",
                        g_ps1_frame, s_bafc_writes, oldv, value,
+                       stage_id, load_ovl_idx, mode_3c730, state_97c98,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        if (phys == 0x974A0u || phys == 0x3C730u || phys == 0x97C98u || phys == 0x3C9A4u || phys == 0x6C374u) {
+            static uint32_t s_stage_state_writes = 0;
+            uint32_t oldv = 0;
+            if (phys == 0x3C9A4u && value == 2u && g_diag_cpu) {
+                uint32_t game_state = 0;
+                uint32_t menu_step = 0;
+                uint32_t stage_id_now = 0;
+                uint16_t pad_pressed = 0;
+                uint16_t pad_previous = 0;
+                uint16_t pad_tapped = 0;
+                memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+                memcpy(&menu_step, &g_ram[0x978F8], sizeof(menu_step));
+                memcpy(&stage_id_now, &g_ram[0x974A0], sizeof(stage_id_now));
+                memcpy(&pad_pressed, &g_ram[0x97490], sizeof(pad_pressed));
+                memcpy(&pad_previous, &g_ram[0x97492], sizeof(pad_previous));
+                memcpy(&pad_tapped, &g_ram[0x97494], sizeof(pad_tapped));
+                /* Legacy menu rescue for corrupted room-probe runs; keep it opt-in so
+                 * canonical title/menu validation doesn't silently rewrite state. */
+                if (cv_force_menu_engstep_clamp_enabled() &&
+                    game_state == 2u &&
+                    (menu_step > 0x1000u || menu_step == 0u)) {
+                    static uint32_t s_engstep_clamp = 0;
+                    static uint32_t s_engstep_zero_clamp = 0;
+                    static uint32_t s_engstep_menuinit = 0;
+                    uint32_t zero = 0u;
+                    if (menu_step > 0x1000u) {
+                        memcpy(&g_ram[0x978F8], &zero, sizeof(zero));
+                    }
+                    if (g_pad1_state == 0u && pad_pressed == 0u && pad_tapped == 0u) {
+                        value = 1u;
+                        if (menu_step > 0x1000u) {
+                            ++s_engstep_clamp;
+                            printf("[ENGSTEP-CLAMP] f%u #%u old_menu=0x%08X new_menu=0x%08X stage=0x%08X raw=0x%04X pressed=0x%04X prev=0x%04X tapped=0x%04X eng_new=0x%08X ra=0x%08X pc=0x%08X\n",
+                                   g_ps1_frame, s_engstep_clamp, menu_step, zero,
+                                   stage_id_now, g_pad1_state, pad_pressed, pad_previous, pad_tapped,
+                                   value,
+                                   g_diag_cpu ? g_diag_cpu->ra : 0u,
+                                   g_diag_cpu ? g_diag_cpu->pc : 0u);
+                        } else {
+                            ++s_engstep_zero_clamp;
+                            printf("[ENGSTEP-CLAMP0] f%u #%u menu=0x%08X stage=0x%08X raw=0x%04X pressed=0x%04X prev=0x%04X tapped=0x%04X eng_new=0x%08X ra=0x%08X pc=0x%08X\n",
+                                   g_ps1_frame, s_engstep_zero_clamp, menu_step,
+                                   stage_id_now, g_pad1_state, pad_pressed, pad_previous, pad_tapped,
+                                   value,
+                                   g_diag_cpu ? g_diag_cpu->ra : 0u,
+                                   g_diag_cpu ? g_diag_cpu->pc : 0u);
+                        }
+                        fflush(stdout);
+                    } else {
+                        ++s_engstep_menuinit;
+                        printf("[ENGSTEP-MENUINIT] f%u #%u eng=0x%08X menustep_old=0x%08X menustep_new=0x%08X stage=0x%08X raw=0x%04X pressed=0x%04X prev=0x%04X tapped=0x%04X ra=0x%08X pc=0x%08X\n",
+                               g_ps1_frame, s_engstep_menuinit, 1u, menu_step, zero,
+                               stage_id_now, g_pad1_state, pad_pressed, pad_previous, pad_tapped,
+                               g_diag_cpu ? g_diag_cpu->ra : 0u,
+                               g_diag_cpu ? g_diag_cpu->pc : 0u);
+                        fflush(stdout);
+                    }
+                }
+            }
+            const char* name = (phys == 0x974A0u) ? "STAGEID-W" :
+                               (phys == 0x3C730u) ? "MODE730-W" :
+                               (phys == 0x97C98u) ? "STATE7C98-W" :
+                               (phys == 0x6C374u) ? "TELEIDX-W" : "ENGSTEP-W";
+            memcpy(&oldv, p, 4);
+            if (phys == 0x3C9A4u && oldv == 0u && value == 1u && g_diag_cpu) {
+                uint32_t game_state = 0;
+                uint32_t stage_id_now = 0;
+                uint32_t playable_character = 0;
+                uint32_t menu_step = 0;
+                uint32_t menu_vis = 0;
+                uint32_t current_entity = 0;
+                memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+                memcpy(&stage_id_now, &g_ram[0x974A0u], sizeof(stage_id_now));
+                memcpy(&playable_character, &g_ram[0x3C9A0u], sizeof(playable_character));
+                memcpy(&menu_step, &g_ram[0x978F8u], sizeof(menu_step));
+                memcpy(&menu_vis, &g_ram[0x978FCu], sizeof(menu_vis));
+                memcpy(&current_entity, &g_ram[0x6C3B8u], sizeof(current_entity));
+                if (game_state == 2u && (stage_id_now & 0xFFu) == 0x1Fu) {
+                    static uint32_t s_st0_engstep1_ctx = 0;
+                    if (++s_st0_engstep1_ctx <= 4u) {
+                        uint32_t pc_words[5] = {0};
+                        uint32_t ra_words[5] = {0};
+                        uint32_t pc_base = g_diag_cpu->pc - 8u;
+                        uint32_t ra_base = g_diag_cpu->ra - 8u;
+                        for (uint32_t i = 0; i < 5u; i++) {
+                            memcpy(&pc_words[i], &g_ram[(pc_base + i * 4u) & 0x1FFFFFu], sizeof(uint32_t));
+                            memcpy(&ra_words[i], &g_ram[(ra_base + i * 4u) & 0x1FFFFFu], sizeof(uint32_t));
+                        }
+                        printf("[ST0-ENG1-CTX] f%u n=%u pc=0x%08X ra=0x%08X gs=0x%08X st=0x%08X play=%u menu=0x%08X menuvis=0x%08X cur=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X v0=0x%08X v1=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X s3=0x%08X\n",
+                               g_ps1_frame, s_st0_engstep1_ctx, g_diag_cpu->pc, g_diag_cpu->ra,
+                               game_state, stage_id_now, playable_character, menu_step, menu_vis,
+                               current_entity, g_diag_cpu->a0, g_diag_cpu->a1, g_diag_cpu->a2,
+                               g_diag_cpu->a3, g_diag_cpu->v0, g_diag_cpu->v1,
+                               g_diag_cpu->s0, g_diag_cpu->s1, g_diag_cpu->s2, g_diag_cpu->s3);
+                        printf("[ST0-ENG1-CODE-PC] 0x%08X:%08X 0x%08X:%08X 0x%08X:%08X 0x%08X:%08X 0x%08X:%08X\n",
+                               pc_base + 0u, pc_words[0], pc_base + 4u, pc_words[1], pc_base + 8u, pc_words[2],
+                               pc_base + 12u, pc_words[3], pc_base + 16u, pc_words[4]);
+                        printf("[ST0-ENG1-CODE-RA] 0x%08X:%08X 0x%08X:%08X 0x%08X:%08X 0x%08X:%08X 0x%08X:%08X\n",
+                               ra_base + 0u, ra_words[0], ra_base + 4u, ra_words[1], ra_base + 8u, ra_words[2],
+                               ra_base + 12u, ra_words[3], ra_base + 16u, ra_words[4]);
+                        fflush(stdout);
+                    }
+                }
+            }
+            if (phys == 0x97C98u) {
+                s_state_97c98_saved = value;
+                s_state_97c98_captured = 1;
+            }
+            if (++s_stage_state_writes <= 120u) {
+                printf("[%s] f%u #%u addr=0x%08X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       name, g_ps1_frame, s_stage_state_writes, 0x80000000u | phys,
+                       oldv, value,
                        g_diag_cpu ? g_diag_cpu->ra : 0u,
                        g_diag_cpu ? g_diag_cpu->pc : 0u);
                 fflush(stdout);
@@ -1106,6 +3755,32 @@ static void write_word(uint32_t addr, uint32_t value) {
                 fflush(stdout);
             }
         }
+        /* Trap writes to g_GameStep (phys 0x73064) */
+        if (phys == 0x73064u) {
+            static uint32_t s_gstep_writes = 0;
+            uint32_t oldv = 0;
+            memcpy(&oldv, p, 4);
+            if (++s_gstep_writes <= 80u) {
+                printf("[GAMESTEP-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       g_ps1_frame, s_gstep_writes, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        /* Trap writes to D_8003C728 (video busy flag) */
+        if (phys == 0x3C728u) {
+            static uint32_t s_c728_writes = 0;
+            uint32_t oldv = 0;
+            memcpy(&oldv, p, 4);
+            if (++s_c728_writes <= 80u) {
+                printf("[C728-W] f%u #%u old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       g_ps1_frame, s_c728_writes, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
         /* Trap writes to overlay B010 (phys 0x1BB010) — entity index for case 2 */
         if (phys == 0x1BB010u) {
             static uint32_t s_b010_writes = 0;
@@ -1119,21 +3794,40 @@ static void write_word(uint32_t addr, uint32_t value) {
                 fflush(stdout);
             }
         }
-        /* Trap writes to gate at phys 0x97494 (halfword, controls case 2 exit) */
+        /* Trap writes to g_pads[0].tapped at phys 0x97494 (halfword). */
         if (phys >= 0x97494u && phys <= 0x97495u) {
             static uint32_t s_gate_writes = 0;
             uint16_t oldv = 0;
             memcpy(&oldv, &g_ram[0x97494], 2);
             if (++s_gate_writes <= 40u) {
-                printf("[7494-W] f%u #%u phys=0x%X old=0x%04X val=0x%08X ra=0x%08X pc=0x%08X\n",
+                printf("[GPAD-TAP-W] f%u #%u phys=0x%X old=0x%04X val=0x%08X ra=0x%08X pc=0x%08X\n",
                        g_ps1_frame, s_gate_writes, phys, oldv, value,
                        g_diag_cpu ? g_diag_cpu->ra : 0u,
                        g_diag_cpu ? g_diag_cpu->pc : 0u);
                 fflush(stdout);
             }
         }
-        /* Track writes to function pointers at C778/C780 (case 6 handlers) */
-        if (phys == 0x3C778u || phys == 0x3C780u) {
+        if ((phys == 0x978F8u || phys == 0x973ECu ||
+             phys == 0xA82D0u || phys == 0xA82D4u ||
+             phys == 0xA82D8u || phys == 0xA82DCu ||
+             phys == 0xA82E0u) && (phys & 3u) == 0u) {
+            static uint32_t s_menu_state_writes = 0;
+            uint32_t oldv = 0;
+            const char* name = (phys == 0x978F8u) ? "MENUSTEP-W" :
+                               (phys == 0x973ECu) ? "MENUVIS-W" :
+                               "MENUPTR-W";
+            memcpy(&oldv, p, 4);
+            if (++s_menu_state_writes <= 80u) {
+                printf("[%s] f%u #%u addr=0x%08X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       name, g_ps1_frame, s_menu_state_writes, 0x80000000u | phys,
+                       oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
+                fflush(stdout);
+            }
+        }
+        /* Track writes to overlay callback slots around C774..C780 */
+        if (phys == 0x3C774u || phys == 0x3C778u || phys == 0x3C77Cu || phys == 0x3C780u) {
             static uint32_t s_fp_writes = 0;
             uint32_t oldv = 0;
             memcpy(&oldv, p, 4);
@@ -1142,6 +3836,19 @@ static void write_word(uint32_t addr, uint32_t value) {
                        g_ps1_frame, 0x80000000u | phys, oldv, value,
                        g_diag_cpu ? g_diag_cpu->pc : 0u,
                        g_diag_cpu ? g_diag_cpu->ra : 0u);
+                fflush(stdout);
+            }
+        }
+        /* Track room list/cursor state writes during gs=8 room setup */
+        if (phys == 0x1C1688u || phys == 0x1C168Cu || (phys >= 0x1C1694u && phys <= 0x1C1697u)) {
+            static uint32_t s_room_ptr_writes = 0;
+            uint32_t oldv = 0;
+            memcpy(&oldv, p, 4);
+            if (++s_room_ptr_writes <= 80u) {
+                printf("[ROOMPTR-W] f%u addr=0x%08X old=0x%08X new=0x%08X ra=0x%08X pc=0x%08X\n",
+                       g_ps1_frame, 0x80000000u | phys, oldv, value,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u);
                 fflush(stdout);
             }
         }
@@ -1245,6 +3952,17 @@ static void write_word(uint32_t addr, uint32_t value) {
         /* [CAM-WPW] camera scratchpad watchpoint — re-enable with LOG_ON_CHANGE(value, "CAM-WPW", ...) */
         /* [BCCA-WW] zone gate watchpoint — re-enable with LOG_ON_CHANGE(value, "BCCA-WW", ...) */
         memcpy(p, &value, 4);
+        if (cv_should_trace_gfx_window() &&
+            phys >= 0x72FA0u && phys < 0x73060u &&
+            ((phys - 0x72FA0u) % 0xCu) == 0u) {
+            static uint32_t s_gfxload_next_logs = 0;
+            uint32_t slot = (phys - 0x72FA0u) / 0xCu;
+            uint16_t kind = 0;
+            memcpy(&kind, &g_ram[0x72FA0u + slot * 0xCu + 4u], 2);
+            if (kind != 0u && ++s_gfxload_next_logs <= 48u) {
+                cv_log_gfxload_slot("GFXLOAD-NEXT", slot);
+            }
+        }
         return;
     }
 
@@ -1356,25 +4074,69 @@ static void write_word(uint32_t addr, uint32_t value) {
                         g_diag_cpu ? g_diag_cpu->sp : 0);
             }
         } else if ((value & 0x01000000u) && sync == 2u && dir == 1u) {
-            /* Linked-list mode, RAM→GPU (dir=1 = to-device): walk the OT chain from MADR */
+            /* Linked-list mode, RAM→GPU (dir=1 = to-device): walk the OT chain from MADR. */
+            extern int g_gpu_linked_dma;
             ++s_dma2_calls;
             uint32_t ptr = s_dma2_madr | 0x80000000u;
             uint32_t gp0_total = 0;
             uint32_t ll_count = 0;
+            if (s_dma2_madr < 0x1000u) {
+                static uint32_t s_dma2_low_logs = 0;
+                if (++s_dma2_low_logs <= 24u) {
+                    uint32_t hdr = 0;
+                    uint32_t w0 = 0;
+                    uint32_t w1 = 0;
+                    uint32_t w2 = 0;
+                    uint32_t cur_ent = 0;
+                    uint8_t* ph = addr_ptr(ptr);
+                    if (ph) {
+                        memcpy(&hdr, ph + 0x0u, 4);
+                        memcpy(&w0, ph + 0x4u, 4);
+                        memcpy(&w1, ph + 0x8u, 4);
+                        memcpy(&w2, ph + 0xCu, 4);
+                    }
+                    memcpy(&cur_ent, &g_ram[0x6C3B8u], sizeof(cur_ent));
+                    printf("[DMA2-LOW-MADR] f%u madr=0x%08X bcr=0x%08X chcr=0x%08X hdr=0x%08X w0=0x%08X w1=0x%08X w2=0x%08X pc=0x%08X ra=0x%08X\n",
+                           g_ps1_frame, s_dma2_madr, s_dma2_bcr, value, hdr, w0, w1, w2,
+                           g_diag_cpu ? g_diag_cpu->pc : 0u,
+                           g_diag_cpu ? g_diag_cpu->ra : 0u);
+                    fflush(stdout);
+                    cv_dump_entity_prim_state("DMA2-LOW-ENT", cur_ent);
+                }
+            }
+            g_gpu_linked_dma = 1;
             for (int ll_limit = 0; ll_limit < 65536; ll_limit++) {
                 uint8_t* ph = addr_ptr(ptr);
                 if (!ph) break;
                 uint32_t hdr; memcpy(&hdr, ph, 4);
                 uint8_t cnt = (uint8_t)(hdr >> 24);
                 ll_count++;
+                if (s_dma2_madr == 0x00000474u) {
+                    uint32_t w0 = 0, w1 = 0;
+                    uint8_t* pw0 = addr_ptr(ptr + 4u);
+                    uint8_t* pw1 = addr_ptr(ptr + 8u);
+                    if (pw0) memcpy(&w0, pw0, 4);
+                    if (pw1) memcpy(&w1, pw1, 4);
+                    printf("[DMA2-LL-DBG] f%u entry=%u ptr=0x%08X hdr=0x%08X cnt=%u next=0x%06X w0=0x%08X w1=0x%08X\n",
+                           g_ps1_frame, ll_count, ptr, hdr, cnt, hdr & 0xFFFFFFu, w0, w1);
+                    fflush(stdout);
+                }
                 for (uint8_t wi = 0; wi < cnt; wi++) {
                     uint8_t* pw = addr_ptr(ptr + 4u + wi * 4u);
                     if (pw) { uint32_t w; memcpy(&w, pw, 4); gpu_submit_word(w); gp0_total++; }
+                }
+                /* Match the DrawOTag OT walker: an A0 CPU→VRAM command inside one
+                 * linked-list entry must not consume the following OT entry headers
+                 * as fake pixel payload. */
+                {
+                    extern void gpu_abort_streaming(void);
+                    gpu_abort_streaming();
                 }
                 uint32_t nxt = hdr & 0xFFFFFFu;
                 if (nxt == 0xFFFFFFu || nxt == 0u) break;
                 ptr = nxt | 0x80000000u;
             }
+            g_gpu_linked_dma = 0;
             if (s_dma2_calls <= 20u || gp0_total > 0u || (s_dma2_calls % 500u) == 0u) {
                 printf("[DMA2-LL] #%u f%u madr=0x%08X links=%u gp0_words=%u\n",
                        s_dma2_calls, g_ps1_frame, s_dma2_madr, ll_count, gp0_total);
@@ -1523,10 +4285,16 @@ static uint16_t read_half(uint32_t addr) {
     {
         static int s_trace_cv_cb_reads = -1;
         static uint32_t s_trace_cv_cb_reads_count = 0;
+        static int s_trace_cv_clutid_reads = -1;
+        static uint32_t s_trace_cv_clutid_reads_count = 0;
         uint32_t phys = addr & 0x1FFFFFFFu;
         if (s_trace_cv_cb_reads < 0) {
             const char* env = getenv("PSX_CV_TRACE_CB_READS");
             s_trace_cv_cb_reads = (env && env[0] && env[0] != '0') ? 1 : 0;
+        }
+        if (s_trace_cv_clutid_reads < 0) {
+            const char* env = getenv("PSX_CV_TRACE_CLUTID_READS");
+            s_trace_cv_clutid_reads = (env && env[0] && env[0] != '0') ? 1 : 0;
         }
         if (s_trace_cv_cb_reads && s_trace_cv_cb_reads_count < 200u &&
             ((phys >= 0x32AB0u && phys <= 0x32AB3u) ||
@@ -1539,6 +4307,17 @@ static uint16_t read_half(uint32_t addr) {
                    g_diag_cpu ? g_diag_cpu->sp : 0u);
             fflush(stdout);
         }
+        if (s_trace_cv_clutid_reads &&
+            s_trace_cv_clutid_reads_count < 240u &&
+            phys >= 0x3C104u && phys < 0x3C304u) {
+            ++s_trace_cv_clutid_reads_count;
+            printf("[CLUTID-R16] f%u idx=0x%02X addr=0x%08X val=0x%04X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                   g_ps1_frame, (unsigned)((phys - 0x3C104u) >> 1), phys, (uint32_t)v,
+                   g_diag_cpu ? g_diag_cpu->pc : 0u,
+                   g_diag_cpu ? g_diag_cpu->ra : 0u,
+                   g_diag_cpu ? g_diag_cpu->sp : 0u);
+            fflush(stdout);
+        }
     }
     return v;
 }
@@ -1546,6 +4325,19 @@ static void write_half(uint32_t addr, uint16_t value) {
     uint8_t* p = addr_ptr(addr);
     if (p) {
         uint32_t phys = addr & 0x1FFFFFFFu;
+        trace_suspicious_code_write("W16", phys, 2u, (uint32_t)value);
+        cv_trace_clobber_window("W16", phys, (uint32_t)value);
+        if (phys >= 0x978F0u && phys < 0x97910u) {
+            static uint32_t s_menu_region_w16 = 0;
+            if (++s_menu_region_w16 <= 128u) {
+                printf("[MENUREG-W16] f%u addr=0x%08X val=0x%04X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                       g_ps1_frame, 0x80000000u | phys, (uint32_t)value,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->sp : 0u);
+                fflush(stdout);
+            }
+        }
         static int s_trace_cv_cb_writes = -1;
         static int s_trace_cv_ptr_writes = -1;
         static uint32_t s_othead_w16_writes = 0;
@@ -1621,6 +4413,31 @@ static void write_half(uint32_t addr, uint16_t value) {
         /* [BCA2-WH] player control flag — re-enable with LOG_ON_CHANGE((uint32_t)value, "BCA2-WH", ...) */
         /* [BCCA-WH] zone gate half — re-enable with LOG_ON_CHANGE((uint32_t)value, "BCCA-WH", ...) */
         /* [TERR-WH] terrain pointer — re-enable with LOG_ON_CHANGE((uint32_t)value, "TERR-WH", ...) */
+        if (phys == 0x73404u || phys == 0x7342Cu || phys == 0x7342Eu) {
+            uint16_t oldv = 0;
+            uint32_t game_state = 0;
+            uint32_t stage_id = 0;
+            uint32_t cutscene_control = 0;
+            const char* name =
+                (phys == 0x73404u) ? "PLAYERSTEP" :
+                (phys == 0x7342Cu) ? "ANIMSET" : "ANIMFRAME";
+            memcpy(&oldv, p, 2);
+            memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+            memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+            memcpy(&cutscene_control, &g_ram[0x3C704u], sizeof(cutscene_control));
+            if (oldv != value && game_state == 2u && (stage_id & 0xFFu) == 0x1Fu) {
+                static uint32_t s_st0_player_ctrl_w16 = 0;
+                if (++s_st0_player_ctrl_w16 <= 220u || (s_st0_player_ctrl_w16 % 160u) == 0u) {
+                    printf("[ST0-%s-W16] f%u old=0x%04X new=0x%04X cut=0x%08X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                           name, g_ps1_frame, (uint32_t)oldv, (uint32_t)value,
+                           cutscene_control,
+                           g_diag_cpu ? g_diag_cpu->pc : 0u,
+                           g_diag_cpu ? g_diag_cpu->ra : 0u,
+                           g_diag_cpu ? g_diag_cpu->sp : 0u);
+                    fflush(stdout);
+                }
+            }
+        }
         memcpy(p, &value, 2);
     } else {
         mmio_trace("W", addr, value, 16);
@@ -1702,6 +4519,19 @@ static void write_byte(uint32_t addr, uint8_t value) {
     uint8_t* p = addr_ptr(addr);
     if (p) {
         uint32_t phys = addr & 0x1FFFFFFFu;
+        trace_suspicious_code_write("W8", phys, 1u, (uint32_t)value);
+        cv_trace_clobber_window("W8", phys, (uint32_t)value);
+        if (phys >= 0x978F0u && phys < 0x97910u) {
+            static uint32_t s_menu_region_w8 = 0;
+            if (++s_menu_region_w8 <= 128u) {
+                printf("[MENUREG-W8] f%u addr=0x%08X val=0x%02X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                       g_ps1_frame, 0x80000000u | phys, (uint32_t)value,
+                       g_diag_cpu ? g_diag_cpu->pc : 0u,
+                       g_diag_cpu ? g_diag_cpu->ra : 0u,
+                       g_diag_cpu ? g_diag_cpu->sp : 0u);
+                fflush(stdout);
+            }
+        }
         static int s_trace_cv_cb_writes = -1;
         static int s_trace_cv_ptr_writes = -1;
         static uint32_t s_othead_w8_writes = 0;
@@ -1719,6 +4549,21 @@ static void write_byte(uint32_t addr, uint8_t value) {
         if (s_trace_ot_writes < 0) {
             const char* env = getenv("PSX_CV_TRACE_OT_WRITES");
             s_trace_ot_writes = (env && env[0] && env[0] != '0') ? 1 : 0;
+        }
+        if (phys == 0x13AE80u || phys == 0x1390A0u) {
+            static uint32_t s_sound_w8_writes = 0;
+            uint8_t oldv = *p;
+            if (oldv != value) {
+                ++s_sound_w8_writes;
+                if (s_sound_w8_writes <= 120u || (g_ps1_frame >= 140u && g_ps1_frame <= 170u)) {
+                    printf("[SOUND-W8] f%u phys=0x%05X old=0x%02X new=0x%02X pc=0x%08X ra=0x%08X sp=0x%08X\n",
+                           g_ps1_frame, phys, (uint32_t)oldv, (uint32_t)value,
+                           g_diag_cpu ? g_diag_cpu->pc : 0u,
+                           g_diag_cpu ? g_diag_cpu->ra : 0u,
+                           g_diag_cpu ? g_diag_cpu->sp : 0u);
+                    fflush(stdout);
+                }
+            }
         }
         
         /* Trace writes to OT region 0x8001072C-0x80010768 (16 slots * 4 bytes) */
@@ -1951,8 +4796,32 @@ void psx_runtime_init(CPUState* cpu) {
 }
 
 void psx_runtime_load(uint32_t addr, const uint8_t* data, uint32_t size) {
+    uint32_t sample = 0u;
+    const uint32_t ram_size = (uint32_t)sizeof(g_ram);
     uint32_t phys = addr & 0x1FFFFFFF;
-    memcpy(&g_ram[phys], data, size);
+    if (size >= 4u && data) {
+        memcpy(&sample, data, 4);
+    }
+    if (!data || size == 0u) {
+        return;
+    }
+
+    /* CdRead destinations can legally alias the 2MB main RAM mirror above
+     * 0x801FFFFF. Mirror them back into physical RAM and wrap safely if the
+     * transfer crosses the end of the 2MB window. */
+    uint32_t ram_phys = phys & (ram_size - 1u);
+    uint32_t first_chunk = ram_size - ram_phys;
+    if (first_chunk > size) {
+        first_chunk = size;
+    }
+
+    trace_suspicious_code_write("RUNTIME-LOAD", ram_phys, first_chunk, sample);
+    memcpy(&g_ram[ram_phys], data, first_chunk);
+
+    if (first_chunk < size) {
+        trace_suspicious_code_write("RUNTIME-LOAD", 0u, size - first_chunk, sample);
+        memcpy(&g_ram[0], data + first_chunk, size - first_chunk);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -2171,6 +5040,64 @@ static int mips_exec_one(CPUState* cpu, uint32_t* R[32],
     }
 }
 
+static int cv_try_repair_st0_dra_before_engine_init(uint32_t pc, uint32_t ra) {
+    uint32_t game_state = 0;
+    uint32_t stage_id = 0;
+    uint32_t eng_step = 0;
+    uint32_t tele_index = 0;
+    uint16_t tele_stage = 0;
+    uint16_t expected_stage = 0;
+    uint32_t expected_index = 0;
+    uint32_t tele_off = 0;
+    int repaired = 0;
+    int stage_id_repaired = 0;
+
+    if (!s_dra_tele_captured || !s_dra_stage_lba_captured) {
+        return 0;
+    }
+
+    memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+    memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+    memcpy(&eng_step, &g_ram[0x3C9A4u], sizeof(eng_step));
+    memcpy(&tele_index, &g_ram[0x6C374u], sizeof(tele_index));
+
+    expected_index = (uint32_t)(s_dra_stage_lba_saved[0x1Fu * 44u] & 0xFFu);
+    if (game_state != 2u || eng_step != 0u ||
+        ((stage_id & 0xFFu) != 0x1Fu && (stage_id & 0xFFu) != 0x00u) ||
+        (tele_index & 0xFFu) != expected_index) {
+        return 0;
+    }
+
+    tele_off = expected_index * 10u;
+    memcpy(&tele_stage, &g_ram[0xA245Cu + tele_off + 8u], sizeof(tele_stage));
+    memcpy(&expected_stage, &s_dra_tele_saved[tele_off + 8u], sizeof(expected_stage));
+
+    if (memcmp(&g_ram[0xA245Cu + tele_off], &s_dra_tele_saved[tele_off], 10u) != 0 ||
+        memcmp(&g_ram[0xA3C68u], s_dra_stage_lba_saved, sizeof(s_dra_stage_lba_saved)) != 0) {
+        memcpy(&g_ram[0xA245Cu], s_dra_tele_saved, sizeof(s_dra_tele_saved));
+        memcpy(&g_ram[0xA3C68u], s_dra_stage_lba_saved, sizeof(s_dra_stage_lba_saved));
+        repaired = 1;
+    }
+
+    if ((stage_id & 0xFFu) == 0x00u && (expected_stage & 0xFFu) == 0x1Fu) {
+        uint32_t restored_stage_id = 0x1Fu;
+        memcpy(&g_ram[0x974A0u], &restored_stage_id, sizeof(restored_stage_id));
+        stage_id_repaired = 1;
+    }
+
+    if (repaired || stage_id_repaired) {
+        static uint32_t s_st0_dra_guard_logs = 0;
+        if (++s_st0_dra_guard_logs <= 24u) {
+            printf("[ST0-DRA-GUARD] f%u pc=0x%08X ra=0x%08X idx=0x%02X teleStage=0x%04X expStage=0x%04X stage=0x%08X repaired=%d stageFix=%d\n",
+                   g_ps1_frame, pc, ra, expected_index, (uint32_t)tele_stage,
+                   (uint32_t)expected_stage, stage_id, repaired, stage_id_repaired);
+            fflush(stdout);
+        }
+    }
+
+    return repaired || stage_id_repaired;
+}
+
 void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     /* Register pointer array — builds once per call depth */
     uint32_t zero_sink = 0;
@@ -2188,105 +5115,90 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     static int s_log = 0; ++s_log;
     /* [INTERP] enter — first 8: printf("[INTERP] enter 0x%08X ra=0x%08X\n", start_pc, cpu->ra); */
 
-    /* ---- CD Sector Loader intercept (func_801073C0) ----
-     * Called from overlay loading code at 0x8010882C with:
-     *   a0=sector, a1=0, a2=size, a3=completion_flag_addr
-     * On real PS1, this sets up async CD read. In our recompiler,
-     * we load sectors directly from ISO. */
+    /* 0x801B410C = HandleTitleScreen: let it run in the interpreter so it can
+     * manage title state and START handling naturally. Streaming helpers stay
+     * hooked below, and 0x801B4048 remains the logo-init entry point to watch. */
+
+    if (start_pc == 0x801B994Cu) {
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (game_state <= 1u || (video_busy != 0u && game_state == 5u)) {
+            if (video_busy != 0u) run_sel_stream_player();
+            return;
+        }
+    }
+
+    if (start_pc == 0x801B9C80u) {
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (game_state <= 1u || (video_busy != 0u && game_state == 5u)) {
+            if (video_busy != 0u) run_sel_stream_player();
+            cpu->v0 = 0;
+            return;
+        }
+    }
+
+    if (start_pc == 0x801B97BCu) {
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (game_state <= 1u || (video_busy != 0u && game_state == 5u)) {
+            if (video_busy != 0u) run_sel_stream_player();
+            cpu->v0 = 0; /* StreamNextVlc retries a few times, then returns cleanly. */
+            return;
+        }
+    }
+
+    /* ---- UpdateCd (func_80108448) ----
+     * The game can enqueue BAFC/C398 load requests near the end of a frame,
+     * then immediately run UpdateCd before our UpdateGame auto-clear shim gets
+     * another turn. Defer UpdateCd for that frame so the existing synchronous
+     * loader in UpdateGame can consume the request on the next frame instead of
+     * falling into the original async CD state machine. */
+    if (start_pc == 0x80108448u) {
+        uint32_t v_bafc = 0;
+        uint32_t v_c398 = 0;
+        uint32_t game_state = 0;
+        uint32_t sub_state = 0;
+        memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
+        memcpy(&v_c398, &g_ram[0x6C398], 4);
+        memcpy(&game_state, &g_ram[0x3C734], 4);
+        memcpy(&sub_state, &g_ram[0x73060], 4);
+        if (v_bafc != 0u && v_c398 != 0u) {
+            static uint32_t s_updatecd_defer = 0;
+            if (++s_updatecd_defer <= 64u || (s_updatecd_defer % 256u) == 0u) {
+                fprintf(stderr,
+                        "[UPDATECD-DEFER] #%u f%u gs=%u sub=%u loadFile=0x%08X cdStep=0x%08X -> deferring to UpdateGame autoclear\n",
+                        s_updatecd_defer, g_ps1_frame, game_state, sub_state,
+                        v_bafc, v_c398);
+                fflush(stderr);
+            }
+            cpu->v0 = 0;
+            return;
+        }
+    }
+
+    /* ---- CD callback reset (func_801073C0) ----
+     * In the real game this only clears CdReady/CdData callbacks.
+     * It is NOT a sector loader. Treating it as one corrupts RAM,
+     * because the argument registers at these call sites are unrelated
+     * to a destination buffer. */
     if (start_pc == 0x801073C0u) {
-        static uint32_t s_cd_load_calls = 0;
-        s_cd_load_calls++;
-        uint32_t sector   = cpu->a0;
-        uint32_t mode     = cpu->a1;
-        uint32_t size     = cpu->a2;
-        uint32_t flag_ptr = cpu->a3;
-        fprintf(stderr, "[CD-SECTOR-LOAD] #%u f%u sector=0x%X(%u) mode=%u size=0x%X flag=0x%08X ra=0x%08X sp=0x%08X\n",
-                s_cd_load_calls, g_ps1_frame, sector, sector, mode, size, flag_ptr, cpu->ra, cpu->sp);
-        /* Dump first 32 MIPS instructions at func_801073C0 (first call only) */
-        if (s_cd_load_calls == 1u) {
-            fprintf(stderr, "[CD-SECTOR-LOAD] MIPS dump at 0x801073C0 (32 instrs):\n");
-            for (int _i = 0; _i < 32; _i++) {
-                uint32_t addr = 0x1073C0 + _i * 4;
-                uint32_t instr = 0;
-                if (addr + 4 <= 0x200000u) memcpy(&instr, &g_ram[addr], 4);
-                fprintf(stderr, "  0x%08X: %08X\n", 0x801073C0u + _i*4, instr);
-            }
-            /* Dump RAM around completion flag structure */
-            fprintf(stderr, "[CD-SECTOR-LOAD] RAM[0x3C0E0..0x3C110]:\n");
-            for (uint32_t off = 0x3C0E0; off < 0x3C110; off += 4) {
-                uint32_t val = 0;
-                memcpy(&val, &g_ram[off], 4);
-                if (val != 0) fprintf(stderr, "  [0x%05X] = 0x%08X\n", off, val);
-            }
+        static uint32_t s_cd_reset_calls = 0;
+        s_cd_reset_calls++;
+        if (s_cd_reset_calls <= 32u || (s_cd_reset_calls % 128u) == 0u) {
+            fprintf(stderr,
+                    "[CD-CB-RESET] #%u f%u ra=0x%08X pc=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
+                    s_cd_reset_calls, g_ps1_frame, cpu->ra, start_pc,
+                    cpu->a0, cpu->a1, cpu->a2, cpu->a3);
             fflush(stderr);
         }
-        /* Load sectors from ISO if we have valid parameters */
-        if (sector > 0 && size > 0 && size < 0x200000u) {
-            /* Destination: the game's overlay loading system stores
-             * the destination in a global. Check RAM[0x6C3AC] (D_8006C3AC
-             * = g_CdLoadDest). If 0, fall back to 0x80180000. */
-            uint32_t dest = 0;
-            memcpy(&dest, &g_ram[0x6C3AC], 4);
-            if (dest == 0) {
-                /* Also check RAM[0x3C3B4] as an alternate location */
-                memcpy(&dest, &g_ram[0x3C3B4], 4);
-            }
-            /* If still 0, check stack frame for destination (sp+0x10 or sp+0x14) */
-            if (dest == 0 && cpu->sp >= 0x80000000u) {
-                uint32_t sp_phys = cpu->sp & 0x1FFFFFu;
-                if (sp_phys + 0x20 < 0x200000u) {
-                    for (int si = 0; si < 8; si++) {
-                        uint32_t sv = 0;
-                        memcpy(&sv, &g_ram[sp_phys + si*4], 4);
-                        fprintf(stderr, "[CD-SECTOR-LOAD] stack[sp+0x%02X]=0x%08X\n", si*4, sv);
-                    }
-                }
-            }
-            if (dest == 0) dest = 0x80180000u;  /* default overlay region */
-            uint32_t dest_phys = dest & 0x1FFFFFu;
-            uint32_t sectors_needed = (size + 2047u) / 2048u;
-            fprintf(stderr, "[CD-SECTOR-LOAD] loading %u sectors from %u to 0x%08X (phys 0x%05X)\n",
-                    sectors_needed, sector, dest, dest_phys);
-            uint8_t sec_buf[2048];
-            int ok = 1;
-            for (uint32_t i = 0; i < sectors_needed; i++) {
-                if (!psx_cdrom_read_sector(sector + i, sec_buf)) {
-                    fprintf(stderr, "[CD-SECTOR-LOAD] FAILED reading sector %u\n", sector + i);
-                    ok = 0;
-                    break;
-                }
-                uint32_t copy_size = 2048u;
-                if (i == sectors_needed - 1u) {
-                    uint32_t remainder = size % 2048u;
-                    if (remainder != 0) copy_size = remainder;
-                }
-                uint32_t dp = dest_phys + i * 2048u;
-                if (dp + copy_size <= 0x200000u) {
-                    memcpy(&g_ram[dp], sec_buf, copy_size);
-                }
-            }
-            fprintf(stderr, "[CD-SECTOR-LOAD] done: ok=%d, loaded %u bytes to 0x%08X\n",
-                    ok, size, dest);
-            /* Dump first 32 bytes at destination */
-            fprintf(stderr, "[CD-SECTOR-LOAD] data@dest: ");
-            for (int dd = 0; dd < 32 && dest_phys + dd < 0x200000u; dd++) {
-                fprintf(stderr, "%02X", g_ram[dest_phys + dd]);
-                if ((dd & 3) == 3) fprintf(stderr, " ");
-            }
-            fprintf(stderr, "\n");
-            fflush(stderr);
-            /* Set completion flag to 0 (loading complete) */
-            if (flag_ptr >= 0x80000000u) {
-                uint32_t flag_phys = flag_ptr & 0x1FFFFFu;
-                if (flag_phys + 4 <= 0x200000u) {
-                    uint32_t zero = 0;
-                    memcpy(&g_ram[flag_phys], &zero, 4);
-                    fprintf(stderr, "[CD-SECTOR-LOAD] cleared flag at 0x%08X\n", flag_ptr);
-                }
-            }
-        }
-        cpu->v0 = 0;  /* return success */
-        fflush(stderr);
+        cpu->v0 = 0;
         return;
     }
 
@@ -2302,6 +5214,115 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         }
         cpu->v0 = 0;
         return;
+    }
+
+    if (start_pc == 0x800E385Cu) {
+        uint32_t game_state = 0;
+        uint32_t sub_state = 0;
+        uint32_t v_bafc = 0;
+        uint32_t v_c398 = 0;
+        memcpy(&game_state, &g_ram[0x3C734], 4);
+        memcpy(&sub_state, &g_ram[0x73060], 4);
+        memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
+        memcpy(&v_c398, &g_ram[0x6C398], 4);
+        if (g_ps1_frame >= 807u && g_ps1_frame < 830u) {
+            static uint32_t s_post_updatecd = 0;
+            if (++s_post_updatecd <= 80u) {
+                fprintf(stderr,
+                        "[POST-UPDATECD] #%u f%u gs=%u sub=%u BAFC=0x%08X C398=0x%08X ra=0x%08X\n",
+                        s_post_updatecd, g_ps1_frame, game_state, sub_state,
+                        v_bafc, v_c398, cpu->ra);
+                fflush(stderr);
+            }
+        }
+    }
+
+    if (start_pc == 0x800EB314u) {
+        uint32_t game_state = 0;
+        uint32_t sub_state = 0;
+        uint32_t v_bafc = 0;
+        uint32_t v_c398 = 0;
+        memcpy(&game_state, &g_ram[0x3C734], 4);
+        memcpy(&sub_state, &g_ram[0x73060], 4);
+        memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
+        memcpy(&v_c398, &g_ram[0x6C398], 4);
+        if (g_ps1_frame >= 807u && g_ps1_frame < 830u) {
+            static uint32_t s_load_pending_gfx = 0;
+            if (++s_load_pending_gfx <= 80u) {
+                fprintf(stderr,
+                        "[LOADPENDINGGFX] #%u f%u gs=%u sub=%u BAFC=0x%08X C398=0x%08X ra=0x%08X\n",
+                        s_load_pending_gfx, g_ps1_frame, game_state, sub_state,
+                        v_bafc, v_c398, cpu->ra);
+                fflush(stderr);
+            }
+        }
+        if (cv_should_trace_gfx_window()) {
+            uint32_t active = 0;
+            for (uint32_t i = 0; i < 16u; i++) {
+                uint32_t next = 0;
+                uint16_t kind = 0;
+                uint32_t base = 0x72FA0u + i * 0xCu;
+                memcpy(&next, &g_ram[base + 0], 4);
+                memcpy(&kind, &g_ram[base + 4], 2);
+                if (kind != 0u || next != 0u) {
+                    active++;
+                }
+            }
+            if (active != 0u) {
+                static uint32_t s_loadpendinggfx_trace_logs = 0;
+                if (++s_loadpendinggfx_trace_logs <= 48u) {
+                    fprintf(stderr,
+                            "[LOADPENDINGGFX-TRACE] #%u f%u gs=%u sub=%u BAFC=0x%08X C398=0x%08X active=%u ra=0x%08X\n",
+                            s_loadpendinggfx_trace_logs, g_ps1_frame, game_state, sub_state,
+                            v_bafc, v_c398, active, cpu->ra);
+                    fflush(stderr);
+                    uint32_t printed = 0;
+                    for (uint32_t i = 0; i < 16u && printed < 4u; i++) {
+                        uint32_t next = 0;
+                        uint16_t kind = 0;
+                        uint32_t base = 0x72FA0u + i * 0xCu;
+                        memcpy(&next, &g_ram[base + 0], 4);
+                        memcpy(&kind, &g_ram[base + 4], 2);
+                        if (kind != 0u || next != 0u) {
+                            cv_log_gfxload_slot("LOADPENDINGGFX-SLOT", i);
+                            printed++;
+                        }
+                    }
+                }
+            }
+        }
+        if (game_state == 2u &&
+            (g_ps1_frame <= 2350u || g_ps1_frame == 2457u ||
+             g_ps1_frame == 2517u || g_ps1_frame == 2577u)) {
+            static uint32_t s_gs2_gfxload_logs = 0;
+            if (++s_gs2_gfxload_logs <= 64u) {
+                uint32_t active = 0;
+                fprintf(stderr,
+                        "[GS2-GFXLOAD] #%u f%u sub=%u BAFC=0x%08X C398=0x%08X",
+                        s_gs2_gfxload_logs, g_ps1_frame, sub_state, v_bafc, v_c398);
+                for (uint32_t i = 0; i < 16u; i++) {
+                    uint32_t next = 0;
+                    uint16_t kind = 0;
+                    int16_t unk6 = 0, unk8 = 0, unkA = 0;
+                    uint32_t base = 0x72FA0u + i * 0xCu;
+                    memcpy(&next, &g_ram[base + 0], 4);
+                    memcpy(&kind, &g_ram[base + 4], 2);
+                    memcpy(&unk6, &g_ram[base + 6], 2);
+                    memcpy(&unk8, &g_ram[base + 8], 2);
+                    memcpy(&unkA, &g_ram[base + 10], 2);
+                    if (kind != 0 || next != 0) {
+                        active++;
+                        if (active <= 6u) {
+                            fprintf(stderr,
+                                    " | i%u next=0x%08X kind=0x%04X u6=%d u8=%d uA=%d",
+                                    i, next, kind, unk6, unk8, unkA);
+                        }
+                    }
+                }
+                fprintf(stderr, " | active=%u\n", active);
+                fflush(stderr);
+            }
+        }
     }
 
     /* DebugUpdate (0x800E2F34): body compiled out in VERSION_US.
@@ -2326,14 +5347,77 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
      * Also trace sub-calls to understand what Game_Init does. */
     if (start_pc == 0x800E7AECu) {
         static uint32_t s_upd_calls = 0;
+        cv_sync_game_pad1(g_pad1_state);
         uint32_t game_state = 0;
         memcpy(&game_state, &g_ram[0x3C734], 4);
         uint32_t sub_state = 0;
         memcpy(&sub_state, &g_ram[0x73060], 4);
+        uint32_t eng_step = 0;
+        uint32_t menu_step = 0;
+        uint32_t menu_vis = 0;
+        memcpy(&eng_step, &g_ram[0x3C9A4], 4);
+        memcpy(&menu_step, &g_ram[0x978F8], 4);
+        memcpy(&menu_vis, &g_ram[0x973EC], 4);
         if (++s_upd_calls <= 20u || (s_upd_calls % 240u) == 0u) {
             printf("[UPDATEGAME] f%u #%u g_GameState=%u sub_state=%u ra=0x%08X\n",
                    g_ps1_frame, s_upd_calls, game_state, sub_state, cpu->ra);
             fflush(stdout);
+        }
+        if (g_ps1_frame <= 840u) {
+            static uint8_t s_prev_menu_bytes[16];
+            static int s_prev_menu_bytes_valid = 0;
+            static uint32_t s_menu_bytes_logs = 0;
+            uint8_t menu_bytes[16];
+            memcpy(menu_bytes, &g_ram[0x978F0], sizeof(menu_bytes));
+            if (!s_prev_menu_bytes_valid ||
+                memcmp(menu_bytes, s_prev_menu_bytes, sizeof(menu_bytes)) != 0) {
+                if (++s_menu_bytes_logs <= 64u) {
+                    printf("[MENU-BYTES] f%u gs=%u sub=%u eng=0x%08X menustep=0x%08X bytes=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                           g_ps1_frame, game_state, sub_state, eng_step, menu_step,
+                           menu_bytes[0], menu_bytes[1], menu_bytes[2], menu_bytes[3],
+                           menu_bytes[4], menu_bytes[5], menu_bytes[6], menu_bytes[7],
+                           menu_bytes[8], menu_bytes[9], menu_bytes[10], menu_bytes[11],
+                           menu_bytes[12], menu_bytes[13], menu_bytes[14], menu_bytes[15]);
+                    fflush(stdout);
+                }
+                memcpy(s_prev_menu_bytes, menu_bytes, sizeof(s_prev_menu_bytes));
+                s_prev_menu_bytes_valid = 1;
+            }
+        }
+        if (g_ps1_frame >= 820u && g_ps1_frame <= 840u) {
+            static uint32_t s_prev_watch_frame = 0xFFFFFFFFu;
+            static uint32_t s_prev_watch_eng = 0xFFFFFFFFu;
+            static uint32_t s_prev_watch_menu = 0xFFFFFFFFu;
+            static uint32_t s_prev_watch_vis = 0xFFFFFFFFu;
+            static uint32_t s_watch_logs = 0;
+            if (g_ps1_frame != s_prev_watch_frame ||
+                eng_step != s_prev_watch_eng ||
+                menu_step != s_prev_watch_menu ||
+                menu_vis != s_prev_watch_vis) {
+                if (++s_watch_logs <= 48u) {
+                    printf("[UG-MENUSTATE] f%u gs=%u sub=%u eng=0x%08X menustep=0x%08X menuvis=0x%08X ra=0x%08X\n",
+                           g_ps1_frame, game_state, sub_state, eng_step, menu_step, menu_vis, cpu->ra);
+                    fflush(stdout);
+                }
+                s_prev_watch_frame = g_ps1_frame;
+                s_prev_watch_eng = eng_step;
+                s_prev_watch_menu = menu_step;
+                s_prev_watch_vis = menu_vis;
+            }
+            if (menu_step > 0x1000u) {
+                static uint32_t s_menu_poison_logs = 0;
+                if (++s_menu_poison_logs <= 12u) {
+                    uint8_t bytes[16] = {0};
+                    memcpy(bytes, &g_ram[0x978F0], sizeof(bytes));
+                    printf("[MENUSTEP-POISON] f%u eng=0x%08X menustep=0x%08X bytes=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                           g_ps1_frame, eng_step, menu_step,
+                           bytes[0], bytes[1], bytes[2], bytes[3],
+                           bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11],
+                           bytes[12], bytes[13], bytes[14], bytes[15]);
+                    fflush(stdout);
+                }
+            }
         }
         /* Dump the jump table entry for the current game_state to verify dispatch */
         if (game_state == 8u && sub_state == 6u) {
@@ -2394,6 +5478,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
          * the overlay table from DRA.BIN data. The table at 0x800A4820 contains
          * overlay entries. Entry 0x45 is at 0xA4820 with sector=0x754F. */
         if (g_ps1_frame == 0u && s_upd_calls == 1u) {
+            cv_cache_stage_cd_table_from_ram();
             /* Dump from entry 0 (0xA3C14) through entry 0x46 (0xA487C) */
             fprintf(stderr, "[OVL-TBL-DUMP] Non-zero words in 0xA3C00..0xA4900:\n");
             for (uint32_t off = 0xA3C00; off < 0xA4900; off += 4) {
@@ -2412,7 +5497,10 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             }
             fflush(stderr);
         }
-        if (sub_state == 5u) {
+        /* Legacy hardcoded F_TITLE0 loader; superseded by the CdFile-based AUTO-CLEAR
+         * dispatcher below. Keep the code disabled for reference while we preserve the
+         * frame-0 table dump above. */
+        if (0 && sub_state == 5u) {
             fprintf(stderr, "[OVL-FIX-DBG] f%u entering overlay fix check\n", g_ps1_frame);
             fflush(stderr);
             uint32_t v_bafc = 0, v_c398 = 0;
@@ -2432,7 +5520,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     uint32_t ovl_id = 0x45;
                     uint32_t ovl_sector = 0x754F;  /* 30031 */
                     uint32_t ovl_size   = 0x56B28; /* 355112 bytes */
-                    uint32_t ovl_init   = 0x800DCDF4;
+                    uint32_t ovl_init   = 0;
                     uint32_t ovl_update = 0x800DCDF0;
                     uint32_t ovl_cleanup= 0x800DD178;
                     fprintf(stderr, "[OVL-FIX-DBG] step 2: id=0x%X sector=%u size=%u init=0x%08X\n",
@@ -2458,6 +5546,9 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         }
                         uint32_t dest_phys = load_phys + i * 2048u;
                         if (dest_phys + copy_size <= 0x200000u) {
+                            uint32_t sample = 0u;
+                            memcpy(&sample, sec_buf, 4);
+                            trace_suspicious_code_write("OVL-FIX", dest_phys, copy_size, sample);
                             memcpy(&g_ram[dest_phys], sec_buf, copy_size);
                         }
                     }
@@ -2500,35 +5591,22 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         memcpy(&ovl_fn0, &g_ram[0x180000], 4);  /* overlay[+0x00] */
                         memcpy(&ovl_fn1, &g_ram[0x180004], 4);  /* overlay[+0x04] */
                         memcpy(&ovl_fn2, &g_ram[0x180008], 4);  /* overlay[+0x08] */
-                        fprintf(stderr, "[OVL-FIX-DBG] step 6b: ovl_fn0=0x%08X ovl_fn1=0x%08X ovl_fn2=0x%08X\n", ovl_fn0, ovl_fn1, ovl_fn2); fflush(stderr);
+                        memcpy(&ovl_init, &g_ram[0x18000C], 4); /* overlay[+0x0C] */
+                        fprintf(stderr, "[OVL-FIX-DBG] step 6b: ovl_fn0=0x%08X ovl_fn1=0x%08X ovl_fn2=0x%08X ovl_init=0x%08X\n",
+                                ovl_fn0, ovl_fn1, ovl_fn2, ovl_init); fflush(stderr);
                         if (ovl_fn0 >= 0x80180000u && ovl_fn0 <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C778], &ovl_fn0, 4);
-                            fprintf(stderr, "[OVL-FIX] Set C778 = 0x%08X (overlay[0])\n", ovl_fn0); fflush(stderr);
+                            memcpy(&g_ram[0x3C774], &ovl_fn0, 4);
+                            fprintf(stderr, "[OVL-FIX] Set C774 = 0x%08X (overlay[0])\n", ovl_fn0); fflush(stderr);
                         }
                         if (ovl_fn1 >= 0x80180000u && ovl_fn1 <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C780], &ovl_fn1, 4);
-                            fprintf(stderr, "[OVL-FIX] Set C780 = 0x%08X (overlay[4])\n", ovl_fn1); fflush(stderr);
+                            memcpy(&g_ram[0x3C778], &ovl_fn1, 4);
+                            fprintf(stderr, "[OVL-FIX] Set C778 = 0x%08X (overlay[4])\n", ovl_fn1); fflush(stderr);
                         }
-                        if (ovl_fn2 >= 0x80180000u && ovl_fn2 <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C774], &ovl_fn2, 4);
-                            fprintf(stderr, "[OVL-FIX] Set C774 = 0x%08X (overlay[8])\n", ovl_fn2); fflush(stderr);
+                        if (ovl_init >= 0x80180000u && ovl_init <= 0x801FFFFFu) {
+                            memcpy(&g_ram[0x3C780], &ovl_init, 4);
+                            fprintf(stderr, "[OVL-FIX] Set C780 = 0x%08X (overlay[C])\n", ovl_init); fflush(stderr);
                         }
-                        /* Skip calling init function since 0x800DCDF4 is actually 
-                         * a string table ("F_SEL", "NO3", etc.), not executable code */
-                        #if 0
-                        /* Call init function with saved/restored CPU state. */
-                        if (ovl_init >= 0x800A0000u && ovl_init <= 0x801FFFFFu) {
-                            fprintf(stderr, "[OVL-FIX-DBG] step 7: calling init at 0x%08X\n", ovl_init); fflush(stderr);
-                            CPUState saved = *cpu;
-                            cpu->a0 = 0;
-                            cpu->ra = 0;
-                            call_by_address(cpu, ovl_init);
-                            memcpy(&fp_c778, &g_ram[0x3C778], 4);
-                            memcpy(&fp_c780, &g_ram[0x3C780], 4);
-                            fprintf(stderr, "[OVL-FIX-DBG] step 8: post-init C778=0x%08X C780=0x%08X\n", fp_c778, fp_c780); fflush(stderr);
-                            *cpu = saved;
-                        }
-                        #endif
+                        cv_copy_overlay_data_fields(0x180000u);
                         fprintf(stderr, "[OVL-FIX-DBG] step 9: DONE\n"); fflush(stderr);
                     }
                 ovl_fix_done: ;
@@ -2553,52 +5631,164 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     fflush(stdout);
                 }
 
-                /* Overlay table structure (from DRA.BIN data at 0x800A3C10):
-                 * Each entry = 0x2C bytes. Entry N at base + N * 0x2C.
-                 * +00: CLUT sector, +04: overlay sector, +08: overlay size,
-                 * +0C: ?, +10: VRAM pos, +14: ?, +18: flags,
-                 * +1C: init, +20: update, +24: cleanup, +28: misc
-                 * Table base = 0xA3C10 (entry 0) verified from entry 0x45 at 0xA481C.
-                 * Table gets cleared by BSS init on frame 1.
-                 * Hardcoded entries from frame-0 dump: */
-                typedef struct {
-                    uint32_t clut_sec;   /* +00 */
-                    uint32_t ovl_sec;    /* +04 */
-                    uint32_t ovl_size;   /* +08 */
-                    uint32_t sec3;       /* +0C */
-                    uint32_t vram_pos;   /* +10 */
-                    uint32_t unk14;      /* +14 */
-                    uint32_t flags;      /* +18 */
-                    uint32_t init;       /* +1C */
-                    uint32_t update;     /* +20 */
-                    uint32_t cleanup;    /* +24 */
-                    uint32_t misc;       /* +28 */
-                } OvlEntry;
-
-                static const OvlEntry s_ovl_table[] = {
-                    /* ID 3 (prologue - Richter vs Dracula) */
-                    [3] = { .ovl_sec=0x7766, .ovl_size=0x585C0,
-                            .init=0x800DD150, .update=0x800DD14C, .cleanup=0x800DD148 },
-                    /* ID 0x0D (13, room overlay for prologue) */
-                    [0x0D] = { .clut_sec=0x9415, .ovl_sec=0x94CE, .ovl_size=0x42340,
-                               .sec3=0x9495, .vram_pos=0x1C20,
-                               .init=0x800DD0A0, .update=0x800DD09C, .cleanup=0x800DD094 },
-                    /* ID 0x45 (69, F_TITLE0 - stage select / menu) */
-                    [0x45] = { .ovl_sec=0x754F, .ovl_size=0x56B28,
-                               .init=0x800DCDF4, .update=0x800DCDF0, .cleanup=0x800DD178 },
-                };
-
-                /* If BAFC looks like an overlay ID (low byte), try loading.
-                 * BAFC & 0x8000: preload only (load data, don't switch C778/C780)
-                 * BAFC without 0x8000: full switch (load data AND update C778/C780)
-                 * This matters because F_TITLE0 writes BAFC=0x8003 to preload
-                 * prologue data while the title screen is still active. */
-                uint32_t ovl_id = v_bafc & 0xFFu;
+                uint32_t stage_id_raw = 0;
+                uint32_t load_ovl_idx = 0;
+                uint32_t playable_character = 0;
+                uint32_t load_file_type = v_bafc & 0x7FFFu;
+                uint32_t ovl_id = 0;
+                uint32_t tele_index = 0;
+                uint16_t tele_stage = 0;
                 int is_preload = (v_bafc & 0x8000u) != 0;
-                if (ovl_id < sizeof(s_ovl_table)/sizeof(s_ovl_table[0])
-                    && s_ovl_table[ovl_id].ovl_sec != 0
-                    && s_ovl_table[ovl_id].ovl_size != 0) {
-                    const OvlEntry *e = &s_ovl_table[ovl_id];
+                int keep_load_flags = 0;
+                const cv_stage_cd_entry_t* e = NULL;
+                uint32_t recent_stage_id = cv_get_recent_stage_id(game_state, 32u);
+
+                memcpy(&stage_id_raw, &g_ram[0x974A0], 4);
+                memcpy(&load_ovl_idx, &g_ram[0x97918], 4);
+                memcpy(&playable_character, &g_ram[0x3C9A0], 4);
+
+                if (load_file_type == 0x03u || load_file_type == 0x0Cu ||
+                    load_file_type == 0x0Du || load_file_type == 0x100u) {
+                    memcpy(&tele_index, &g_ram[0x6C374], 4);
+                    if (tele_index < 0x100u && (0xA245Cu + tele_index * 10u + 10u) <= sizeof(g_ram)) {
+                        memcpy(&tele_stage, &g_ram[0xA245Cu + tele_index * 10u + 8u], 2);
+                    }
+                    if (game_state == 4u &&
+                        (stage_id_raw & 0xFFu) == 0x45u &&
+                        tele_stage != 0u &&
+                        (tele_stage & 0xFFu) != 0x45u &&
+                        cv_get_stage_cd_entry(tele_stage & 0xFFu) != NULL) {
+                        static uint32_t s_stage_override_logs = 0;
+                        uint32_t new_stage = (uint32_t)(tele_stage & 0xFFu);
+                        memcpy(&g_ram[0x974A0], &new_stage, 4);
+                        stage_id_raw = new_stage;
+                        if (load_file_type != 0x100u) {
+                            memcpy(&g_ram[0x97918], &new_stage, 4);
+                            load_ovl_idx = new_stage;
+                        }
+                        if (++s_stage_override_logs <= 16u) {
+                            fprintf(stderr,
+                                    "[LOAD-STAGE-OVERRIDE] f%u gs=%u sub=%u file=0x%X teleIdx=%u stage 0x%02X->0x%02X loadOvl=0x%02X\n",
+                                    g_ps1_frame, game_state, sub_state, load_file_type,
+                                    tele_index, 0x45u, new_stage, load_ovl_idx & 0xFFu);
+                            fflush(stderr);
+                        }
+                    }
+                    if ((load_file_type == 0x03u || load_file_type == 0x0Cu ||
+                         load_file_type == 0x0Du) &&
+                        (!cv_stage_word_is_clean(load_ovl_idx) ||
+                         cv_get_stage_cd_entry(load_ovl_idx & 0xFFu) == NULL) &&
+                        cv_stage_word_is_clean(stage_id_raw) &&
+                        cv_get_stage_cd_entry(stage_id_raw & 0xFFu) != NULL) {
+                        uint32_t new_load_ovl = stage_id_raw & 0xFFu;
+                        memcpy(&g_ram[0x97918], &new_load_ovl, 4);
+                        load_ovl_idx = new_load_ovl;
+                    }
+                    if ((load_file_type == 0x03u || load_file_type == 0x0Cu ||
+                         load_file_type == 0x0Du) &&
+                        (game_state == 4u || game_state == 2u) &&
+                        cv_get_stage_cd_entry(recent_stage_id) != NULL &&
+                        (!cv_stage_word_is_clean(stage_id_raw) ||
+                         !cv_stage_word_is_clean(load_ovl_idx))) {
+                        static uint32_t s_stage_repair_logs = 0;
+                        memcpy(&g_ram[0x974A0], &recent_stage_id, 4);
+                        memcpy(&g_ram[0x97918], &recent_stage_id, 4);
+                        if (++s_stage_repair_logs <= 16u) {
+                            fprintf(stderr,
+                                    "[LOAD-STAGE-REPAIR] f%u gs=%u file=0x%X rawStage=0x%08X rawLoadOvl=0x%08X recent=0x%02X\n",
+                                    g_ps1_frame, game_state, load_file_type,
+                                    stage_id_raw, load_ovl_idx, recent_stage_id & 0xFFu);
+                            fflush(stderr);
+                        }
+                        stage_id_raw = recent_stage_id;
+                        load_ovl_idx = recent_stage_id;
+                    }
+                }
+
+                if (load_file_type == 0x11u || load_file_type == 0x12u) {
+                    int32_t weapon_id = -1;
+                    uint32_t weapon_slot = (load_file_type == 0x11u) ? 0u : 1u;
+                    memcpy(&weapon_id, &g_ram[0x3C90Cu + weapon_slot * 4u], 4);
+                    if (!cv_load_weapon_cd_file(weapon_slot, weapon_id)) {
+                        keep_load_flags = 1;
+                    }
+                } else if (load_file_type == 0x1Bu) {
+                    int32_t servant_idx = 0;
+                    memcpy(&servant_idx, &g_ram[0x97918], 4); /* g_LoadOvlIdx = g_Servant - 1 */
+                    if (!cv_load_servant_cd_file(servant_idx)) {
+                        keep_load_flags = 1;
+                    }
+                } else if (load_file_type == 0x02u) {
+                    uint32_t game_stage_id = cv_resolve_stage_asset_id(stage_id_raw, 0x45u);
+                    if (!cv_load_game_chr_cd_file(game_stage_id, playable_character)) {
+                        keep_load_flags = 1;
+                    }
+                } else if (load_file_type == 0x03u) {
+                    uint32_t chr_stage_id = cv_resolve_stage_asset_id(load_ovl_idx, stage_id_raw);
+                    if (!cv_load_stage_chr_cd_file(chr_stage_id, is_preload)) {
+                        keep_load_flags = 1;
+                    } else {
+                        cv_note_recent_stage_id(chr_stage_id, game_state);
+                    }
+                } else if (load_file_type == 0x0Cu) {
+                    uint32_t seq_stage_id = cv_resolve_stage_asset_id(load_ovl_idx, stage_id_raw);
+                    if (!cv_complete_stage_seq_cd_file(cpu, seq_stage_id)) {
+                        keep_load_flags = 1;
+                    } else {
+                        cv_note_recent_stage_id(seq_stage_id, game_state);
+                    }
+                } else if (load_file_type == 0x0Du) {
+                    uint32_t sfx_stage_id = cv_resolve_stage_asset_id(load_ovl_idx, stage_id_raw);
+                    if (!cv_complete_stage_sfx_cd_file(cpu, sfx_stage_id)) {
+                        keep_load_flags = 1;
+                    } else {
+                        cv_note_recent_stage_id(sfx_stage_id, game_state);
+                    }
+                } else if (load_file_type == 0x100u) {
+                    uint32_t raw_stage_id = stage_id_raw & 0xFFu;
+                    uint32_t raw_load_ovl = load_ovl_idx & 0xFFu;
+                    uint32_t raw_tele_stage = tele_stage & 0xFFu;
+                    ovl_id = cv_resolve_stage_asset_id(stage_id_raw, 0x45u);
+                    if ((game_state == 4u || game_state == 2u) &&
+                        (cv_get_stage_cd_entry(raw_stage_id) == NULL ||
+                         !cv_stage_word_is_clean(stage_id_raw) ||
+                         !cv_stage_word_is_clean(load_ovl_idx))) {
+                        static uint32_t s_stageprg_resolve_logs = 0;
+                        uint32_t repaired_ovl_id =
+                            cv_resolve_stage_prg_id(stage_id_raw, load_ovl_idx, tele_stage,
+                                                    recent_stage_id);
+                        if (repaired_ovl_id != ovl_id) {
+                            ovl_id = repaired_ovl_id;
+                            memcpy(&g_ram[0x974A0], &ovl_id, 4);
+                            stage_id_raw = ovl_id;
+                            if (++s_stageprg_resolve_logs <= 16u) {
+                                fprintf(stderr,
+                                        "[OVL-RESOLVE] f%u gs=%u rawStage=0x%02X loadOvl=0x%02X teleIdx=%u teleStage=0x%02X recent=0x%02X -> ovl=0x%02X\n",
+                                        g_ps1_frame, game_state, raw_stage_id, raw_load_ovl,
+                                        tele_index, raw_tele_stage, recent_stage_id & 0xFFu,
+                                        ovl_id & 0xFFu);
+                                fflush(stderr);
+                            }
+                        }
+                    }
+                    e = cv_get_stage_cd_entry(ovl_id);
+                    if (e == NULL || e->ovl_sec == 0u || e->ovl_size == 0u) {
+                        fprintf(stderr,
+                                "[OVL-LOAD] missing StagePrg entry for stage=0x%02X rawStage=0x%08X rawLoadOvl=0x%08X\n",
+                                ovl_id, stage_id_raw, load_ovl_idx);
+                        fflush(stderr);
+                        keep_load_flags = 1;
+                    } else {
+                        cv_note_recent_stage_id(ovl_id, game_state);
+                    }
+                } else {
+                    fprintf(stderr,
+                            "[LOAD-AUTOCLEAR] unsupported loadFile=0x%X stage=0x%08X loadOvl=0x%08X -> clearing flags only\n",
+                            load_file_type, stage_id_raw, load_ovl_idx);
+                    fflush(stderr);
+                }
+
+                if (e != NULL && e->ovl_sec != 0u && e->ovl_size != 0u) {
                     uint32_t load_addr = 0x80180000u;
                     uint32_t load_phys = load_addr & 0x1FFFFFu;
                     uint32_t sectors_needed = (e->ovl_size + 2047u) / 2048u;
@@ -2609,25 +5799,34 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
 
                     uint8_t sec_buf[2048];
                     int ok = 1;
-                    for (uint32_t i = 0; i < sectors_needed; i++) {
-                        if (!psx_cdrom_read_sector(e->ovl_sec + i, sec_buf)) {
-                            fprintf(stderr, "[OVL-LOAD] FAILED reading sector %u\n", e->ovl_sec + i);
-                            ok = 0; break;
-                        }
-                        uint32_t copy_size = 2048u;
-                        if (i == sectors_needed - 1u) {
-                            uint32_t rem = e->ovl_size % 2048u;
-                            if (rem != 0) copy_size = rem;
-                        }
-                        uint32_t dp = load_phys + i * 2048u;
-                        if (dp + copy_size <= 0x200000u) {
-                            memcpy(&g_ram[dp], sec_buf, copy_size);
+                    if (is_preload) {
+                        fprintf(stderr,
+                                "[OVL-LOAD] deferring preload for overlay ID=%u to avoid overwriting the active overlay at 0x80180000\n",
+                                ovl_id);
+                    } else {
+                        for (uint32_t i = 0; i < sectors_needed; i++) {
+                            if (!psx_cdrom_read_sector(e->ovl_sec + i, sec_buf)) {
+                                fprintf(stderr, "[OVL-LOAD] FAILED reading sector %u\n", e->ovl_sec + i);
+                                ok = 0; break;
+                            }
+                            uint32_t copy_size = 2048u;
+                            if (i == sectors_needed - 1u) {
+                                uint32_t rem = e->ovl_size % 2048u;
+                                if (rem != 0) copy_size = rem;
+                            }
+                            uint32_t dp = load_phys + i * 2048u;
+                            if (dp + copy_size <= 0x200000u) {
+                                uint32_t sample = 0u;
+                                memcpy(&sample, sec_buf, 4);
+                                trace_suspicious_code_write("OVL-LOAD", dp, copy_size, sample);
+                                memcpy(&g_ram[dp], sec_buf, copy_size);
+                            }
                         }
                     }
                     fprintf(stderr, "[OVL-LOAD] done: ok=%d preload=%d\n", ok, is_preload);
 
                     /* Dump key BSS data that C774 needs */
-                    if (ok) {
+                    if (ok && !is_preload) {
                         uint32_t clut_ptr = 0;
                         memcpy(&clut_ptr, &g_ram[0x1C1688], 4);
                         fprintf(stderr, "[OVL-LOAD] After load: RAM[0x801C1688]=0x%08X (CLUT list ptr)\n", clut_ptr);
@@ -2642,25 +5841,78 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
 
                     if (ok && !is_preload) {
                         /* Full overlay switch: update C774/C778/C780 from overlay header */
-                        uint32_t hdr[8];
+                        uint32_t hdr[12];
                         memcpy(hdr, &g_ram[load_phys], sizeof(hdr));
                         fprintf(stderr, "[OVL-LOAD] header: [0]=0x%08X [4]=0x%08X [8]=0x%08X [C]=0x%08X\n",
                                 hdr[0], hdr[1], hdr[2], hdr[3]);
                         fprintf(stderr, "[OVL-LOAD] header: [10]=0x%08X [14]=0x%08X [18]=0x%08X [1C]=0x%08X\n",
                                 hdr[4], hdr[5], hdr[6], hdr[7]);
+                        fprintf(stderr, "[OVL-LOAD] header: [20]=0x%08X [24]=0x%08X [28]=0x%08X [2C]=0x%08X\n",
+                                hdr[8], hdr[9], hdr[10], hdr[11]);
 
-                        if (hdr[0] >= 0x80180000u && hdr[0] <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C778], &hdr[0], 4);
-                            fprintf(stderr, "[OVL-LOAD] Set C778 = 0x%08X\n", hdr[0]);
+                        if (ovl_id == 0x45u) {
+                            if (hdr[0] >= 0x80180000u && hdr[0] <= 0x801FFFFFu) {
+                                memcpy(&g_ram[0x3C774], &hdr[0], 4);
+                                fprintf(stderr, "[OVL-LOAD] Set C774 = 0x%08X (SEL overlay[0])\n", hdr[0]);
+                            }
+                            if (hdr[1] >= 0x80180000u && hdr[1] <= 0x801FFFFFu) {
+                                memcpy(&g_ram[0x3C778], &hdr[1], 4);
+                                fprintf(stderr, "[OVL-LOAD] Set C778 = 0x%08X (SEL overlay[4])\n", hdr[1]);
+                            }
+                            if (hdr[3] >= 0x80180000u && hdr[3] <= 0x801FFFFFu) {
+                                memcpy(&g_ram[0x3C780], &hdr[3], 4);
+                                fprintf(stderr, "[OVL-LOAD] Set C780 = 0x%08X (SEL overlay[C])\n", hdr[3]);
+                            }
+                        } else {
+                            if (hdr[0] >= 0x80180000u && hdr[0] <= 0x801FFFFFu) {
+                                memcpy(&g_ram[0x3C778], &hdr[0], 4);
+                                fprintf(stderr, "[OVL-LOAD] Set C778 = 0x%08X\n", hdr[0]);
+                            }
+                            if (hdr[1] >= 0x80180000u && hdr[1] <= 0x801FFFFFu) {
+                                memcpy(&g_ram[0x3C780], &hdr[1], 4);
+                                fprintf(stderr, "[OVL-LOAD] Set C780 = 0x%08X\n", hdr[1]);
+                            }
+                            /* gs=8 case 6 reads C774 for its JALR target — set from header[2] */
+                            if (hdr[2] >= 0x80180000u && hdr[2] <= 0x801FFFFFu) {
+                                memcpy(&g_ram[0x3C774], &hdr[2], 4);
+                                fprintf(stderr, "[OVL-LOAD] Set C774 = 0x%08X\n", hdr[2]);
+                            }
                         }
-                        if (hdr[1] >= 0x80180000u && hdr[1] <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C780], &hdr[1], 4);
-                            fprintf(stderr, "[OVL-LOAD] Set C780 = 0x%08X\n", hdr[1]);
+                        cv_copy_overlay_data_fields(load_phys);
+                        if (!cv_complete_stage_seq_cd_file(cpu, ovl_id)) {
+                            fprintf(stderr,
+                                    "[CD-STAGE-SEQ] stage=0x%02X registration failed during StagePrg completion\n",
+                                    ovl_id);
+                            fflush(stderr);
                         }
-                        /* gs=8 case 6 reads C774 for its JALR target — set from header[2] */
-                        if (hdr[2] >= 0x80180000u && hdr[2] <= 0x801FFFFFu) {
-                            memcpy(&g_ram[0x3C774], &hdr[2], 4);
-                            fprintf(stderr, "[OVL-LOAD] Set C774 = 0x%08X\n", hdr[2]);
+
+                        if ((ovl_id == 3u || ovl_id == 0x0Du)
+                            && hdr[4] >= 0x80180000u && hdr[4] <= 0x801FFFFFu) {
+                            uint32_t rooms_phys = hdr[4] & 0x1FFFFFFFu;
+                            fprintf(stderr, "[OVL-ROOMS] ovl=%u rooms=0x%08X\n", ovl_id, hdr[4]);
+                            for (uint32_t ri = 0; ri < 8u; ri++) {
+                                uint32_t off = rooms_phys + ri * 8u;
+                                uint8_t left = 0, top = 0, right = 0, bottom = 0;
+                                uint8_t tileLayoutId = 0, tilesetId = 0, objGfxId = 0, objLayoutId = 0;
+                                if (off + 8u > 0x200000u) {
+                                    break;
+                                }
+                                left = g_ram[off + 0];
+                                top = g_ram[off + 1];
+                                right = g_ram[off + 2];
+                                bottom = g_ram[off + 3];
+                                tileLayoutId = g_ram[off + 4];
+                                tilesetId = g_ram[off + 5];
+                                objGfxId = g_ram[off + 6];
+                                objLayoutId = g_ram[off + 7];
+                                fprintf(stderr,
+                                        "[OVL-ROOMS] ovl=%u room[%u] rect=(%u,%u)-(%u,%u) load={tile=%u set=%u gfx=%u obj=%u}\n",
+                                        ovl_id, ri, left, top, right, bottom,
+                                        tileLayoutId, tilesetId, objGfxId, objLayoutId);
+                                if (left == 0x40u) {
+                                    break;
+                                }
+                            }
                         }
 
                         fprintf(stderr, "[OVL-LOAD] data@0x180000: ");
@@ -2688,6 +5940,22 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                                 fprintf(stderr, "\n");
                             }
                         }
+                        {
+                            const uint32_t dra_addrs[] = {
+                                0x800E6F00u, 0x800E6F40u, 0x800E6F60u,
+                                0x800E7E50u, 0x800E7E60u, 0x800F1580u, 0x800F15A0u, 0x800F15B8u
+                            };
+                            for (int di = 0; di < (int)(sizeof(dra_addrs) / sizeof(dra_addrs[0])); di++) {
+                                uint32_t da = dra_addrs[di] & 0x1FFFFFFFu;
+                                fprintf(stderr, "[DRA-CODE] 0x%08X:", dra_addrs[di]);
+                                for (int ii = 0; ii < 8; ii++) {
+                                    uint32_t w = 0;
+                                    memcpy(&w, &g_ram[da + ii * 4], 4);
+                                    fprintf(stderr, " %08X", w);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
                     }
                     fflush(stderr);
 
@@ -2697,54 +5965,280 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                      * function loops forever on a null list.
                      * Fix: if the CLUT list ptr is NULL, point it at a small
                      * terminator buffer so the search exits immediately. */
-                    if (ok && !is_preload) {
+                    if (ok && !is_preload && ovl_id == 0x0Du) {
+                        /* --- Load room asset block #1 from CD (clut_sec..sec3) --- */
+                        g_room_clut_loaded = 0;
+                        g_room_clut_phys = 0;
+                        g_room_clut_bytes = 0;
+                        g_room_tile_cluts_uploaded = 0;
+                        g_room_sec3_loaded = 0;
+                        g_room_sec3_phys = 0;
+                        g_room_sec3_bytes = 0;
+                        g_room_ovl_tail_phys = 0;
+                        g_room_ovl_tail_size = 0;
+                        g_room_ovl_tail_restored = 0;
+                        {
+                            uint32_t overlap_start = 0x1C0000u;
+                            uint32_t overlap_end = load_phys + e->ovl_size;
+                            if (overlap_end > overlap_start && overlap_start < 0x200000u) {
+                                if (overlap_end > 0x200000u) {
+                                    overlap_end = 0x200000u;
+                                }
+                                g_room_ovl_tail_phys = overlap_start;
+                                g_room_ovl_tail_size = overlap_end - overlap_start;
+                                if (g_room_ovl_tail_size > sizeof(g_room_ovl_tail_backup)) {
+                                    g_room_ovl_tail_size = sizeof(g_room_ovl_tail_backup);
+                                }
+                                memcpy(g_room_ovl_tail_backup,
+                                       &g_ram[g_room_ovl_tail_phys],
+                                       g_room_ovl_tail_size);
+                                fprintf(stderr, "[OVL-TAIL-BACKUP] saved 0x%X bytes from phys 0x%X before room asset staging\n",
+                                        g_room_ovl_tail_size, g_room_ovl_tail_phys);
+                            }
+                        }
+                        if (e->gfx_sec != 0) {
+                            /* The first room asset block runs from gfx_sec until vh_sec.
+                             * For room overlay 0x0D this is a 0x40000-byte block that the
+                             * later C778/C780 path appears to expect near 0x801Cxxxx.
+                             * Loading it strictly after the overlay end misses 2MB RAM by
+                             * only 0x3000, so pack it at 0x801C0000 instead. This overlaps
+                             * only the overlay's zero tail and gives the game one real shot
+                             * at initializing 0x801C1688 from actual room data. */
+                            uint32_t clut_end_sec = e->vh_sec ? e->vh_sec : e->ovl_sec;
+                            uint32_t clut_secs = clut_end_sec - e->gfx_sec;
+                            uint32_t clut_bytes = clut_secs * 2048u;
+                            uint32_t clut_dest_phys = (load_phys + e->ovl_size + 0xFFFu) & ~0xFFFu;
+                            if (ovl_id == 0x0Du
+                                && clut_dest_phys + clut_bytes > 0x200000u
+                                && clut_bytes == 0x40000u) {
+                                clut_dest_phys = 0x1C0000u;
+                            }
+                            fprintf(stderr, "[OVL-CLUT] Loading %u CLUT sectors (0x%X→0x%X) = %u bytes to phys 0x%X\n",
+                                    clut_secs, e->gfx_sec, clut_end_sec - 1, clut_bytes, clut_dest_phys);
+                            if (clut_dest_phys + clut_bytes <= 0x200000u) {
+                                int clut_ok = 1;
+                                for (uint32_t ci = 0; ci < clut_secs; ci++) {
+                                    uint8_t cbuf[2048];
+                                    if (!psx_cdrom_read_sector(e->gfx_sec + ci, cbuf)) {
+                                        fprintf(stderr, "[OVL-CLUT] FAILED reading sector %u\n", e->gfx_sec + ci);
+                                        clut_ok = 0; break;
+                                    }
+                                    memcpy(&g_ram[clut_dest_phys + ci * 2048u], cbuf, 2048u);
+                                }
+                                if (clut_ok) {
+                                    if (ovl_id == 0x0Du) {
+                                        g_room_clut_loaded = 1;
+                                        g_room_clut_phys = clut_dest_phys;
+                                        g_room_clut_bytes = clut_bytes;
+                                        if (clut_bytes == 0x40000u) {
+                                            int clut_blocks_uploaded = 0;
+                                            for (uint32_t ti = 0; ti < 32u; ti++) {
+                                                int tile_x = 512 + (int)((ti / 4u) * 64u) + (int)((ti & 1u) * 32u);
+                                                int tile_y = (ti & 2u) ? 128 : 0;
+                                                psx_vram_upload(tile_x, tile_y, 32, 128,
+                                                                (const uint16_t*)&g_ram[clut_dest_phys + ti * 0x2000u]);
+                                                if ((ti & 2u) && tile_x < 768) {
+                                                    psx_vram_upload(tile_x, 240, 32, 16,
+                                                                    (const uint16_t*)&g_ram[clut_dest_phys + ti * 0x2000u + 0x1C00u]);
+                                                    clut_blocks_uploaded++;
+                                                }
+                                            }
+                                            g_room_tile_cluts_uploaded = (clut_blocks_uploaded == 8);
+                                            fprintf(stderr, "[OVL-TILES] Scatter-uploaded 32 tile blocks from phys 0x%X to VRAM\n",
+                                                    clut_dest_phys);
+                                            if (clut_blocks_uploaded != 0) {
+                                                fprintf(stderr, "[OVL-TILE-CLUT] Extracted %d stage CLUT blocks to VRAM (512,240)-(767,255)\n",
+                                                        clut_blocks_uploaded);
+                                            }
+                                        }
+                                    }
+                                    fprintf(stderr, "[OVL-CLUT] Loaded %u bytes of CLUT data OK\n", clut_bytes);
+                                    /* Dump first 32 bytes of loaded CLUT data */
+                                    fprintf(stderr, "[OVL-CLUT] data: ");
+                                    for (int dd = 0; dd < 32 && dd < (int)clut_bytes; dd++) {
+                                        fprintf(stderr, "%02X", g_ram[clut_dest_phys + dd]);
+                                        if ((dd & 3) == 3) fprintf(stderr, " ");
+                                    }
+                                    fprintf(stderr, "\n");
+                                }
+                            } else {
+                                fprintf(stderr, "[OVL-CLUT] CLUT data too large for RAM (need 0x%X, max 0x200000)\n",
+                                        clut_dest_phys + clut_bytes);
+                            }
+                        }
+
+                        if (e->vh_sec != 0 && e->ovl_sec > e->vh_sec) {
+                            uint32_t sec3_secs = e->ovl_sec - e->vh_sec;
+                            uint32_t sec3_bytes = sec3_secs * 2048u;
+                            uint32_t sec3_dest_phys = 0x1C3000u;
+                            fprintf(stderr, "[OVL-SEC3] Loading %u room sec3 sectors (0x%X→0x%X) = %u bytes to phys 0x%X\n",
+                                    sec3_secs, e->vh_sec, e->ovl_sec - 1u, sec3_bytes, sec3_dest_phys);
+                            if (sec3_dest_phys + sec3_bytes <= 0x200000u) {
+                                int sec3_ok = 1;
+                                for (uint32_t si = 0; si < sec3_secs; si++) {
+                                    uint8_t sbuf[2048];
+                                    if (!psx_cdrom_read_sector(e->vh_sec + si, sbuf)) {
+                                        fprintf(stderr, "[OVL-SEC3] FAILED reading sector %u\n", e->vh_sec + si);
+                                        sec3_ok = 0;
+                                        break;
+                                    }
+                                    memcpy(&g_ram[sec3_dest_phys + si * 2048u], sbuf, 2048u);
+                                }
+                                if (sec3_ok) {
+                                    g_room_sec3_loaded = 1;
+                                    g_room_sec3_phys = sec3_dest_phys;
+                                    g_room_sec3_bytes = sec3_bytes;
+                                    fprintf(stderr, "[OVL-SEC3] Loaded %u bytes of room sec3 data OK\n", sec3_bytes);
+                                }
+                            } else {
+                                fprintf(stderr, "[OVL-SEC3] room sec3 too large for RAM (need 0x%X, max 0x200000)\n",
+                                        sec3_dest_phys + sec3_bytes);
+                            }
+                        }
+
+                        /* --- Force room-ready flag at RAM[0x80097908] --- 
+                         * C774 (draw function) checks this first: 
+                         *   v0 = RAM[0x80097908]; if (v0 == 0) return;
+                         * This flag is normally set when CLUT/tileset loading
+                         * completes via the async CD system. Force it so C774
+                         * proceeds to the rendering code. */
+                        {
+                            uint32_t room_ready = 0;
+                            memcpy(&room_ready, &g_ram[0x97908], 4);
+                            if (room_ready == 0u) {
+                                uint32_t one = 1u;
+                                memcpy(&g_ram[0x97908], &one, 4);
+                                fprintf(stderr, "[OVL-LOAD] Forced RAM[0x80097908] = 1 (room-ready flag)\n");
+                            }
+                        }
+
+                        /* --- CLUT list terminator fallback ---
+                         * Only install this immediately if we did NOT manage to load
+                         * a real room CLUT block. If the real block is present, let
+                         * C778/C780 try once before forcing the terminator. */
                         uint32_t clut_ptr = 0;
                         memcpy(&clut_ptr, &g_ram[0x1C1688], 4);
                         if (clut_ptr == 0u) {
-                            /* Place a {0xFFFE, 0xFFFF} terminator at a safe
-                             * address past the overlay end (0x801C4000). */
-                            uint32_t term_addr_phys = 0x1C4000u;
-                            uint16_t term_val = 0xFFFEu;
-                            memcpy(&g_ram[term_addr_phys], &term_val, 2);
-                            term_val = 0xFFFFu;
-                            memcpy(&g_ram[term_addr_phys + 2], &term_val, 2);
-                            uint32_t term_ptr = 0x801C4000u;
-                            memcpy(&g_ram[0x1C1688], &term_ptr, 4);
-                            fprintf(stderr, "[OVL-LOAD] CLUT-FIX: set 0x801C1688 → 0x%08X (terminator)\n",
-                                    term_ptr);
+                            if (ovl_id == 0x0Du && g_room_clut_loaded) {
+                                fprintf(stderr, "[OVL-LOAD] Room CLUT block loaded at 0x%08X (%u bytes); deferring 0x801C1688 fallback until after C778/C780\n",
+                                        0x80000000u | g_room_clut_phys, g_room_clut_bytes);
+                            } else {
+                                cv_install_room_clut_terminator();
+                                fprintf(stderr, "[OVL-LOAD] CLUT-FIX: set 0x801C1688 → 0x801C4000 (terminator)\n");
+                            }
+                        }
+                    }
+
+                    if (ok && !is_preload && ovl_id == 69u) {
+                        static int s_room_scan_done = 0;
+                        if (!s_room_scan_done) {
+                            s_room_scan_done = 1;
+                            uint32_t printed = 0;
+                            for (uint32_t base = load_phys; base + 0xA8u < load_phys + e->ovl_size; base += 4u) {
+                                const uint8_t* rh = &g_ram[base + 0xA0u];
+                                if (rh[0] >= 0x40u || rh[1] >= 0x40u || rh[2] >= 0x40u || rh[3] >= 0x40u) {
+                                    continue;
+                                }
+                                if (rh[0] > rh[2] || rh[1] > rh[3]) {
+                                    continue;
+                                }
+                                if (rh[4] >= 0x80u || rh[5] >= 0x80u || rh[6] >= 0x80u || rh[7] >= 0x80u) {
+                                    continue;
+                                }
+                                int room_count = -1;
+                                for (uint32_t ri = 0; ri < 64u; ri++) {
+                                    uint32_t off = base + ri * 8u;
+                                    if (off + 8u > load_phys + e->ovl_size) {
+                                        break;
+                                    }
+                                    if (g_ram[off] == 0x40u) {
+                                        room_count = (int)ri;
+                                        break;
+                                    }
+                                }
+                                if (room_count < 4 || room_count > 48) {
+                                    continue;
+                                }
+                                fprintf(stderr,
+                                        "[ROOMS-SCAN] cand=0x%08X roomA0=%02X %02X %02X %02X %02X %02X %02X %02X rooms=%d\n",
+                                        0x80000000u | base,
+                                        rh[0], rh[1], rh[2], rh[3], rh[4], rh[5], rh[6], rh[7],
+                                        room_count);
+                                if (++printed >= 16u) {
+                                    break;
+                                }
+                            }
+                            fflush(stderr);
                         }
                     }
                 }
 
-                uint32_t zero = 0;
-                memcpy(&g_ram[0x6BAFC], &zero, 4);
-                memcpy(&g_ram[0x6C398], &zero, 4);
-                memcpy(&g_ram[0x6C3B0], &zero, 4);
-                /* Also clear C0F8 (completion step counter) */
-                memcpy(&g_ram[0x3C0F8], &zero, 4);
-
-                /* Set gate bits for overlay state machine progression */
-                uint16_t gate7494 = 0;
-                memcpy(&gate7494, &g_ram[0x97494], 2);
-                if (!(gate7494 & 0x6800u)) {
-                    gate7494 |= 0x6800u;
-                    memcpy(&g_ram[0x97494], &gate7494, 2);
-                    printf("[LOAD-AUTOCLEAR] set gate 0x97494=0x%04X (bits 11,13,14)\n",
-                           gate7494);
-                    fflush(stdout);
+                if (!keep_load_flags) {
+                    uint32_t zero = 0;
+                    memcpy(&g_ram[0x6BAFC], &zero, 4);
+                    memcpy(&g_ram[0x6C398], &zero, 4);
+                    memcpy(&g_ram[0x6C3B0], &zero, 4);
+                    /* Also clear C0F8 (completion step counter) */
+                    memcpy(&g_ram[0x3C0F8], &zero, 4);
                 }
+
             }
         }
 
-        /* Skip title screen: after 60 frames of F_TITLE0 running (gs=0, sub=6, C9A4=1),
-         * force transition to gs=8 (prologue). On real hardware the player presses Start.
-         * The prologue data was already preloaded to 0x80180000 at f9. */
+        /* Optional title skip: after 60 frames of F_TITLE0 running (gs=0, sub=6, C9A4=1),
+         * force transition to gs=8 (prologue). This is only a debug shortcut now;
+         * canonical validation should keep it disabled unless explicitly requested. */
         {
+            static int s_force_title_skip = -1;
             static int s_gs8_forced = 0;
-            if (!s_gs8_forced && game_state == 0u && sub_state == 6u && g_ps1_frame >= 60u) {
+            if (s_force_title_skip < 0) {
+                const char* env = getenv("PSX_CV_FORCE_TITLE_SKIP");
+                s_force_title_skip = (env && *env != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+                printf("[CV-SIG] force title skip=%d (PSX_CV_FORCE_TITLE_SKIP)\n", s_force_title_skip);
+                fflush(stdout);
+            }
+            if (s_force_title_skip &&
+                !s_gs8_forced &&
+                game_state == 0u &&
+                sub_state == 6u &&
+                g_ps1_frame >= 60u) {
                 uint32_t c9a4_val = 0;
                 memcpy(&c9a4_val, &g_ram[0x3C9A4], 4);
                 if (c9a4_val == 1u) {
+                    uint32_t ovl_sec = 0x7766u;
+                    uint32_t ovl_size = 0x585C0u;
+                    uint32_t load_phys = 0x180000u;
+                    uint32_t sectors_needed = (ovl_size + 2047u) / 2048u;
+                    uint8_t sec_buf[2048];
+                    int prologue_ok = 1;
+                    for (uint32_t i = 0; i < sectors_needed; i++) {
+                        if (!psx_cdrom_read_sector(ovl_sec + i, sec_buf)) {
+                            fprintf(stderr, "[GS-SKIP] FAILED reading prologue sector %u\n", ovl_sec + i);
+                            fflush(stderr);
+                            prologue_ok = 0;
+                            break;
+                        }
+                        uint32_t copy_size = 2048u;
+                        if (i == sectors_needed - 1u) {
+                            uint32_t rem = ovl_size % 2048u;
+                            if (rem != 0) {
+                                copy_size = rem;
+                            }
+                        }
+                        uint32_t dp = load_phys + i * 2048u;
+                        if (dp + copy_size <= 0x200000u) {
+                            uint32_t sample = 0u;
+                            memcpy(&sample, sec_buf, 4);
+                            trace_suspicious_code_write("GS-SKIP-OVL", dp, copy_size, sample);
+                            memcpy(&g_ram[dp], sec_buf, copy_size);
+                        }
+                    }
+                    if (!prologue_ok) {
+                        printf("[GS-SKIP] f%u failed to load overlay 3 on demand; leaving title state intact\n",
+                               g_ps1_frame);
+                        fflush(stdout);
+                        goto done_force_title_skip;
+                    }
                     /* Force game state to 8 (prologue) */
                     uint32_t new_gs = 8u;
                     uint32_t new_sub = 0u;
@@ -2770,12 +6264,19 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     if (hdr[2] >= 0x80180000u && hdr[2] <= 0x801FFFFFu) {
                         memcpy(&g_ram[0x3C774], &hdr[2], 4);
                     }
+                    cv_copy_overlay_data_fields(0x180000u);
 
                     printf("[GS-SKIP] f%u FORCED gs=0→8 sub=0 C774=0x%08X C778=0x%08X C780=0x%08X hdr[3]=0x%08X\n",
                            g_ps1_frame, hdr[2], hdr[0], hdr[1], hdr[3]);
                     fflush(stdout);
                 }
             }
+done_force_title_skip:
+            ;
+        }
+        if ((game_state >= 4u || (game_state == 8u && sub_state >= 6u)) &&
+            g_ps1_frame >= 60u) {
+            cv_seed_default_cluts();
         }
         /* Trace case 6+: what function pointer and overlay sub-state */
         if (sub_state >= 6u && (s_upd_calls <= 60u || game_state >= 8u)) {
@@ -2784,11 +6285,59 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             memcpy(&fp_c780, &g_ram[0x3C780], 4);
             memcpy(&c9a4, &g_ram[0x3C9A4], 4);
             static uint32_t s_ug6_log = 0;
-            if (++s_ug6_log <= 80u) {
+            if (++s_ug6_log <= 120u) {
                 uint32_t fp_c774 = 0;
                 memcpy(&fp_c774, &g_ram[0x3C774], 4);
-                printf("[UG-CASE6] f%u #%u gs=%u sub=%u C9A4=%u C774=0x%08X C778=0x%08X C780=0x%08X\n",
-                       g_ps1_frame, s_upd_calls, game_state, sub_state, c9a4, fp_c774, fp_c778, fp_c780);
+                if ((game_state == 0u || game_state == 8u) && fp_c780 == 0x801B410Cu) {
+                    uint32_t sel_b014 = 0;
+                    uint32_t sel_af14 = 0;
+                    uint32_t menu_cursor = 0;
+                    uint32_t mem_rstep = 0;
+                    uint32_t mem_rsub = 0;
+                    uint32_t mem_retry = 0;
+                    uint16_t pad0_pressed = 0;
+                    uint16_t pad0_previous = 0;
+                    uint16_t pad0_tapped = 0;
+                    uint16_t pad0_repeat = 0;
+                    int32_t save_pad[2] = {0, 0};
+                    uint32_t save_neg3[2] = {0, 0};
+                    uint32_t save_neg2[2] = {0, 0};
+                    uint32_t save_nonneg[2] = {0, 0};
+                    memcpy(&sel_b014, &g_ram[0x1BB014], 4);
+                    memcpy(&sel_af14, &g_ram[0x1BAF14], 4);
+                    memcpy(&menu_cursor, &g_ram[0x1D6B0C], 4);
+                    memcpy(&mem_rstep, &g_ram[0x1BAFEC], 4);
+                    memcpy(&mem_rsub, &g_ram[0x1BAFF0], 4);
+                    memcpy(&mem_retry, &g_ram[0x1BAFF8], 4);
+                    memcpy(&pad0_pressed, &g_ram[0x97490], 2);
+                    memcpy(&pad0_previous, &g_ram[0x97492], 2);
+                    memcpy(&pad0_tapped, &g_ram[0x97494], 2);
+                    memcpy(&pad0_repeat, &g_ram[0x97496], 2);
+                    for (uint32_t port = 0; port < 2u; ++port) {
+                        uint32_t base = 0x1BC8E0u + port * 0x3A8u;
+                        memcpy(&save_pad[port], &g_ram[base + 0x3A4u], 4);
+                        for (uint32_t slot = 0; slot < 15u; ++slot) {
+                            int32_t icon = 0;
+                            memcpy(&icon, &g_ram[base + slot * 4u], 4);
+                            if (icon == -3) {
+                                save_neg3[port]++;
+                            } else if (icon == -2) {
+                                save_neg2[port]++;
+                            } else if (icon >= 0) {
+                                save_nonneg[port]++;
+                            }
+                        }
+                    }
+                    printf("[UG-CASE6] f%u #%u gs=%u sub=%u C9A4=%u C774=0x%08X C778=0x%08X C780=0x%08X SEL_B014=0x%08X SEL_AF14=%u MENU_CUR=%u MCR=%u/%u retry=%u PAD0_P=0x%04X PAD0_PRV=0x%04X PAD0_T=0x%04X PAD0_R=0x%04X S0_PAD=%d S0[-3]=%u S0[-2]=%u S0[>=0]=%u S1_PAD=%d S1[-3]=%u S1[-2]=%u S1[>=0]=%u\n",
+                           g_ps1_frame, s_upd_calls, game_state, sub_state, c9a4, fp_c774, fp_c778, fp_c780,
+                           sel_b014, sel_af14, menu_cursor, mem_rstep, mem_rsub, mem_retry,
+                           pad0_pressed, pad0_previous, pad0_tapped, pad0_repeat,
+                           save_pad[0], save_neg3[0], save_neg2[0], save_nonneg[0],
+                           save_pad[1], save_neg3[1], save_neg2[1], save_nonneg[1]);
+                } else {
+                    printf("[UG-CASE6] f%u #%u gs=%u sub=%u C9A4=%u C774=0x%08X C778=0x%08X C780=0x%08X\n",
+                           g_ps1_frame, s_upd_calls, game_state, sub_state, c9a4, fp_c774, fp_c778, fp_c780);
+                }
                 fflush(stdout);
             }
             /* Trace prologue C780 key state when gs=8, sub=6 */
@@ -2941,6 +6490,8 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     if (start_pc == 0x800E7458u) {
         static uint32_t s_gs8h = 0;
         static int s_c778_called = 0;
+        static uint32_t s_gs8_sub6_entries = 0;
+        static int s_gs8_sub7_forced = 0;
         uint32_t gs8_sub = 0;
         memcpy(&gs8_sub, &g_ram[0x73060], 4);
         if (++s_gs8h <= 40u) {
@@ -2962,17 +6513,167 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             }
         }
 
-        /* When sub=6, the handler just calls C774 (draw).  But C774 depends on
-         * data initialized by C778 (overlay init) and updated by C780 (overlay
-         * update).  In the original game these are called from the entity system
-         * in MainGame, but our MainGame's guard fires before that code runs.
-         * Inject C778 (once) and C780 (every frame) before the handler proceeds. */
+        /* When sub=6, the handler just calls C774. For room overlays we need to
+         * synthesize the missed overlay callbacks from MainGame, but SEL is a
+         * special case: hdr[0] is the real menu Update and hdr[1] is the title
+         * handler. Calling hdr[1] every frame traps Game_MainMenu inside title
+         * logic and leaves the screen black. */
         if (gs8_sub == 6u) {
-            uint32_t c778 = 0, c780 = 0;
+            uint32_t c774 = 0, c778 = 0, c780 = 0;
+            uint32_t ovl_rooms = 0, ovl_tile_layers = 0;
+            int is_room_overlay = 0;
+            int is_sel_overlay = 0;
+            int has_overlay_room_data = 0;
+            ++s_gs8_sub6_entries;
+            memcpy(&c774, &g_ram[0x3C774], 4);
             memcpy(&c778, &g_ram[0x3C778], 4);
             memcpy(&c780, &g_ram[0x3C780], 4);
+            memcpy(&ovl_rooms, &g_ram[0x3C784], 4);
+            memcpy(&ovl_tile_layers, &g_ram[0x3C794], 4);
+            is_room_overlay = (c778 == 0x801AC710u && c780 == 0x801ACB14u);
+            is_sel_overlay = (c778 == 0x801AEED8u && c780 == 0x801B410Cu);
+            has_overlay_room_data =
+                (ovl_rooms >= 0x80180000u && ovl_rooms < 0x80200000u) &&
+                (ovl_tile_layers >= 0x80180000u && ovl_tile_layers < 0x80200000u);
 
-            if (!s_c778_called && c778 != 0u && c778 >= 0x80100000u) {
+            if (cv_force_gs8_roomready_enabled() && is_room_overlay) {
+                static uint32_t s_room_ready_forces = 0;
+                uint32_t room_ready = 0;
+                memcpy(&room_ready, &g_ram[0x97908], 4);
+                if (room_ready == 0u) {
+                    uint32_t one = 1u;
+                    memcpy(&g_ram[0x97908], &one, 4);
+                    if (++s_room_ready_forces <= 20u) {
+                        printf("[GS8-ROOMREADY] f%u forced RAM[0x80097908] = 1 before C774\n",
+                               g_ps1_frame);
+                        fflush(stdout);
+                    }
+                }
+            }
+
+            if (is_sel_overlay && c778 != 0u && c778 >= 0x80100000u) {
+                static uint32_t s_sel_update_calls = 0;
+                static uint32_t s_sel12_logs = 0;
+                static uint32_t s_sel_sound_tick_calls = 0;
+                static uint32_t s_sel12_stuck_sound_frames = 0;
+                uint32_t c9a4 = 0u;
+                memcpy(&c9a4, &g_ram[0x3C9A4], sizeof(c9a4));
+                if (++s_sel_update_calls <= 120u) {
+                    printf("[GS8-FIX] f%u Calling SEL Update from C778 = 0x%08X (#%u)\n",
+                           g_ps1_frame, c778, s_sel_update_calls);
+                    fflush(stdout);
+                }
+                cv_prepare_sel_gpu_state();
+                uint32_t save_ra = cpu->ra;
+                uint32_t save_a0 = cpu->a0;
+                mips_interpret(cpu, c778);
+                cpu->ra = save_ra;
+                cpu->a0 = save_a0;
+                {
+                    CPUState saved_cpu = *cpu;
+                    if (++s_sel_sound_tick_calls <= 120u) {
+                        printf("[GS8-SOUND] f%u Calling sound tick 0x801361F8 (#%u)\n",
+                               g_ps1_frame, s_sel_sound_tick_calls);
+                        fflush(stdout);
+                    }
+                    call_by_address(cpu, 0x801361F8u);
+                    *cpu = saved_cpu;
+                }
+                {
+                    uint32_t game_state_after = 0;
+                    memcpy(&game_state_after, &g_ram[0x3C734], sizeof(game_state_after));
+                    if (game_state_after != 8u) {
+                        static uint32_t s_sel_state_change_returns = 0;
+                        if (++s_sel_state_change_returns <= 24u) {
+                            printf("[GS8-FIX-RETURN] f%u leaving gs8 handler after SEL update changed state to %u\n",
+                                   g_ps1_frame, game_state_after);
+                            fflush(stdout);
+                        }
+                        return;
+                    }
+                }
+                if (c9a4 == 0x12u) {
+                    int32_t d_8013b61c = 0;
+                    int16_t d_8013901c = 0;
+                    int16_t queue_pos = 0;
+                    int16_t queue0 = 0;
+                    int16_t queue1 = 0;
+                    uint8_t cd_step = 0u;
+                    memcpy(&d_8013b61c, &g_ram[0x13B61C], sizeof(d_8013b61c));
+                    memcpy(&d_8013901c, &g_ram[0x13901C], sizeof(d_8013901c));
+                    memcpy(&queue_pos, &g_ram[0x1396F4], sizeof(queue_pos));
+                    memcpy(&queue0, &g_ram[0x139868], sizeof(queue0));
+                    memcpy(&queue1, &g_ram[0x13986A], sizeof(queue1));
+                    memcpy(&cd_step, &g_ram[0x13AE80], sizeof(cd_step));
+                    if (d_8013b61c != 0 &&
+                        d_8013901c == 0 &&
+                        queue_pos == 2 &&
+                        queue0 == 4 &&
+                        queue1 == 10 &&
+                        cd_step == 1u) {
+                        if (++s_sel12_stuck_sound_frames >= 8u) {
+                            const int16_t zero16 = 0;
+                            const int32_t zero32 = 0;
+                            const uint8_t zero8 = 0u;
+                            memcpy(&g_ram[0x1396F4], &zero16, sizeof(zero16));   /* qpos */
+                            memcpy(&g_ram[0x139868], &zero16, sizeof(zero16));   /* q[0] */
+                            memcpy(&g_ram[0x13986A], &zero16, sizeof(zero16));   /* q[1] */
+                            memcpy(&g_ram[0x13986C], &zero16, sizeof(zero16));   /* q[2] */
+                            memcpy(&g_ram[0x13AE80], &zero8, sizeof(zero8));     /* step */
+                            memcpy(&g_ram[0x1390A0], &zero8, sizeof(zero8));     /* busy */
+                            memcpy(&g_ram[0x13B61C], &zero32, sizeof(zero32));   /* gate */
+                            memcpy(&g_ram[0x0BD1C4], &zero32, sizeof(zero32));   /* fade wait */
+                            printf("[GS8-SOUND-FIX] f%u cleared stuck SEL sound queue q=[4,10] step=1 gate=1\n",
+                                   g_ps1_frame);
+                            fflush(stdout);
+                            s_sel12_stuck_sound_frames = 0;
+                        }
+                    } else {
+                        s_sel12_stuck_sound_frames = 0;
+                    }
+                } else {
+                    s_sel12_stuck_sound_frames = 0;
+                }
+                if (c9a4 == 0x12u && (++s_sel12_logs <= 120u || (s_sel12_logs % 120u) == 0u)) {
+                    int32_t d_8013b61c = 0;
+                    int16_t d_8013901c = 0;
+                    uint8_t d_801390a0 = 0u;
+                    int32_t d_800bd1c4 = 0;
+                    uint8_t cd_step = 0u;
+                    int16_t xa_fade = 0;
+                    int16_t xa_mul = 0;
+                    int16_t volume_l = 0;
+                    int16_t volume_r = 0;
+                    int16_t queue_pos = 0;
+                    int16_t queue0 = 0;
+                    int16_t queue1 = 0;
+                    int16_t queue2 = 0;
+                    uint8_t sound_initialized = 0u;
+                    uint32_t c9a4_after = 0u;
+                    memcpy(&d_8013b61c, &g_ram[0x13B61C], sizeof(d_8013b61c));
+                    memcpy(&d_8013901c, &g_ram[0x13901C], sizeof(d_8013901c));
+                    memcpy(&d_801390a0, &g_ram[0x1390A0], sizeof(d_801390a0));
+                    memcpy(&d_800bd1c4, &g_ram[0x0BD1C4], sizeof(d_800bd1c4));
+                    memcpy(&cd_step, &g_ram[0x13AE80], sizeof(cd_step));
+                    memcpy(&xa_fade, &g_ram[0x139A78], sizeof(xa_fade));
+                    memcpy(&xa_mul, &g_ram[0x139A68], sizeof(xa_mul));
+                    memcpy(&volume_l, &g_ram[0x13AE8C], sizeof(volume_l));
+                    memcpy(&volume_r, &g_ram[0x13B698], sizeof(volume_r));
+                    memcpy(&queue_pos, &g_ram[0x1396F4], sizeof(queue_pos));
+                    memcpy(&queue0, &g_ram[0x139868], sizeof(queue0));
+                    memcpy(&queue1, &g_ram[0x13986A], sizeof(queue1));
+                    memcpy(&queue2, &g_ram[0x13986C], sizeof(queue2));
+                    memcpy(&sound_initialized, &g_ram[0x13AEEC], sizeof(sound_initialized));
+                    memcpy(&c9a4_after, &g_ram[0x3C9A4], sizeof(c9a4_after));
+                    printf("[SEL12-STATE] f%u C9A4=%u->%u sound=%u qpos=%d q=[%d,%d,%d] step=%u xaFade=%d xaMul=%d vol=%d/%d B61C=%d 3901C=%d 390A0=%u BD1C4=%d\n",
+                           g_ps1_frame, c9a4, c9a4_after, (unsigned)sound_initialized,
+                           (int)queue_pos, (int)queue0, (int)queue1, (int)queue2,
+                           (unsigned)cd_step,
+                           (int)xa_fade, (int)xa_mul, (int)volume_l, (int)volume_r,
+                           d_8013b61c, (int)d_8013901c, (unsigned)d_801390a0, d_800bd1c4);
+                    fflush(stdout);
+                }
+            } else if (!has_overlay_room_data && !s_c778_called && c778 != 0u && c778 >= 0x80100000u) {
                 s_c778_called = 1;
                 uint32_t ptr_before = 0;
                 memcpy(&ptr_before, &g_ram[0x1C1688], 4);
@@ -2991,20 +6692,143 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 fflush(stdout);
             }
 
-            if (c780 != 0u && c780 >= 0x80100000u) {
+            if (!has_overlay_room_data && !is_sel_overlay && c780 != 0u && c780 >= 0x80100000u) {
                 static uint32_t s_c780_calls = 0;
-                if (++s_c780_calls <= 5u) {
+                if (++s_c780_calls <= 120u) {
                     uint32_t ptr_val = 0;
                     memcpy(&ptr_val, &g_ram[0x1C1688], 4);
                     printf("[GS8-FIX] f%u Calling C780(update) = 0x%08X (#%u) (0x801C1688=0x%08X)\n",
                            g_ps1_frame, c780, s_c780_calls, ptr_val);
                     fflush(stdout);
                 }
+                if (is_room_overlay) {
+                    static uint32_t s_room_base_seed_logs = 0;
+                    static int s_room_base_seeded = 0;
+                    uint32_t ptr_before_update = 0;
+                    uint32_t cursor_before_update = 0;
+                    uint32_t cursor_base_1688 = 0x8018241Cu;
+                    uint32_t cursor_base_168C = 0x80182E28u;
+                    memcpy(&ptr_before_update, &g_ram[0x1C1688], 4);
+                    memcpy(&cursor_before_update, &g_ram[0x1C168C], 4);
+                    if (!s_room_base_seeded
+                        || ptr_before_update < 0x80182000u || ptr_before_update > 0x80183000u
+                        || cursor_before_update < 0x80182000u || cursor_before_update > 0x80183000u) {
+                        s_room_base_seeded = 1;
+                        memcpy(&g_ram[0x1C1688], &cursor_base_1688, 4);
+                        memcpy(&g_ram[0x1C168C], &cursor_base_168C, 4);
+                        if (++s_room_base_seed_logs <= 8u) {
+                            printf("[GS8-FIX] f%u Seeded room overlay base pointers before C780: 1688=0x%08X 168C=0x%08X\n",
+                                   g_ps1_frame, cursor_base_1688, cursor_base_168C);
+                            fflush(stdout);
+                        }
+                    }
+                }
                 uint32_t save_ra = cpu->ra;
                 uint32_t save_a0 = cpu->a0;
                 mips_interpret(cpu, c780);
                 cpu->ra = save_ra;
                 cpu->a0 = save_a0;
+                if (is_room_overlay) {
+                    cv_try_manual_room_layer_init("gs8-c780");
+                }
+
+                if (g_room_clut_loaded) {
+                    static uint32_t s_room_cursor_force_logs = 0;
+                    static uint32_t s_room_state_force_logs = 0;
+                    static uint32_t s_room_mask_clear_logs = 0;
+                    static int s_room_cursor_seeded = 0;
+                    uint32_t ptr_after_update = 0;
+                    uint32_t cursor_after_update = 0;
+                    memcpy(&ptr_after_update, &g_ram[0x1C1688], 4);
+                    memcpy(&cursor_after_update, &g_ram[0x1C168C], 4);
+                    if (c778 == 0x801AC710u && c780 == 0x801ACB14u) {
+                        uint32_t room_state_1690 = 0;
+                        uint32_t room_state_1694 = 0;
+                        if (!s_room_cursor_seeded ||
+                            ptr_after_update == 0u || cursor_after_update == 0u ||
+                            ptr_after_update < 0x80182000u || ptr_after_update > 0x80183000u ||
+                            cursor_after_update < 0x80182000u || cursor_after_update > 0x80183000u) {
+                            s_room_cursor_seeded = 1;
+                            ptr_after_update = 0x80182458u;
+                            cursor_after_update = 0x80182E46u;
+                            memcpy(&g_ram[0x1C1688], &ptr_after_update, 4);
+                            memcpy(&g_ram[0x1C168C], &cursor_after_update, 4);
+                            if (++s_room_cursor_force_logs <= 8u) {
+                                printf("[GS8-FIX] f%u Recovered zeroed room cursors after C780: 1688=0x%08X 168C=0x%08X\n",
+                                       g_ps1_frame, ptr_after_update, cursor_after_update);
+                                fflush(stdout);
+                            }
+                        }
+                        memcpy(&room_state_1690, &g_ram[0x1C1690], 4);
+                        memcpy(&room_state_1694, &g_ram[0x1C1694], 4);
+                        if ((room_state_1690 & 0xFFu) != 0u) {
+                            room_state_1690 &= ~0xFFu;
+                            memcpy(&g_ram[0x1C1690], &room_state_1690, 4);
+                        }
+                        memset(&g_ram[0x97428], 0, 0x20);
+                        if (++s_room_mask_clear_logs <= 8u) {
+                            printf("[GS8-FIX] f%u Cleared room visibility mask table at 0x80097428\n",
+                                   g_ps1_frame);
+                            fflush(stdout);
+                        }
+                        if (++s_room_state_force_logs <= 120u) {
+                            printf("[GS8-FIX] f%u Room scan state after C780: 1690=0x%08X 1694=0x%08X\n",
+                                   g_ps1_frame, room_state_1690, room_state_1694);
+                            fflush(stdout);
+                        }
+                    }
+                    if (ptr_after_update < 0x80000000u || ptr_after_update > 0x801FFFFFu) {
+                        cv_install_room_clut_terminator();
+                        memcpy(&ptr_after_update, &g_ram[0x1C1688], 4);
+                        printf("[GS8-FIX] f%u Room CLUT block at 0x%08X (%u bytes) did not yield a valid 0x801C1688 after C780; fallback -> 0x%08X\n",
+                               g_ps1_frame, 0x80000000u | g_room_clut_phys, g_room_clut_bytes, ptr_after_update);
+                        fflush(stdout);
+                    } else {
+                        uint32_t room_state_1690 = 0;
+                        uint32_t room_state_1694 = 0;
+                        uint32_t rec0_w0 = 0;
+                        uint32_t rec0_w1 = 0;
+                        uint16_t rec0_w2 = 0;
+                        memcpy(&room_state_1690, &g_ram[0x1C1690], 4);
+                        memcpy(&room_state_1694, &g_ram[0x1C1694], 4);
+                        if (cursor_after_update < 0x80000000u || cursor_after_update > 0x801FFFFFu) {
+                            memcpy(&g_ram[0x1C168C], &ptr_after_update, 4);
+                            cursor_after_update = ptr_after_update;
+                            printf("[GS8-FIX] f%u Synced 0x801C168C to 0x%08X after C780\n",
+                                   g_ps1_frame, cursor_after_update);
+                            fflush(stdout);
+                        }
+                        uint8_t* rec0 = addr_ptr(ptr_after_update);
+                        if (rec0) {
+                            memcpy(&rec0_w0, rec0, 4);
+                            memcpy(&rec0_w1, rec0 + 4, 4);
+                            memcpy(&rec0_w2, rec0 + 8, 2);
+                        }
+                        if (s_c780_calls <= 120u) {
+                            printf("[GS8-FIX] f%u C780 produced 0x801C1688=0x%08X from room CLUT block 0x%08X\n",
+                                   g_ps1_frame, ptr_after_update, 0x80000000u | g_room_clut_phys);
+                            printf("[GS8-ROOM] f%u ptr=0x%08X cur=0x%08X 1690=0x%08X 1694=0x%08X rec0=%08X %08X %04X\n",
+                                   g_ps1_frame, ptr_after_update, cursor_after_update,
+                                   room_state_1690, room_state_1694, rec0_w0, rec0_w1, rec0_w2);
+                            fflush(stdout);
+                        }
+                    }
+                }
+            }
+            /* Legacy room-overlay shortcut; keep it opt-in so the default path
+             * doesn't silently jump past the real gs=8 sub-state flow. */
+            if (cv_force_gs8_sub7_enabled() &&
+                !s_gs8_sub7_forced &&
+                s_gs8_sub6_entries >= 8u &&
+                c774 == 0x801AECA4u &&
+                c778 == 0x801AC710u &&
+                c780 == 0x801ACB14u) {
+                uint32_t forced_sub = 7u;
+                memcpy(&g_ram[0x73060], &forced_sub, 4);
+                s_gs8_sub7_forced = 1;
+                printf("[GS8-SUBFIX] f%u forced sub 6->7 after %u gs8/sub6 entries (C774=0x%08X C778=0x%08X C780=0x%08X)\n",
+                       g_ps1_frame, s_gs8_sub6_entries, c774, c778, c780);
+                fflush(stdout);
             }
         }
     }
@@ -3090,21 +6914,24 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
     }
 
     /* Trace key DRA.BIN function entries for Castlevania rendering pipeline analysis */
-    if (start_pc == 0x80106670u || start_pc == 0x800EDEDCu ||
-        start_pc == 0x800E414Cu || start_pc == 0x800F3828u ||
+    if (start_pc == 0x80106670u || start_pc == 0x800ECE58u || start_pc == 0x800EBBACu ||
+        start_pc == 0x800EDEDCu || start_pc == 0x800E414Cu || start_pc == 0x800F3828u ||
         start_pc == 0x800F44C8u || start_pc == 0x800E4128u) {
-        static uint32_t s_dra_trace[6] = {0};
+        static uint32_t s_dra_trace[8] = {0};
         int idx = (start_pc == 0x80106670u) ? 0 :
-                  (start_pc == 0x800EDEDCu) ? 1 :
-                  (start_pc == 0x800E414Cu) ? 2 :
-                  (start_pc == 0x800F3828u) ? 3 :
-                  (start_pc == 0x800F44C8u) ? 4 : 5;
+                  (start_pc == 0x800ECE58u) ? 1 :
+                  (start_pc == 0x800EBBACu) ? 2 :
+                  (start_pc == 0x800EDEDCu) ? 3 :
+                  (start_pc == 0x800E414Cu) ? 4 :
+                  (start_pc == 0x800F3828u) ? 5 :
+                  (start_pc == 0x800F44C8u) ? 6 : 7;
         static const char* dra_names[] = {
-            "RenderFunc", "ProcEntities", "StepHandler",
-            "StepCaller1", "StepCaller2", "StepInit"
+            "RenderFunc", "RenderTilemap", "RenderEntities", "RenderPrimitives",
+            "StepHandler", "StepCaller1", "StepCaller2", "StepInit"
         };
         s_dra_trace[idx]++;
-        if (s_dra_trace[idx] <= 20u || (s_dra_trace[idx] % 240u) == 0u) {
+        if ((g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) ||
+            s_dra_trace[idx] <= 20u || (s_dra_trace[idx] % 240u) == 0u) {
             printf("[DRA-TRACE] f%u %s(0x%08X) #%u ra=0x%08X a0=0x%08X\n",
                    g_ps1_frame, dra_names[idx], start_pc, s_dra_trace[idx],
                    cpu->ra, cpu->a0);
@@ -3203,6 +7030,19 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         guard_limit = (uint32_t)INT32_MAX;
     }
     if (start_pc == 0x800E7AECu) {
+        /* Canonical title -> New Game -> room init now reaches heavier stage helpers
+         * (for example the RCAT byte-packing loops around 0x801B2268) that can burn
+         * through 10M interpreted instructions before the frame finishes initialising.
+         * Truncating UpdateGame here leaves gameplay half-initialised and permanently black. */
+        guard_limit = 100000000u;
+    }
+    if (start_pc == 0x800E7458u) {
+        /* The GS8 handler's sub=6 path jalr's into stage overlay draw/setup code.
+         * On the canonical prologue path, overlay 12 walks large init/draw tables and
+         * can exceed the generic overlay budget before the frame returns. */
+        guard_limit = 10000000u;
+    }
+    if (start_pc == 0x800EB314u) {
         guard_limit = 10000000u;
     }
     /* All DRA.BIN / stage overlay code (≥0x800A0000) dispatched via start_pc
@@ -3210,8 +7050,14 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
      * data-scan loops that easily exceed the default 10K iterations.
      * Exclude MainGame/UpdateGame (already set above). */
     if (start_pc >= 0x800A0000u && start_pc <= 0x801FFFFFu
-        && start_pc != 0x800E3988u && start_pc != 0x800E7AECu) {
+        && start_pc != 0x800E3988u && start_pc != 0x800E7AECu
+        && start_pc != 0x800EB314u && start_pc != 0x800E7458u) {
         guard_limit = 100000u;
+    }
+    /* SEL Update (0x801AEED8) walks text/font helpers in DRA.BIN and regularly
+     * exceeds the generic 100K overlay budget during menu init/fade. */
+    if (start_pc == 0x801AEED8u) {
+        guard_limit = 100000000u;
     }
     /* DRA.BIN overlay code (≥0x800A0000): the main game function at 0x800E3988
      * is an infinite loop (init + while(1) { frame... }).  The default 10K guard
@@ -3250,6 +7096,11 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             }
             interp_call_top = interp_call_base; return;
         }
+        /* VSync frame-done: VSync handler set this flag to end the frame cleanly.
+         * This mirrors VBlank breaking the current timeslice on real hardware. */
+        if (g_vsync_frame_done) {
+            interp_call_top = interp_call_base; return;
+        }
         if (s_interp_min_sp != 0u && cpu->sp < s_interp_min_sp) {
             static uint32_t s_interp_min_sp_hits = 0;
             if (s_interp_min_sp_hits < 40u) {
@@ -3262,6 +7113,206 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
         }
         cpu->zero = 0;
         cpu->pc = pc;
+        if (pc == 0x800F16D0u || pc == 0x800F14CCu) {
+            cv_try_repair_st0_dra_before_engine_init(pc, cpu->ra);
+        }
+        if (start_pc == 0x800E7AECu &&
+            g_ps1_frame >= 1754u && g_ps1_frame <= 1755u) {
+            static uint32_t s_ug_delta_frame = 0xFFFFFFFFu;
+            static uint32_t s_ug_delta_prev_pc = 0;
+            static uint32_t s_ug_delta_menu_vis = 0;
+            static uint32_t s_ug_delta_fade[4] = {0};
+            static uint32_t s_ug_delta_ptrs[5] = {0};
+            uint32_t cur_menu_vis = 0;
+            uint32_t cur_fade[4] = {0};
+            uint32_t cur_ptrs[5] = {0};
+            static const uint32_t k_menu_ptr_phys_delta[5] = {
+                0xA83C8u, 0xA83CCu, 0xA83D0u, 0xA83D4u, 0xA83D8u
+            };
+            memcpy(&cur_menu_vis, &g_ram[0x973ECu], sizeof(cur_menu_vis));
+            memcpy(&cur_fade[0], &g_ram[0x13799Cu], sizeof(cur_fade[0]));
+            memcpy(&cur_fade[1], &g_ram[0x1379A0u], sizeof(cur_fade[1]));
+            memcpy(&cur_fade[2], &g_ram[0x1379A4u], sizeof(cur_fade[2]));
+            memcpy(&cur_fade[3], &g_ram[0x1379A8u], sizeof(cur_fade[3]));
+            for (int i = 0; i < 5; i++) {
+                memcpy(&cur_ptrs[i], &g_ram[k_menu_ptr_phys_delta[i]], sizeof(cur_ptrs[i]));
+            }
+            if (s_ug_delta_frame != g_ps1_frame) {
+                s_ug_delta_frame = g_ps1_frame;
+                s_ug_delta_prev_pc = pc;
+                s_ug_delta_menu_vis = cur_menu_vis;
+                memcpy(s_ug_delta_fade, cur_fade, sizeof(s_ug_delta_fade));
+                memcpy(s_ug_delta_ptrs, cur_ptrs, sizeof(s_ug_delta_ptrs));
+            } else if (s_ug_delta_menu_vis != cur_menu_vis ||
+                       memcmp(s_ug_delta_fade, cur_fade, sizeof(s_ug_delta_fade)) != 0 ||
+                       memcmp(s_ug_delta_ptrs, cur_ptrs, sizeof(s_ug_delta_ptrs)) != 0) {
+                uint32_t instr = cpu->read_word(pc);
+                printf("[UG-MEM-DELTA] f%u prev_pc=0x%08X pc=0x%08X instr=0x%08X"
+                       " menuvis=0x%08X->0x%08X"
+                       " fade=%08X/%08X/%08X/%08X->%08X/%08X/%08X/%08X"
+                       " ptrs=%08X,%08X,%08X,%08X,%08X->%08X,%08X,%08X,%08X,%08X\n",
+                       g_ps1_frame, s_ug_delta_prev_pc, pc, instr,
+                       s_ug_delta_menu_vis, cur_menu_vis,
+                       s_ug_delta_fade[0], s_ug_delta_fade[1], s_ug_delta_fade[2], s_ug_delta_fade[3],
+                       cur_fade[0], cur_fade[1], cur_fade[2], cur_fade[3],
+                       s_ug_delta_ptrs[0], s_ug_delta_ptrs[1], s_ug_delta_ptrs[2], s_ug_delta_ptrs[3], s_ug_delta_ptrs[4],
+                       cur_ptrs[0], cur_ptrs[1], cur_ptrs[2], cur_ptrs[3], cur_ptrs[4]);
+                fflush(stdout);
+                s_ug_delta_menu_vis = cur_menu_vis;
+                memcpy(s_ug_delta_fade, cur_fade, sizeof(s_ug_delta_fade));
+                memcpy(s_ug_delta_ptrs, cur_ptrs, sizeof(s_ug_delta_ptrs));
+            }
+            s_ug_delta_prev_pc = pc;
+        }
+        {
+            int room_activation_entry =
+                start_pc == 0x801AD16Cu || start_pc == 0x801AD6E8u ||
+                start_pc == 0x801AD9CCu || start_pc == 0x801AEDCCu ||
+                start_pc == 0x801ADC2Cu || start_pc == 0x801AEEC0u;
+            if ((((start_pc == 0x801ACB14u || start_pc == 0x801AECA4u) &&
+                  (pc == 0x801ACC74u || pc == 0x801AD16Cu || pc == 0x801AD6E8u ||
+                   pc == 0x801AD9CCu || pc == 0x801AEDCCu || pc == 0x801ADC2Cu ||
+                   pc == 0x801AEEC0u)) ||
+                 (room_activation_entry && pc == start_pc))) {
+            static uint32_t s_room_activation_pc_logs = 0;
+            if (++s_room_activation_pc_logs <= 120u) {
+                printf("[ROOM-ACT-PC] f%u #%u entry=0x%08X pc=0x%08X v0=0x%08X v1=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X ra=0x%08X\n",
+                       g_ps1_frame, s_room_activation_pc_logs, start_pc, pc,
+                       cpu->v0, cpu->v1, cpu->a0, cpu->a1, cpu->a2, cpu->a3,
+                       cpu->t0, cpu->t1, cpu->t2, cpu->t3, cpu->ra);
+                fflush(stdout);
+            }
+            }
+        }
+        if (pc == 0x801B2108u && g_ps1_frame >= 820u && g_ps1_frame <= 840u) {
+            static uint32_t s_text_blit_logs = 0;
+            if (++s_text_blit_logs <= 48u) {
+                uint32_t game_state = 0;
+                uint32_t eng_step = 0;
+                uint32_t menu_step = 0;
+                uint32_t glyph_cb = 0;
+                uint8_t bytes[24] = {0};
+                memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+                memcpy(&eng_step, &g_ram[0x3C9A4], sizeof(eng_step));
+                memcpy(&menu_step, &g_ram[0x978F8], sizeof(menu_step));
+                memcpy(&glyph_cb, &g_ram[0x3C800], sizeof(glyph_cb));
+                {
+                    uint8_t* pstr = addr_ptr(cpu->a0);
+                    if (pstr) {
+                        memcpy(bytes, pstr, sizeof(bytes));
+                    }
+                }
+                printf("[TEXTBLIT] f%u #%u entry=0x%08X ra=0x%08X a0=0x%08X a1=0x%08X gs=%u eng=0x%08X menustep=0x%08X glyph=0x%08X bytes=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                       g_ps1_frame, s_text_blit_logs, start_pc, cpu->ra,
+                       cpu->a0, cpu->a1, game_state, eng_step, menu_step, glyph_cb,
+                       bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                       bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+                       bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+                       bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23]);
+                fflush(stdout);
+            }
+        }
+        if (start_pc == 0x800E7AECu && pc == 0x800F682Cu &&
+            g_ps1_frame >= 844u && g_ps1_frame < 847u) {
+            static uint32_t s_menustr_probe = 0;
+            static uint32_t s_menustr_ctx = 0;
+            if (++s_menustr_probe <= 80u) {
+                uint8_t bytes[8] = {0};
+                uint8_t* pstr = addr_ptr(cpu->s0);
+                if (pstr) {
+                    memcpy(bytes, pstr, sizeof(bytes));
+                }
+                printf("[MENUSTR] f%u n=%u ra=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X s3=0x%08X bytes=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                       g_ps1_frame, s_menustr_probe, cpu->ra, cpu->s0, cpu->s1, cpu->s2, cpu->s3,
+                       bytes[0], bytes[1], bytes[2], bytes[3],
+                       bytes[4], bytes[5], bytes[6], bytes[7]);
+                fflush(stdout);
+            }
+            if (++s_menustr_ctx <= 8u) {
+                uint32_t eng = 0;
+                uint32_t menu_step = 0;
+                uint32_t menu_vis = 0;
+                uint32_t ptr5 = 0;
+                uint32_t ptr6 = 0;
+                uint32_t ptr7 = 0;
+                uint32_t ptr8 = 0;
+                uint32_t ptr12 = 0;
+                uint32_t ptr13 = 0;
+                uint32_t ptr14 = 0;
+                uint32_t ptr15 = 0;
+                uint16_t pressed = 0;
+                uint16_t prev = 0;
+                uint16_t tapped = 0;
+                uint16_t raw = g_pad1_state;
+                uint8_t b5[8] = {0};
+                uint8_t b6[8] = {0};
+                uint8_t b7[8] = {0};
+                uint8_t b8[8] = {0};
+                uint8_t b12[8] = {0};
+                uint8_t b13[8] = {0};
+                uint8_t b14[8] = {0};
+                uint8_t b15[8] = {0};
+                memcpy(&eng, &g_ram[0x3C9A4], sizeof(eng));
+                memcpy(&menu_step, &g_ram[0x978F8], sizeof(menu_step));
+                memcpy(&menu_vis, &g_ram[0x973EC], sizeof(menu_vis));
+                memcpy(&ptr5, &g_ram[0xA8174], sizeof(ptr5));
+                memcpy(&ptr6, &g_ram[0xA8178], sizeof(ptr6));
+                memcpy(&ptr7, &g_ram[0xA817C], sizeof(ptr7));
+                memcpy(&ptr8, &g_ram[0xA8180], sizeof(ptr8));
+                memcpy(&ptr12, &g_ram[0xA8190], sizeof(ptr12));
+                memcpy(&ptr13, &g_ram[0xA8194], sizeof(ptr13));
+                memcpy(&ptr14, &g_ram[0xA8198], sizeof(ptr14));
+                memcpy(&ptr15, &g_ram[0xA819C], sizeof(ptr15));
+                memcpy(&pressed, &g_ram[0x97490], sizeof(pressed));
+                memcpy(&prev, &g_ram[0x97492], sizeof(prev));
+                memcpy(&tapped, &g_ram[0x97494], sizeof(tapped));
+                {
+                    uint8_t* p = addr_ptr(ptr5);
+                    if (p) memcpy(b5, p, sizeof(b5));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr6);
+                    if (p) memcpy(b6, p, sizeof(b6));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr7);
+                    if (p) memcpy(b7, p, sizeof(b7));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr8);
+                    if (p) memcpy(b8, p, sizeof(b8));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr12);
+                    if (p) memcpy(b12, p, sizeof(b12));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr13);
+                    if (p) memcpy(b13, p, sizeof(b13));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr14);
+                    if (p) memcpy(b14, p, sizeof(b14));
+                }
+                {
+                    uint8_t* p = addr_ptr(ptr15);
+                    if (p) memcpy(b15, p, sizeof(b15));
+                }
+                printf("[MENUCTX] f%u n=%u eng=0x%08X menustep=0x%08X menuvis=0x%08X raw=0x%04X pressed=0x%04X prev=0x%04X tapped=0x%04X ptr5=0x%08X ptr6=0x%08X ptr7=0x%08X ptr8=0x%08X ptr12=0x%08X ptr13=0x%08X ptr14=0x%08X ptr15=0x%08X b5=%02X %02X %02X %02X %02X %02X %02X %02X b6=%02X %02X %02X %02X %02X %02X %02X %02X b7=%02X %02X %02X %02X %02X %02X %02X %02X b8=%02X %02X %02X %02X %02X %02X %02X %02X b12=%02X %02X %02X %02X %02X %02X %02X %02X b13=%02X %02X %02X %02X %02X %02X %02X %02X b14=%02X %02X %02X %02X %02X %02X %02X %02X b15=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                       g_ps1_frame, s_menustr_ctx, eng, menu_step, menu_vis,
+                       raw, pressed, prev, tapped,
+                       ptr5, ptr6, ptr7, ptr8, ptr12, ptr13, ptr14, ptr15,
+                       b5[0], b5[1], b5[2], b5[3], b5[4], b5[5], b5[6], b5[7],
+                       b6[0], b6[1], b6[2], b6[3], b6[4], b6[5], b6[6], b6[7],
+                       b7[0], b7[1], b7[2], b7[3], b7[4], b7[5], b7[6], b7[7],
+                       b8[0], b8[1], b8[2], b8[3], b8[4], b8[5], b8[6], b8[7],
+                       b12[0], b12[1], b12[2], b12[3], b12[4], b12[5], b12[6], b12[7],
+                       b13[0], b13[1], b13[2], b13[3], b13[4], b13[5], b13[6], b13[7],
+                       b14[0], b14[1], b14[2], b14[3], b14[4], b14[5], b14[6], b14[7],
+                       b15[0], b15[1], b15[2], b15[3], b15[4], b15[5], b15[6], b15[7]);
+                fflush(stdout);
+            }
+        }
         if (s_trace_a664_loop && start_pc == 0x8001A664u &&
             (pc == 0x8001A7CCu || pc == 0x8001A7D0u || pc == 0x8001A7D4u ||
              pc == 0x8001A7D8u || pc == 0x8001A7DCu || pc == 0x8001A7E0u ||
@@ -3295,7 +7346,183 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                 fflush(stdout);
             }
         }
+        if (pc == 0x80156F40u || pc == 0x80157BFCu || pc == 0x801603C4u) {
+            uint32_t game_state = 0;
+            uint32_t stage_id = 0;
+            uint32_t current_entity = 0;
+            memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+            memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+            memcpy(&current_entity, &g_ram[0x6C3B8u], sizeof(current_entity));
+            if (game_state == 2u && (stage_id & 0xFFu) == 0x1Fu) {
+                const uint32_t player_entity = 0x800733D8u;
+                if (pc == 0x80156F40u) {
+                    if (current_entity != player_entity) {
+                        static uint32_t s_st0_playerinit_entry_hits = 0;
+                        memcpy(&g_ram[0x6C3B8u], &player_entity, sizeof(player_entity));
+                        g_st0_player_init_entry_frame = g_ps1_frame;
+                        if (++s_st0_playerinit_entry_hits <= 16u ||
+                            (s_st0_playerinit_entry_hits % 64u) == 0u) {
+                            printf("[ST0-PLAYERINIT-ENTRY] f%u n=%u pc=0x%08X cur:0x%08X->0x%08X ra=0x%08X a0=0x%08X sp=0x%08X\n",
+                                   g_ps1_frame, s_st0_playerinit_entry_hits, pc,
+                                   current_entity, player_entity, cpu->ra, cpu->a0, cpu->sp);
+                            fflush(stdout);
+                        }
+                    }
+                } else {
+                    uint16_t player_step = 0;
+                    uint16_t player_frame = 0;
+                    uint32_t current_entity_after = current_entity;
+                    memcpy(&player_step, &g_ram[0x73404u], sizeof(player_step));
+                    memcpy(&player_frame, &g_ram[0x7342Eu], sizeof(player_frame));
+                    if (pc == 0x80157BFCu && current_entity != player_entity) {
+                        memcpy(&g_ram[0x6C3B8u], &player_entity, sizeof(player_entity));
+                        current_entity_after = player_entity;
+                    }
+                    if (pc == 0x80157BFCu) {
+                        static uint32_t s_st0_playermain_entry_hits = 0;
+                        if (++s_st0_playermain_entry_hits <= 24u ||
+                            (s_st0_playermain_entry_hits % 120u) == 0u) {
+                            printf("[ST0-PLAYERMAIN-ENTRY] f%u n=%u pc=0x%08X cur:0x%08X->0x%08X step=0x%04X frame=0x%04X ra=0x%08X sp=0x%08X\n",
+                                   g_ps1_frame, s_st0_playermain_entry_hits, pc,
+                                   current_entity, current_entity_after,
+                                   (uint32_t)player_step, (uint32_t)player_frame,
+                                   cpu->ra, cpu->sp);
+                            fflush(stdout);
+                        }
+                    } else {
+                        static uint32_t s_st0_playerents_entry_hits = 0;
+                        if (++s_st0_playerents_entry_hits <= 24u ||
+                            (s_st0_playerents_entry_hits % 120u) == 0u) {
+                            printf("[ST0-PLAYERENTS-ENTRY] f%u n=%u pc=0x%08X cur=0x%08X step=0x%04X frame=0x%04X ra=0x%08X sp=0x%08X\n",
+                                   g_ps1_frame, s_st0_playerents_entry_hits, pc,
+                                   current_entity, (uint32_t)player_step,
+                                   (uint32_t)player_frame, cpu->ra, cpu->sp);
+                            fflush(stdout);
+                        }
+                    }
+                }
+            }
+        }
         uint32_t instr = cpu->read_word(pc);
+        if (start_pc == 0x800E3988u &&
+            g_ps1_frame >= 1790u && g_ps1_frame <= 1810u &&
+            pc >= 0x800E3D00u && pc <= 0x800E3DB8u) {
+            uint32_t c0f8 = 0, c73ec = 0, c734 = 0;
+            memcpy(&c0f8, &g_ram[0x3C0F8], 4);
+            memcpy(&c73ec, &g_ram[0x973EC], 4);
+            memcpy(&c734, &g_ram[0x3C734], 4);
+            if ((instr >> 26) == 0x03u) {
+                uint32_t jal_target = ((pc + 4u) & 0xF0000000u) | ((instr & 0x03FFFFFFu) << 2);
+                printf("[MG-LATE-JAL] f%u pc=0x%08X target=0x%08X v0=0x%08X C0F8=%u 73EC=%u C734=%u ra=0x%08X sp=0x%08X\n",
+                       g_ps1_frame, pc, jal_target, cpu->v0, c0f8, c73ec, c734, cpu->ra, cpu->sp);
+                fflush(stdout);
+            } else if (pc == 0x800E3D08u || pc == 0x800E3D18u || pc == 0x800E3D94u) {
+                uint32_t tile_flags = 0;
+                uint32_t tile_hide = 0;
+                uint32_t bg0_flags = 0;
+                uint32_t prim_active = 0;
+                uint32_t room_def_ptr = 0;
+                uint32_t tile_layout_ptr = 0;
+                uint32_t tile_tiledef_ptr = 0;
+                uint32_t bg0_layout_ptr = 0;
+                uint32_t bg0_tiledef_ptr = 0;
+                int32_t room_pos_x = 0;
+                int32_t room_pos_y = 0;
+                if (pc == 0x800E3D18u || pc == 0x800E3D94u) {
+                    memcpy(&tile_layout_ptr, &g_ram[0x73084], 4);
+                    memcpy(&tile_tiledef_ptr, &g_ram[0x73088], 4);
+                    memcpy(&tile_flags, &g_ram[0x730A0], 4);
+                    memcpy(&tile_hide, &g_ram[0x730AC], 4);
+                    memcpy(&bg0_layout_ptr, &g_ram[0x730D8], 4);
+                    memcpy(&bg0_tiledef_ptr, &g_ram[0x730DC], 4);
+                    memcpy(&bg0_flags, &g_ram[0x730F4], 4);
+                    memcpy(&room_def_ptr, &g_ram[0x1375BC], 4);
+                    memcpy(&room_pos_x, &g_ram[0x1375C0], 4);
+                    memcpy(&room_pos_y, &g_ram[0x1375C4], 4);
+                    if (c734 == 2u && (tile_flags == 0u || bg0_flags == 0u)) {
+                        cv_try_manual_room_layer_init("play-render");
+                        memcpy(&tile_flags, &g_ram[0x730A0], 4);
+                        memcpy(&tile_hide, &g_ram[0x730AC], 4);
+                        memcpy(&bg0_flags, &g_ram[0x730F4], 4);
+                    }
+                    for (uint32_t prim_i = 0; prim_i < 0x500u; prim_i++) {
+                        if (g_ram[0x86FECu + prim_i * 0x34u] != 0u) {
+                            prim_active++;
+                        }
+                    }
+                }
+                printf("[MG-LATE-PC] f%u pc=0x%08X instr=0x%08X v0=0x%08X C0F8=%u 73EC=%u C734=%u tile=0x%08X hide=%u tileLayout=0x%08X tileDef=0x%08X bg0=0x%08X bgLayout=0x%08X bgTileDef=0x%08X prim=%u def=0x%08X pos=(%d,%d) ra=0x%08X sp=0x%08X\n",
+                       g_ps1_frame, pc, instr, cpu->v0, c0f8, c73ec, c734,
+                       tile_flags, tile_hide, tile_layout_ptr, tile_tiledef_ptr,
+                       bg0_flags, bg0_layout_ptr, bg0_tiledef_ptr, prim_active,
+                       room_def_ptr, room_pos_x, room_pos_y,
+                       cpu->ra, cpu->sp);
+                fflush(stdout);
+            }
+        }
+        if (pc == 0x800E7E50u) {
+            static uint32_t s_gapi_copy_pc_logs = 0;
+            if (++s_gapi_copy_pc_logs <= 8u) {
+                printf("[GAPI-COPY-PC] f%u pc=0x%08X a0=0x%08X a1=0x%08X v1=0x%08X ra=0x%08X\n",
+                       g_ps1_frame, pc, cpu->a0, cpu->a1, cpu->v1, cpu->ra);
+                if (addr_ptr(cpu->a1)) {
+                    printf("[GAPI-COPY-SRC]");
+                    for (int ii = 0; ii < 16; ii++) {
+                        uint32_t w = 0;
+                        memcpy(&w, addr_ptr(cpu->a1 + (uint32_t)ii * 4u), 4);
+                        printf(" %08X", w);
+                    }
+                    printf("\n");
+                }
+                fflush(stdout);
+            }
+        }
+        if (pc == 0x800F15B8u) {
+            static uint32_t s_roomdef_pc_logs = 0;
+            if (++s_roomdef_pc_logs <= 16u) {
+                uint32_t c374 = 0;
+                uint32_t tile_layers_ptr = 0;
+                uint32_t fg_ptr = 0;
+                uint32_t bg_ptr = 0;
+                uint8_t room_hdr[8] = {0};
+                uint16_t tele_x = 0, tele_y = 0, tele_room = 0, tele_unk6 = 0, tele_stage = 0;
+                uint16_t saved_x = 0, saved_y = 0, saved_room = 0, saved_unk6 = 0, saved_stage = 0;
+                memcpy(&c374, &g_ram[0x6C374], 4);
+                memcpy(&tile_layers_ptr, &g_ram[0x3C794], 4);
+                if (addr_ptr(cpu->a2)) {
+                    memcpy(&tele_x, addr_ptr(cpu->a2 + 0u), 2);
+                    memcpy(&tele_y, addr_ptr(cpu->a2 + 2u), 2);
+                    memcpy(&tele_room, addr_ptr(cpu->a2 + 4u), 2);
+                    memcpy(&tele_unk6, addr_ptr(cpu->a2 + 6u), 2);
+                    memcpy(&tele_stage, addr_ptr(cpu->a2 + 8u), 2);
+                }
+                if (cpu->v0 >= 0x80000004u && addr_ptr(cpu->v0 - 4u)) {
+                    memcpy(room_hdr, addr_ptr(cpu->v0 - 4u), sizeof(room_hdr));
+                }
+                if (tile_layers_ptr >= 0x80000000u &&
+                    room_hdr[4] < 0x80u &&
+                    addr_ptr(tile_layers_ptr + (uint32_t)room_hdr[4] * 8u)) {
+                    memcpy(&fg_ptr, addr_ptr(tile_layers_ptr + (uint32_t)room_hdr[4] * 8u + 0u), 4);
+                    memcpy(&bg_ptr, addr_ptr(tile_layers_ptr + (uint32_t)room_hdr[4] * 8u + 4u), 4);
+                }
+                if (s_dra_tele_captured) {
+                    memcpy(&saved_x, &s_dra_tele_saved[0], 2);
+                    memcpy(&saved_y, &s_dra_tele_saved[2], 2);
+                    memcpy(&saved_room, &s_dra_tele_saved[4], 2);
+                    memcpy(&saved_unk6, &s_dra_tele_saved[6], 2);
+                    memcpy(&saved_stage, &s_dra_tele_saved[8], 2);
+                }
+                printf("[ROOMDEF-PC] f%u pc=0x%08X v0=0x%08X v1=0x%08X a2=0x%08X c374=0x%08X tele={x=%u y=%u room=0x%04X unk6=0x%04X stage=0x%04X} saved0={x=%u y=%u room=0x%04X unk6=0x%04X stage=0x%04X} hdr=%02X %02X %02X %02X %02X %02X %02X %02X tileLayers=0x%08X fg=0x%08X bg=0x%08X ra=0x%08X\n",
+                       g_ps1_frame, pc, cpu->v0, cpu->v1, cpu->a2, c374,
+                       tele_x, tele_y, tele_room, tele_unk6, tele_stage,
+                       saved_x, saved_y, saved_room, saved_unk6, saved_stage,
+                       room_hdr[0], room_hdr[1], room_hdr[2], room_hdr[3],
+                       room_hdr[4], room_hdr[5], room_hdr[6], room_hdr[7],
+                       tile_layers_ptr, fg_ptr, bg_ptr,
+                       cpu->ra);
+                fflush(stdout);
+            }
+        }
         int  is_link = 0, is_jr31 = 0;
         uint32_t target = 0;
 
@@ -3342,7 +7569,14 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             return;
         }
 
-        if (target == 0 || (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u)) {
+        int invalid_target =
+            (target == 0u) ||
+            (target < 0x80000000u && target != 0xA0u && target != 0xB0u && target != 0xC0u) ||
+            (target >= 0x80000000u &&
+             !is_compiled_addr(target) &&
+             !cv_force_interpret_range(target) &&
+             !addr_ptr(target));
+        if (invalid_target) {
             if (trace_cv_interp) {
                 static uint32_t s_cv_null_target = 0;
                 if (++s_cv_null_target <= 30u) {
@@ -3357,6 +7591,14 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     printf("[NULL-JALR] #%u f%u pc=0x%08X target=0x%08X ra=0x%08X — null call skipped\n",
                            s_null_jalr, g_ps1_frame, pc, target, cpu->ra);
                     fflush(stdout);
+                }
+                if (pc == 0x801B1B58u) {
+                    static uint32_t s_st0_null_entity_logs = 0;
+                    if (++s_st0_null_entity_logs <= 24u) {
+                        uint32_t cur_ent = 0;
+                        memcpy(&cur_ent, &g_ram[0x6C3B8u], sizeof(cur_ent));
+                        cv_dump_entity_prim_state("NULL-JALR-ENT", cur_ent);
+                    }
                 }
                 pc = pc + 8;  /* skip past JALR+delay-slot, treat call as no-op */
                 continue;
@@ -3433,6 +7675,13 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                             fflush(stdout);
                         }
                     }
+                    if (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u &&
+                        (target == 0x800ECE58u || target == 0x800EBBACu || target == 0x800EDEDCu)) {
+                        static uint32_t s_late_render_calls = 0;
+                        printf("[LATE-RENDER-CALL] f%u #%u from=0x%08X to=0x%08X a0=0x%08X a1=0x%08X ra=0x%08X\n",
+                               g_ps1_frame, ++s_late_render_calls, pc, target, cpu->a0, cpu->a1, cpu->ra);
+                        fflush(stdout);
+                    }
                 }
                 /* Boot-time trace: overlay/DRA.BIN → compiled calls */
                 if (g_ps1_frame == 0u && pc >= 0x80080000u) {
@@ -3444,14 +7693,21 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         fflush(stdout);
                     }
                 }
+                int trace_ug_compiled_window = 0;
                 /* Trace compiled calls from UpdateGame */
-                if (start_pc == 0x800E7AECu) {
+                if (start_pc == 0x800E7AECu && g_ps1_frame <= 840u) {
                     static uint32_t s_ug_compiled = 0;
                     if (++s_ug_compiled <= 40u || (s_ug_compiled % 480u) == 0u) {
                         printf("[UG-COMPILED] f%u #%u pc=0x%08X → 0x%08X a0=0x%08X a1=0x%08X\n",
                                g_ps1_frame, s_ug_compiled, pc, target, cpu->a0, cpu->a1);
                         fflush(stdout);
                     }
+                }
+                if (trace_ug_compiled_window) {
+                    static uint32_t s_ug_compiled_window = 0;
+                    printf("[UG-COMPILED-WIN] f%u #%u pc=0x%08X -> 0x%08X a0=0x%08X a1=0x%08X ra=0x%08X\n",
+                           g_ps1_frame, ++s_ug_compiled_window, pc, target, cpu->a0, cpu->a1, cpu->ra);
+                    fflush(stdout);
                 }
                 /* Trace compiled calls from overlay code (start_pc >= 0x80180000, f66+) */
                 if (start_pc >= 0x80180000u && g_ps1_frame >= 66u) {
@@ -3462,7 +7718,86 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                         fflush(stderr);
                     }
                 }
-                call_by_address(cpu, target);
+                if (target == 0x800160E4u && pc == 0x800FDEF0u) {
+                    static uint32_t s_levelup_rand_logs = 0;
+                    static uint32_t s_levelup_exp_clamps = 0;
+                    uint32_t status_level = 0;
+                    uint32_t status_exp = 0;
+                    uint32_t demo_mode = 0;
+                    memcpy(&status_level, &g_ram[0x97BE8], 4);
+                    memcpy(&status_exp, &g_ram[0x97BEC], 4);
+                    memcpy(&demo_mode, &g_ram[0x97914], 4);
+                    if (++s_levelup_rand_logs <= 40u) {
+                        printf("[LEVELUP-RAND] f%u #%u level=%u exp=%u demo=%u pc=0x%08X ra=0x%08X\n",
+                               g_ps1_frame, s_levelup_rand_logs,
+                               status_level, status_exp, demo_mode, pc, cpu->ra);
+                        fflush(stdout);
+                    }
+                    if (status_level > 99u || demo_mode > 10u) {
+                        uint32_t sane_level = 99u;
+                        uint32_t sane_exp = 0u;
+                        uint32_t sane_demo = 0u;
+                        memcpy(&g_ram[0x97BE8], &sane_level, 4);
+                        memcpy(&g_ram[0x97BEC], &sane_exp, 4);
+                        memcpy(&g_ram[0x97914], &sane_demo, 4);
+                        if (++s_levelup_exp_clamps <= 20u) {
+                            printf("[LEVELUP-SANITIZE] f%u #%u level %u -> %u exp %u -> %u demo %u -> %u\n",
+                                   g_ps1_frame, s_levelup_exp_clamps,
+                                   status_level, sane_level, status_exp, sane_exp, demo_mode, sane_demo);
+                            fflush(stdout);
+                        }
+                    } else if (status_exp > 20000u) {
+                        uint32_t zero = 0;
+                        memcpy(&g_ram[0x97BEC], &zero, 4);
+                        if (++s_levelup_exp_clamps <= 20u) {
+                            printf("[LEVELUP-CLAMP] f%u #%u exp %u -> 0 at level=%u demo=%u\n",
+                                   g_ps1_frame, s_levelup_exp_clamps,
+                                   status_exp, status_level, demo_mode);
+                            fflush(stdout);
+                        }
+                    }
+                }
+                if (trace_ug_compiled_window) {
+                    uint32_t before_menu_vis = 0, after_menu_vis = 0;
+                    uint32_t before_fade[4] = {0}, after_fade[4] = {0};
+                    uint32_t before_ptrs[5] = {0}, after_ptrs[5] = {0};
+                    static const uint32_t k_menu_ptr_phys_trace[5] = {
+                        0xA83C8u, 0xA83CCu, 0xA83D0u, 0xA83D4u, 0xA83D8u
+                    };
+                    memcpy(&before_menu_vis, &g_ram[0x973ECu], sizeof(before_menu_vis));
+                    memcpy(&before_fade[0], &g_ram[0x13799Cu], sizeof(before_fade[0]));
+                    memcpy(&before_fade[1], &g_ram[0x1379A0u], sizeof(before_fade[1]));
+                    memcpy(&before_fade[2], &g_ram[0x1379A4u], sizeof(before_fade[2]));
+                    memcpy(&before_fade[3], &g_ram[0x1379A8u], sizeof(before_fade[3]));
+                    for (int i = 0; i < 5; i++) {
+                        memcpy(&before_ptrs[i], &g_ram[k_menu_ptr_phys_trace[i]], sizeof(before_ptrs[i]));
+                    }
+                    call_by_address(cpu, target);
+                    memcpy(&after_menu_vis, &g_ram[0x973ECu], sizeof(after_menu_vis));
+                    memcpy(&after_fade[0], &g_ram[0x13799Cu], sizeof(after_fade[0]));
+                    memcpy(&after_fade[1], &g_ram[0x1379A0u], sizeof(after_fade[1]));
+                    memcpy(&after_fade[2], &g_ram[0x1379A4u], sizeof(after_fade[2]));
+                    memcpy(&after_fade[3], &g_ram[0x1379A8u], sizeof(after_fade[3]));
+                    for (int i = 0; i < 5; i++) {
+                        memcpy(&after_ptrs[i], &g_ram[k_menu_ptr_phys_trace[i]], sizeof(after_ptrs[i]));
+                    }
+                    if (before_menu_vis != after_menu_vis ||
+                        memcmp(before_fade, after_fade, sizeof(before_fade)) != 0 ||
+                        memcmp(before_ptrs, after_ptrs, sizeof(before_ptrs)) != 0) {
+                        printf("[UG-COMPILED-MEM] f%u pc=0x%08X -> 0x%08X menuvis=0x%08X->0x%08X"
+                               " fade=%08X/%08X/%08X/%08X->%08X/%08X/%08X/%08X"
+                               " ptrs=%08X,%08X,%08X,%08X,%08X->%08X,%08X,%08X,%08X,%08X\n",
+                               g_ps1_frame, pc, target,
+                               before_menu_vis, after_menu_vis,
+                               before_fade[0], before_fade[1], before_fade[2], before_fade[3],
+                               after_fade[0], after_fade[1], after_fade[2], after_fade[3],
+                               before_ptrs[0], before_ptrs[1], before_ptrs[2], before_ptrs[3], before_ptrs[4],
+                               after_ptrs[0], after_ptrs[1], after_ptrs[2], after_ptrs[3], after_ptrs[4]);
+                        fflush(stdout);
+                    }
+                } else {
+                    call_by_address(cpu, target);
+                }
                 if (pc >= 0x80108450u && pc <= 0x80109300u) {
                     static uint32_t s_ovl_calls = 0;
                     if (++s_ovl_calls <= 200u) {
@@ -3479,6 +7814,14 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                                g_ps1_frame, s_interp_dra, pc, target, cpu->a0, cpu->ra);
                         fflush(stdout);
                     }
+                    if (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u &&
+                        (target == 0x80106670u || target == 0x800ECE58u ||
+                         target == 0x800EBBACu || target == 0x800EDEDCu)) {
+                        static uint32_t s_late_dra_jals = 0;
+                        printf("[LATE-DRA-JAL] f%u #%u from=0x%08X target=0x%08X start=0x%08X a0=0x%08X ra=0x%08X\n",
+                               g_ps1_frame, ++s_late_dra_jals, pc, target, start_pc, cpu->a0, cpu->ra);
+                        fflush(stdout);
+                    }
                     /* Trace overlay calls that go to overlay space (0x80180000+) */
                     if (target >= 0x80180000u && g_ps1_frame >= 66u) {
                         static uint32_t s_ovl_jal = 0;
@@ -3490,7 +7833,7 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                     }
                 }
                 /* Trace JAL calls from UpdateGame (0x800E7AEC) during gs=8 */
-                if (start_pc == 0x800E7AECu) {
+                if (start_pc == 0x800E7AECu && g_ps1_frame <= 840u) {
                     uint32_t gs_jal = 0;
                     memcpy(&gs_jal, &g_ram[0x3C734], 4);
                     static uint32_t s_ug_jal = 0;
@@ -3514,23 +7857,437 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
                  * Functions with start_pc intercepts MUST use recursive dispatch
                  * so the start_pc checks at the top of mips_interpret fire.
                  * All other functions use the iterative call stack. */
+                if ((target == 0x800E9880u || target == 0x800EA5E4u || target == 0x80106A28u) &&
+                    psx_override_dispatch(cpu, target)) {
+                    pc = ret_pc;
+                    continue;
+                }
+                if (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u &&
+                    (target == 0x800ECE58u || target == 0x800EBBACu || target == 0x800EDEDCu)) {
+                    uint32_t ot_before[4] = {0};
+                    uint32_t ot_after[4] = {0};
+                    memcpy(&ot_before[0], &g_ram[0x3CB0Cu], sizeof(uint32_t));
+                    memcpy(&ot_before[1], &g_ram[0x3CB68u], sizeof(uint32_t));
+                    memcpy(&ot_before[2], &g_ram[0x3CF7Cu], sizeof(uint32_t));
+                    memcpy(&ot_before[3], &g_ram[0x54770u], sizeof(uint32_t));
+                    call_by_address(cpu, target);
+                    memcpy(&ot_after[0], &g_ram[0x3CB0Cu], sizeof(uint32_t));
+                    memcpy(&ot_after[1], &g_ram[0x3CB68u], sizeof(uint32_t));
+                    memcpy(&ot_after[2], &g_ram[0x3CF7Cu], sizeof(uint32_t));
+                    memcpy(&ot_after[3], &g_ram[0x54770u], sizeof(uint32_t));
+                    printf("[LATE-OT-DELTA] f%u from=0x%08X target=0x%08X ot=%08X/%08X/%08X/%08X->%08X/%08X/%08X/%08X v0=0x%08X\n",
+                           g_ps1_frame, pc, target,
+                           ot_before[0], ot_before[1], ot_before[2], ot_before[3],
+                           ot_after[0], ot_after[1], ot_after[2], ot_after[3], cpu->v0);
+                    fflush(stdout);
+                    pc += 8;
+                    continue;
+                }
                 int needs_start_pc_intercept =
                     target == 0x800E2F34u ||  /* DebugUpdate: force v0=1 */
+                    target == 0x800E385Cu ||  /* Main loop post-UpdateCd trace */
+                    target == 0x800EB314u ||  /* LoadPendingGfx trace */
                     target == 0x800E7AECu ||  /* UpdateGame: overlay loading */
+                    target == 0x80108448u ||  /* UpdateCd: defer async loads */
                     target == 0x800E7458u ||  /* gs=8 handler: trace entry/exit */
+                    target == 0x801B97BCu ||  /* SEL StreamNext */
+                    target == 0x801B994Cu ||  /* SEL wait-for-frame */
+                    target == 0x801B9C80u ||  /* SEL logo/title stream driver */
+                    target == 0x801B410Cu ||  /* SEL HandleTitleScreen: inspect pad/C9A4 before/after */
+                    target == 0x801B4048u ||  /* SEL OVL_EXPORT(Init): boot logo init path */
                     target == 0x801073C0u ||  /* CD sector loader */
-                    target == 0x801073E8u;    /* CD status check */
+                    target == 0x801073E8u ||  /* CD status check */
+                    target == 0x801AE394u ||  /* Room viewport gate (Y) */
+                    target == 0x801AE4ACu ||  /* Room viewport gate (X) */
+                    target == 0x801AEB2Cu ||  /* Room entity init candidate (ovl 0x0D) */
+                    target == 0x801BDAF0u ||  /* Room entity init candidate (ovl 3) */
+                    target == 0x801AE2D0u ||  /* Room slot producer: dump post-call slot state */
+                    target == 0x801AD16Cu ||  /* Room activation helper */
+                    target == 0x801AD6E8u ||  /* Room activation helper */
+                    target == 0x801AD9CCu ||  /* Room activation helper */
+                    target == 0x801AEDCCu ||  /* Room activation helper */
+                    target == 0x801ADC2Cu ||  /* Room activation helper */
+                    target == 0x801AEEC0u ||  /* Room activation helper */
+                    target == 0x801AECA4u ||  /* Room draw: allow post-draw C780 probe */
+                    (target == 0x800160E4u && pc == 0x800FDEF0u); /* CheckAndDoLevelUp rand */
                 /* Trace overlay function calls (0x80180000+) from any context */
                 if (target >= 0x80180000u && target <= 0x801FFFFFu) {
                     static uint32_t s_ovl_nc = 0;
-                    if (++s_ovl_nc <= 50u || (s_ovl_nc % 500u) == 0u) {
+                    if (g_ps1_frame >= 66u &&
+                        (target == 0x801AE394u || target == 0x801AE4ACu || target == 0x801AEB2Cu || target == 0x801BDAF0u || target == 0x801AE2D0u ||
+                         target == 0x801AD16Cu || target == 0x801AD6E8u || target == 0x801AD9CCu ||
+                         target == 0x801AEDCCu || target == 0x801ADC2Cu || target == 0x801AEEC0u)) {
+                        static uint32_t s_room_gate_calls = 0;
+                        uint32_t a0_w0 = 0;
+                        uint32_t a0_w1 = 0;
+                        uint16_t a0_w2 = 0;
+                        uint8_t* a0_ptr = addr_ptr(cpu->a0);
+                        if (a0_ptr && target != 0x801AE2D0u) {
+                            memcpy(&a0_w0, a0_ptr, 4);
+                            memcpy(&a0_w1, a0_ptr + 4, 4);
+                            memcpy(&a0_w2, a0_ptr + 8, 2);
+                        }
+                        if (++s_room_gate_calls <= 120u) {
+                            printf("[ROOM-GATE] f%u #%u pc=0x%08X -> 0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X data=%08X %08X %04X ra=0x%08X entry=0x%08X\n",
+                                   g_ps1_frame, s_room_gate_calls, pc, target, cpu->a0,
+                                   cpu->a1, cpu->a2, cpu->a3,
+                                   a0_w0, a0_w1, a0_w2, cpu->ra, start_pc);
+                            fflush(stdout);
+                        }
+                    }
+                    if (g_ps1_frame == 66u && pc == 0x801AE838u && target == 0x801AE394u) {
+                        static uint32_t s_room_helper66 = 0;
+                        if (++s_room_helper66 <= 40u) {
+                            uint32_t room_base = 0;
+                            uint32_t room_cur = 0;
+                            uint32_t room_1694 = 0;
+                            uint32_t a0_w0 = 0;
+                            uint32_t a0_w1 = 0;
+                            uint16_t a0_w2 = 0;
+                            memcpy(&room_base, &g_ram[0x1C1688], 4);
+                            memcpy(&room_cur, &g_ram[0x1C168C], 4);
+                            memcpy(&room_1694, &g_ram[0x1C1694], 4);
+                            uint8_t* a0_ptr = addr_ptr(cpu->a0);
+                            if (a0_ptr) {
+                                memcpy(&a0_w0, a0_ptr, 4);
+                                memcpy(&a0_w1, a0_ptr + 4, 4);
+                                memcpy(&a0_w2, a0_ptr + 8, 2);
+                            }
+                            printf("[ROOM-HELPER66] #%u a0=0x%08X data=%08X %08X %04X base=0x%08X cur=0x%08X 1694=0x%08X ra=0x%08X\n",
+                                   s_room_helper66, cpu->a0, a0_w0, a0_w1, a0_w2,
+                                   room_base, room_cur, room_1694, cpu->ra);
+                            fflush(stdout);
+                        }
+                    }
+                    if ((start_pc == 0x801AEED8u && g_ps1_frame >= 49u && g_ps1_frame <= 55u) ||
+                        ++s_ovl_nc <= 50u || (s_ovl_nc % 500u) == 0u) {
                         printf("[OVL-CALL] f%u #%u from=0x%08X → 0x%08X a0=0x%08X ra=0x%08X entry=0x%08X\n",
                                g_ps1_frame, s_ovl_nc, pc, target, cpu->a0, cpu->ra, start_pc);
                         fflush(stdout);
                     }
                 }
                 if (needs_start_pc_intercept) {
+                    int run_post_room_c780 = 0;
+                    uint32_t post_room_c780 = 0;
+                    uint32_t ae2d0_slot = 0;
+                    uint32_t ae2d0_src = 0;
+                    uint32_t ae2d0_pre0 = 0;
+                    uint32_t ae2d0_pre1 = 0;
+                    uint32_t ae2d0_pre2 = 0;
+                    uint32_t ae2d0_pre3 = 0;
+                    uint16_t ae2d0_src_flags = 0;
+                    if (target == 0x801AECA4u && start_pc == 0x800E7458u) {
+                        memcpy(&post_room_c780, &g_ram[0x3C780], 4);
+                        run_post_room_c780 = (post_room_c780 == 0x801ACB14u);
+                    }
+                    uint32_t sel_title_pre_c9a4 = 0;
+                    uint16_t sel_title_pre_p = 0;
+                    uint16_t sel_title_pre_t = 0;
+                    int trace_sel_title = 0;
+                    if (target == 0x801B410Cu) {
+                        memcpy(&sel_title_pre_c9a4, &g_ram[0x3C9A4], 4);
+                        memcpy(&sel_title_pre_p, &g_ram[0x97490], 2);
+                        memcpy(&sel_title_pre_t, &g_ram[0x97494], 2);
+                        trace_sel_title = (g_ps1_frame <= 80u);
+                        if (trace_sel_title) {
+                            static uint32_t s_sel_title_enter = 0;
+                            if (++s_sel_title_enter <= 120u) {
+                                printf("[SEL-TITLE-ENTER] f%u #%u C9A4=%u PAD0_P=0x%04X PAD0_T=0x%04X a0=0x%08X ra=0x%08X\n",
+                                       g_ps1_frame, s_sel_title_enter, sel_title_pre_c9a4,
+                                       sel_title_pre_p, sel_title_pre_t, cpu->a0, cpu->ra);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                    if (target == 0x801AE2D0u) {
+                        ae2d0_slot = cpu->a0;
+                        ae2d0_src = cpu->a1;
+                        uint8_t* slot_ptr = addr_ptr(ae2d0_slot);
+                        uint8_t* src_ptr = addr_ptr(ae2d0_src);
+                        if (slot_ptr) {
+                            memcpy(&ae2d0_pre0, slot_ptr + 0, 4);
+                            memcpy(&ae2d0_pre1, slot_ptr + 4, 4);
+                            memcpy(&ae2d0_pre2, slot_ptr + 8, 4);
+                            memcpy(&ae2d0_pre3, slot_ptr + 12, 4);
+                        }
+                        if (src_ptr) {
+                            memcpy(&ae2d0_src_flags, src_ptr + 4, 2);
+                        }
+                    }
+                    if (target == 0x801AECA4u) {
+                        static uint32_t s_room_draw_rescues = 0;
+                        static uint32_t s_room_ovl_tail_restores = 0;
+                        static uint32_t s_room_watch_last_frame = UINT32_MAX;
+                        uint32_t room_ptr = 0;
+                        uint32_t room_cur = 0;
+                        uint32_t room_1690 = 0;
+                        if (!g_room_ovl_tail_restored && g_room_ovl_tail_size != 0u) {
+                            memcpy(&g_ram[g_room_ovl_tail_phys],
+                                   g_room_ovl_tail_backup,
+                                   g_room_ovl_tail_size);
+                            g_room_ovl_tail_restored = 1;
+                            if (++s_room_ovl_tail_restores <= 8u) {
+                                printf("[ROOM-OVL-RESTORE] f%u #%u restored 0x%X bytes at 0x%08X before room draw\n",
+                                       g_ps1_frame, s_room_ovl_tail_restores,
+                                       g_room_ovl_tail_size,
+                                       0x80000000u | g_room_ovl_tail_phys);
+                                fflush(stdout);
+                            }
+                        }
+                        if (g_room_watch_count != 0u &&
+                            g_ps1_frame >= 110u && g_ps1_frame <= 140u &&
+                            s_room_watch_last_frame != g_ps1_frame) {
+                            s_room_watch_last_frame = g_ps1_frame;
+                            for (uint32_t wi = 0; wi < g_room_watch_count; wi++) {
+                                uint8_t* slot_ptr = addr_ptr(g_room_watch_slots[wi]);
+                                if (slot_ptr) {
+                                    uint32_t pfn = 0;
+                                    uint32_t flags = 0;
+                                    uint32_t prim = 0;
+                                    uint16_t id = 0;
+                                    uint16_t step = 0;
+                                    uint16_t z = 0;
+                                    uint8_t draw = 0;
+                                    memcpy(&id, slot_ptr + 0x26, 2);
+                                    memcpy(&pfn, slot_ptr + 0x28, 4);
+                                    memcpy(&step, slot_ptr + 0x2C, 2);
+                                    memcpy(&z, slot_ptr + 0x24, 2);
+                                    memcpy(&flags, slot_ptr + 0x34, 4);
+                                    memcpy(&prim, slot_ptr + 0x64, 4);
+                                    draw = slot_ptr[0x19];
+                                    printf("[ROOM-SLOT-WATCH] f%u slot=0x%08X id=%u step=%u draw=0x%02X z=%u flags=0x%08X prim=%d pfn=0x%08X\n",
+                                           g_ps1_frame, g_room_watch_slots[wi], id, step,
+                                           draw, z, flags, (int32_t)prim, pfn);
+                                }
+                            }
+                            fflush(stdout);
+                        }
+                        memcpy(&room_ptr, &g_ram[0x1C1688], 4);
+                        memcpy(&room_cur, &g_ram[0x1C168C], 4);
+                        memcpy(&room_1690, &g_ram[0x1C1690], 4);
+                        if (room_ptr == 0u ||
+                            room_cur == 0u ||
+                            room_ptr < 0x80182000u || room_ptr > 0x80183000u ||
+                            room_cur < 0x80182000u || room_cur > 0x80183000u) {
+                            uint32_t rescue_ptr = 0x80182458u;
+                            uint32_t rescue_cur = 0x80182E46u;
+                            room_1690 &= ~0xFFu;
+                            memcpy(&g_ram[0x1C1688], &rescue_ptr, 4);
+                            memcpy(&g_ram[0x1C168C], &rescue_cur, 4);
+                            memcpy(&g_ram[0x1C1690], &room_1690, 4);
+                            memset(&g_ram[0x97428], 0, 0x20);
+                            if (++s_room_draw_rescues <= 40u) {
+                                printf("[ROOM-DRAW-RESCUE] f%u #%u old_ptr=0x%08X old_cur=0x%08X -> ptr=0x%08X cur=0x%08X 1690=0x%08X entry=0x%08X\n",
+                                       g_ps1_frame, s_room_draw_rescues, room_ptr, room_cur,
+                                       rescue_ptr, rescue_cur, room_1690, start_pc);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                    if (target == 0x801B410Cu &&
+                        s_cd_title_restore_pending &&
+                        s_cd_title_restore_addr + s_cd_title_restore_size <= sizeof(g_ram)) {
+                        memcpy(&g_ram[s_cd_title_restore_addr],
+                               s_cd_title_ram_preserve,
+                               s_cd_title_restore_size);
+                        s_cd_title_restore_pending = 0;
+                        printf("[CD-TITLE-RAM-RESTORE] restored 0x%X bytes at RAM 0x%08X before title handler\n",
+                               s_cd_title_restore_size, s_cd_title_restore_addr + 0x80000000u);
+                        fflush(stdout);
+                    }
+                    if ((target == 0x801AE394u || target == 0x801AE4ACu) && g_ps1_frame >= 66u) {
+                        static uint32_t s_room_scroll_nudges = 0;
+                        uint8_t* rec_ptr = addr_ptr(cpu->a0);
+                        if (rec_ptr) {
+                            int16_t rec_coord = 0;
+                            int16_t old_scroll = 0;
+                            uint16_t rec_flags = 0;
+                            uint16_t rec_kind = 0;
+                            uint32_t scroll_off = (target == 0x801AE4ACu) ? 0x7308Eu : 0x73092u;
+                            uint32_t coord_off = (target == 0x801AE4ACu) ? 0u : 2u;
+                            memcpy(&rec_coord, rec_ptr + coord_off, 2);
+                            memcpy(&rec_flags, rec_ptr + 4, 2);
+                            rec_kind = rec_flags & 0xE000u;
+                            if (rec_kind == 0xA000u || rec_kind == 0u) {
+                                memcpy(&old_scroll, &g_ram[scroll_off], 2);
+                                if (old_scroll != rec_coord) {
+                                    memcpy(&g_ram[scroll_off], &rec_coord, 2);
+                                    if (++s_room_scroll_nudges <= 80u) {
+                                        printf("[ROOM-SCROLL-NUDGE] f%u #%u target=0x%08X a0=0x%08X flags=0x%04X coord=%d old=%d\n",
+                                               g_ps1_frame, s_room_scroll_nudges, target, cpu->a0,
+                                               rec_flags, rec_coord, old_scroll);
+                                        fflush(stdout);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if ((target == 0x801AEB2Cu || target == 0x801BDAF0u) && g_ps1_frame >= 40u) {
+                        static uint32_t s_room_init_logs = 0;
+                        if (++s_room_init_logs <= 40u) {
+                            int16_t scroll_x = 0;
+                            int16_t scroll_y = 0;
+                            uint32_t room_ptr = 0;
+                            uint32_t room_cur = 0;
+                            memcpy(&scroll_x, &g_ram[0x7308E], 2);
+                            memcpy(&scroll_y, &g_ram[0x73092], 2);
+                            memcpy(&room_ptr, &g_ram[0x1C1688], 4);
+                            memcpy(&room_cur, &g_ram[0x1C168C], 4);
+                            printf("[ROOM-INIT-CALL] f%u #%u target=0x%08X objLayoutId=%u a1=0x%08X scroll=(%d,%d) ptr=0x%08X cur=0x%08X ra=0x%08X\n",
+                                   g_ps1_frame, s_room_init_logs, target, cpu->a0, cpu->a1,
+                                   scroll_x, scroll_y, room_ptr, room_cur, cpu->ra);
+                            fflush(stdout);
+                        }
+                    }
+                    if (target == 0x800160E4u && pc == 0x800FDEF0u) {
+                        static uint32_t s_levelup_rand_logs = 0;
+                        static uint32_t s_levelup_exp_clamps = 0;
+                        uint32_t status_level = 0;
+                        uint32_t status_exp = 0;
+                        uint32_t demo_mode = 0;
+                        memcpy(&status_level, &g_ram[0x97BE8], 4);
+                        memcpy(&status_exp, &g_ram[0x97BEC], 4);
+                        memcpy(&demo_mode, &g_ram[0x97914], 4);
+                        if (++s_levelup_rand_logs <= 40u) {
+                            printf("[LEVELUP-RAND] f%u #%u level=%u exp=%u demo=%u pc=0x%08X ra=0x%08X\n",
+                                   g_ps1_frame, s_levelup_rand_logs,
+                                   status_level, status_exp, demo_mode, pc, cpu->ra);
+                            fflush(stdout);
+                        }
+                        if (status_exp > 20000u) {
+                            uint32_t zero = 0;
+                            memcpy(&g_ram[0x97BEC], &zero, 4);
+                            if (++s_levelup_exp_clamps <= 20u) {
+                                printf("[LEVELUP-CLAMP] f%u #%u exp %u -> 0 at level=%u demo=%u\n",
+                                       g_ps1_frame, s_levelup_exp_clamps,
+                                       status_exp, status_level, demo_mode);
+                                fflush(stdout);
+                            }
+                        }
+                    }
                     mips_interpret(cpu, target);
+                    if (target == 0x801B410Cu && trace_sel_title) {
+                        static uint32_t s_sel_title_exit = 0;
+                        uint32_t sel_title_post_c9a4 = 0;
+                        uint16_t sel_title_post_p = 0;
+                        uint16_t sel_title_post_t = 0;
+                        memcpy(&sel_title_post_c9a4, &g_ram[0x3C9A4], 4);
+                        memcpy(&sel_title_post_p, &g_ram[0x97490], 2);
+                        memcpy(&sel_title_post_t, &g_ram[0x97494], 2);
+                        if (++s_sel_title_exit <= 120u) {
+                            printf("[SEL-TITLE-EXIT] f%u #%u C9A4=%u PAD0_P=0x%04X PAD0_T=0x%04X v0=0x%08X ra=0x%08X\n",
+                                   g_ps1_frame, s_sel_title_exit, sel_title_post_c9a4,
+                                   sel_title_post_p, sel_title_post_t, cpu->v0, cpu->ra);
+                            fflush(stdout);
+                        }
+                    }
+                    if (target == 0x801AECA4u) {
+                        static uint32_t s_room_draw_exit_logs = 0;
+                        uint32_t room_ptr = 0;
+                        uint32_t room_cur = 0;
+                        uint32_t room_1690 = 0;
+                        uint32_t room_1694 = 0;
+                        int16_t scroll_x = 0;
+                        int16_t scroll_y = 0;
+                        memcpy(&room_ptr, &g_ram[0x1C1688], 4);
+                        memcpy(&room_cur, &g_ram[0x1C168C], 4);
+                        memcpy(&room_1690, &g_ram[0x1C1690], 4);
+                        memcpy(&room_1694, &g_ram[0x1C1694], 4);
+                        memcpy(&scroll_x, &g_ram[0x7308E], 2);
+                        memcpy(&scroll_y, &g_ram[0x73092], 2);
+                        if (++s_room_draw_exit_logs <= 120u ||
+                            (cpu->v0 == 0u && s_room_draw_exit_logs <= 240u)) {
+                            printf("[ROOM-DRAW-EXIT] f%u #%u v0=0x%08X ptr=0x%08X cur=0x%08X 1690=0x%08X 1694=0x%08X scroll=(%d,%d) ra=0x%08X\n",
+                                   g_ps1_frame, s_room_draw_exit_logs, cpu->v0,
+                                   room_ptr, room_cur, room_1690, room_1694,
+                                   scroll_x, scroll_y, cpu->ra);
+                            fflush(stdout);
+                        }
+                    }
+                    if (target == 0x801AE2D0u && g_ps1_frame >= 66u) {
+                        static uint32_t s_ae2d0_slot_logs = 0;
+                        uint32_t ae2d0_post0 = 0;
+                        uint32_t ae2d0_post1 = 0;
+                        uint32_t ae2d0_post2 = 0;
+                        uint32_t ae2d0_post3 = 0;
+                        uint32_t ae2d0_pfn = 0;
+                        uint32_t ae2d0_flags = 0;
+                        uint32_t ae2d0_prim = 0;
+                        uint16_t ae2d0_z = 0;
+                        uint16_t ae2d0_id = 0;
+                        uint16_t ae2d0_params = 0;
+                        uint8_t ae2d0_flag3c = 0;
+                        uint8_t ae2d0_draw = 0;
+                        uint8_t ae2d0_flag46 = 0;
+                        uint8_t ae2d0_flag47 = 0;
+                        uint8_t* slot_ptr = addr_ptr(ae2d0_slot);
+                        if (slot_ptr) {
+                            if (slot_ptr[0x3C] == 0) slot_ptr[0x3C] = 1;
+                            if (slot_ptr[0x46] == 0) slot_ptr[0x46] = 1;
+                            if (slot_ptr[0x47] == 0) slot_ptr[0x47] = 1;
+                            memcpy(&ae2d0_post0, slot_ptr + 0, 4);
+                            memcpy(&ae2d0_post1, slot_ptr + 4, 4);
+                            memcpy(&ae2d0_post2, slot_ptr + 8, 4);
+                            memcpy(&ae2d0_post3, slot_ptr + 12, 4);
+                            memcpy(&ae2d0_z, slot_ptr + 0x24, 2);
+                            memcpy(&ae2d0_id, slot_ptr + 0x26, 2);
+                            memcpy(&ae2d0_pfn, slot_ptr + 0x28, 4);
+                            memcpy(&ae2d0_params, slot_ptr + 0x30, 2);
+                            memcpy(&ae2d0_flags, slot_ptr + 0x34, 4);
+                            ae2d0_flag3c = slot_ptr[0x3C];
+                            ae2d0_draw = slot_ptr[0x19];
+                            ae2d0_flag46 = slot_ptr[0x46];
+                            ae2d0_flag47 = slot_ptr[0x47];
+                            memcpy(&ae2d0_prim, slot_ptr + 0x64, 4);
+                        }
+                        if (++s_ae2d0_slot_logs <= 60u) {
+                            printf("[AE2D0-SLOT] f%u #%u slot=0x%08X src=0x%08X srcFlags=0x%04X pre=%08X %08X %08X %08X post=%08X %08X %08X %08X id=%u z=%u draw=0x%02X pfn=0x%08X params=0x%04X flags=0x%08X prim=%d act=%02X/%02X/%02X v0=0x%08X ra=0x%08X\n",
+                                   g_ps1_frame, s_ae2d0_slot_logs, ae2d0_slot,
+                                   ae2d0_src, ae2d0_src_flags,
+                                   ae2d0_pre0, ae2d0_pre1, ae2d0_pre2, ae2d0_pre3,
+                                   ae2d0_post0, ae2d0_post1, ae2d0_post2, ae2d0_post3,
+                                   ae2d0_id, ae2d0_z, ae2d0_draw, ae2d0_pfn,
+                                   ae2d0_params, ae2d0_flags, (int32_t)ae2d0_prim,
+                                   ae2d0_flag3c, ae2d0_flag46, ae2d0_flag47,
+                                   cpu->v0, cpu->ra);
+                            fflush(stdout);
+                        }
+                        if (ae2d0_slot != 0u && g_room_watch_count < 4u) {
+                            int seen = 0;
+                            for (uint32_t wi = 0; wi < g_room_watch_count; wi++) {
+                                if (g_room_watch_slots[wi] == ae2d0_slot) {
+                                    seen = 1;
+                                    break;
+                                }
+                            }
+                            if (!seen) {
+                                g_room_watch_slots[g_room_watch_count++] = ae2d0_slot;
+                            }
+                        }
+                    }
+                    if (run_post_room_c780) {
+                        static uint32_t s_post_room_c780_calls = 0;
+                        static int s_in_post_room_c780 = 0;
+                        if (!s_in_post_room_c780) {
+                            uint32_t save_ra = cpu->ra;
+                            uint32_t save_a0 = cpu->a0;
+                            uint32_t slot0 = 0;
+                            uint32_t slot1 = 0;
+                            memcpy(&slot0, &g_ram[0x76AEC], 4);
+                            memcpy(&slot1, &g_ram[0x76AF0], 4);
+                            if (++s_post_room_c780_calls <= 20u) {
+                                printf("[GS8-POSTC780] f%u #%u slot76AEC=%08X %08X c780=0x%08X\n",
+                                       g_ps1_frame, s_post_room_c780_calls, slot0, slot1, post_room_c780);
+                                fflush(stdout);
+                            }
+                            s_in_post_room_c780 = 1;
+                            mips_interpret(cpu, post_room_c780);
+                            s_in_post_room_c780 = 0;
+                            cpu->ra = save_ra;
+                            cpu->a0 = save_a0;
+                            cv_try_manual_room_layer_init("post-room-c780");
+                        }
+                    }
                 } else if (interp_call_top < INTERP_CALL_STACK_MAX) {
                     interp_call_stack[interp_call_top++] = ret_pc;
                     pc = target;
@@ -3672,6 +8429,108 @@ void mips_interpret(CPUState* cpu, uint32_t start_pc) {
             printf("[OVL-GUARD-HIT] #%u entry=0x%08X stuck_pc=0x%08X f%u guard=%u ra=0x%08X v0=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X\n",
                    s_ovl_guard_hit, start_pc, pc, g_ps1_frame, guard_limit, cpu->ra, cpu->v0,
                    cpu->a0, cpu->a1, cpu->a2, cpu->a3);
+            if (pc >= 0x800F5904u && pc < 0x800F68F0u) {
+                uint8_t bytes[16] = {0};
+                uint8_t* p = addr_ptr(cpu->s0);
+                if (p) {
+                    memcpy(bytes, p, sizeof(bytes));
+                }
+                printf("[MENU-GUARD] f%u pc=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X s3=0x%08X s4=0x%08X bytes=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                       g_ps1_frame, pc, cpu->s0, cpu->s1, cpu->s2, cpu->s3, cpu->s4,
+                       bytes[0], bytes[1], bytes[2], bytes[3],
+                       bytes[4], bytes[5], bytes[6], bytes[7],
+                       bytes[8], bytes[9], bytes[10], bytes[11],
+                       bytes[12], bytes[13], bytes[14], bytes[15]);
+            }
+            if (pc >= 0x801B2118u && pc < 0x801B23D8u) {
+                const struct {
+                    const char* name;
+                    uint32_t* value;
+                } watched_regs[] = {
+                    { "s0", &cpu->s0 }, { "s1", &cpu->s1 }, { "s2", &cpu->s2 }, { "s3", &cpu->s3 },
+                    { "s4", &cpu->s4 }, { "s5", &cpu->s5 }, { "s6", &cpu->s6 }, { "s7", &cpu->s7 },
+                    { "fp", &cpu->fp }, { "a0", &cpu->a0 }, { "a1", &cpu->a1 }, { "a2", &cpu->a2 },
+                    { "a3", &cpu->a3 }
+                };
+                const uint32_t entity_base = 0x800733D8u;
+                const uint32_t entity_stride = 0xBCu;
+                const uint32_t entity_count = 0x100u;
+                const uint32_t entity_end = entity_base + entity_stride * entity_count;
+                const uint32_t prim_base = 0x80086FECu;
+                const uint32_t prim_stride = 0x34u;
+                const uint32_t prim_count = 0x500u;
+                const uint32_t prim_end = prim_base + prim_stride * prim_count;
+                printf("[OVL-GUARD-REGS] pc=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X s3=0x%08X s4=0x%08X s5=0x%08X s6=0x%08X s7=0x%08X fp=0x%08X sp=0x%08X\n",
+                       pc, cpu->s0, cpu->s1, cpu->s2, cpu->s3, cpu->s4, cpu->s5, cpu->s6, cpu->s7, cpu->fp, cpu->sp);
+                for (size_t ri = 0; ri < sizeof(watched_regs) / sizeof(watched_regs[0]); ri++) {
+                    uint32_t reg = *watched_regs[ri].value;
+                    if (reg >= entity_base && reg < entity_end &&
+                        ((reg - entity_base) % entity_stride) == 0u) {
+                        uint32_t ent_phys = reg & 0x1FFFFFFFu;
+                        uint16_t step = 0;
+                        uint16_t params = 0;
+                        uint16_t entity_id = 0;
+                        int32_t prim_index = -1;
+                        uint32_t flags = 0;
+                        memcpy(&entity_id, &g_ram[ent_phys + 0x26], sizeof(entity_id));
+                        memcpy(&step, &g_ram[ent_phys + 0x2C], sizeof(step));
+                        memcpy(&params, &g_ram[ent_phys + 0x30], sizeof(params));
+                        memcpy(&flags, &g_ram[ent_phys + 0x34], sizeof(flags));
+                        memcpy(&prim_index, &g_ram[ent_phys + 0x64], sizeof(prim_index));
+                        printf("[OVL-GUARD-ENT] reg=%s ent=%u ptr=0x%08X entityId=0x%04X step=%u params=0x%04X flags=0x%08X primIndex=%d\n",
+                               watched_regs[ri].name, (unsigned)((reg - entity_base) / entity_stride),
+                               reg, entity_id, step, params, flags, prim_index);
+                        if (prim_index >= 0 && (uint32_t)prim_index < prim_count) {
+                            uint32_t prim_ptr = prim_base + (uint32_t)prim_index * prim_stride;
+                            uint32_t seen[16] = {0};
+                            size_t seen_count = 0;
+                            for (int pi = 0; pi < 12; pi++) {
+                                uint32_t prim_phys = prim_ptr & 0x1FFFFFFFu;
+                                uint32_t next = 0;
+                                uint16_t priority = 0;
+                                uint16_t draw_mode = 0;
+                                int16_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+                                uint8_t type = 0;
+                                if (prim_ptr < prim_base || prim_ptr >= prim_end || prim_phys + prim_stride > 0x200000u) {
+                                    printf("[OVL-GUARD-PRIM] reg=%s chain[%d] ptr=0x%08X out-of-range\n",
+                                           watched_regs[ri].name, pi, prim_ptr);
+                                    break;
+                                }
+                                memcpy(&next, &g_ram[prim_phys + 0x00], sizeof(next));
+                                type = g_ram[prim_phys + 0x07];
+                                memcpy(&x0, &g_ram[prim_phys + 0x08], sizeof(x0));
+                                memcpy(&y0, &g_ram[prim_phys + 0x0A], sizeof(y0));
+                                memcpy(&x1, &g_ram[prim_phys + 0x14], sizeof(x1));
+                                memcpy(&y1, &g_ram[prim_phys + 0x16], sizeof(y1));
+                                memcpy(&priority, &g_ram[prim_phys + 0x26], sizeof(priority));
+                                memcpy(&draw_mode, &g_ram[prim_phys + 0x32], sizeof(draw_mode));
+                                printf("[OVL-GUARD-PRIM] reg=%s chain[%d] ptr=0x%08X type=%u next=0x%08X priority=0x%04X drawMode=0x%04X x0=%d y0=%d x1=%d y1=%d\n",
+                                       watched_regs[ri].name, pi, prim_ptr, type, next, priority, draw_mode,
+                                       (int)x0, (int)y0, (int)x1, (int)y1);
+                                if (next == 0u) {
+                                    break;
+                                }
+                                int seen_cycle = 0;
+                                for (size_t si = 0; si < seen_count; si++) {
+                                    if (seen[si] == next) {
+                                        seen_cycle = 1;
+                                        break;
+                                    }
+                                }
+                                if (seen_cycle) {
+                                    printf("[OVL-GUARD-PRIM] reg=%s cycle-detected next=0x%08X\n",
+                                           watched_regs[ri].name, next);
+                                    break;
+                                }
+                                if (seen_count < sizeof(seen) / sizeof(seen[0])) {
+                                    seen[seen_count++] = prim_ptr;
+                                }
+                                prim_ptr = next;
+                            }
+                        }
+                    }
+                }
+            }
             /* Dump 64 instructions around stuck PC */
             if (s_ovl_guard_hit <= 3u) {
                 printf("[LOOP-DUMP] 64 instrs starting at 0x%08X:\n", pc - 16);
@@ -3727,6 +8586,20 @@ static void fire_interrupt_chain(CPUState *cpu, uint32_t priority) {
 }
 
 void call_by_address(CPUState* cpu, uint32_t addr) {
+    uint32_t late_ot_before[4] = {0};
+    int trace_late_render_callee =
+        (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u) &&
+        (addr == 0x800ECE58u || addr == 0x800EBBACu || addr == 0x800EDEDCu);
+    if (trace_late_render_callee) {
+        memcpy(&late_ot_before[0], &g_ram[0x3CB0Cu], sizeof(uint32_t));
+        memcpy(&late_ot_before[1], &g_ram[0x3CB68u], sizeof(uint32_t));
+        memcpy(&late_ot_before[2], &g_ram[0x3CF7Cu], sizeof(uint32_t));
+        memcpy(&late_ot_before[3], &g_ram[0x54770u], sizeof(uint32_t));
+        printf("[LATE-CALLEE-IN] f%u addr=0x%08X a0=0x%08X a1=0x%08X ra=0x%08X v0=0x%08X ot=%08X/%08X/%08X/%08X\n",
+               g_ps1_frame, addr, cpu->a0, cpu->a1, cpu->ra, cpu->v0,
+               late_ot_before[0], late_ot_before[1], late_ot_before[2], late_ot_before[3]);
+        fflush(stdout);
+    }
     /* ---- CD library call trace ---- */
     if (addr >= 0x80064000u && addr < 0x80070000u) {
         static uint32_t s_cd_cba = 0;
@@ -3857,6 +8730,35 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             fflush(stdout);
         }
     }
+    if (addr == 0x800264A0u) {
+        static uint32_t s_ssut_keyonv = 0;
+        if (++s_ssut_keyonv <= 60u) {
+            printf("[LIBSND-KEYONV] f%u hits=%u voice=%u vab=%u prog=%u tone=%u ra=0x%08X\n",
+                   g_ps1_frame, s_ssut_keyonv, cpu->a0 & 0xFFFFu, cpu->a1 & 0xFFFFu,
+                   cpu->a2 & 0xFFFFu, cpu->a3 & 0xFFFFu, cpu->ra);
+            fflush(stdout);
+        }
+    }
+    if (addr == 0x80025F08u) {
+        static uint32_t s_ssut_keyon = 0;
+        if (++s_ssut_keyon <= 60u) {
+            printf("[LIBSND-KEYON] f%u hits=%u voice=%u vab=%u prog=%u tone=%u ra=0x%08X\n",
+                   g_ps1_frame, s_ssut_keyon, cpu->a0 & 0xFFFFu, cpu->a1 & 0xFFFFu,
+                   cpu->a2 & 0xFFFFu, cpu->a3 & 0xFFFFu, cpu->ra);
+            fflush(stdout);
+        }
+    }
+    if (addr == 0x800247C8u) {
+        static uint32_t s_spuvm_flush = 0;
+        uint16_t okon1 = 0, okon2 = 0;
+        memcpy(&okon1, &g_ram[0x3BDD8], sizeof(okon1));
+        memcpy(&okon2, &g_ram[0x3BDDC], sizeof(okon2));
+        if (okon1 != 0u || okon2 != 0u || ++s_spuvm_flush <= 40u) {
+            printf("[LIBSND-FLUSH] f%u hits=%u okon1=0x%04X okon2=0x%04X ra=0x%08X\n",
+                   g_ps1_frame, s_spuvm_flush, okon1, okon2, cpu->ra);
+            fflush(stdout);
+        }
+    }
     /* DRA.BIN call trace — always on */
     if (addr >= 0x800A0000u && addr <= 0x801FFFFFu) {
         static uint32_t s_dra_calls = 0;
@@ -3882,10 +8784,96 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             }
         }
     }
+    uint32_t trace_gs = 0;
+    uint32_t trace_sub = 0;
+    uint32_t trace_eng = 0;
+    uint32_t trace_menu = 0;
+    int trace_compiled_window = 0;
+    if (trace_compiled_window) {
+        memcpy(&trace_gs, &g_ram[0x3C734], sizeof(trace_gs));
+        memcpy(&trace_sub, &g_ram[0x73060], sizeof(trace_sub));
+        memcpy(&trace_eng, &g_ram[0x3C9A4], sizeof(trace_eng));
+        memcpy(&trace_menu, &g_ram[0x978F8], sizeof(trace_menu));
+    }
+
     /* Normalise KUSEG/KSEG1 addresses to KSEG0 before dispatch.
      * Some game code stores function pointers as KUSEG (no KSEG0 bit).
      * e.g. 0x00014900 → 0x80014900. */
     uint32_t kseg0 = (addr & 0x1FFFFFFFu) | 0x80000000u;
+    if (kseg0 == 0x8001D798u) {
+        static uint32_t s_seq_open = 0;
+        if (++s_seq_open <= 40u) {
+            printf("[LIBSND-SEQOPEN] f%u hits=%u seq=0x%08X sep=%u ra=0x%08X\n",
+                   g_ps1_frame, s_seq_open, cpu->a0, cpu->a1 & 0xFFFFu, cpu->ra);
+            fflush(stdout);
+        }
+    }
+    if (kseg0 == 0x80020C94u) {
+        static uint32_t s_seq_play = 0;
+        if (++s_seq_play <= 40u) {
+            printf("[LIBSND-SEQPLAY] f%u hits=%u access=%u play=%u loops=%u ra=0x%08X\n",
+                   g_ps1_frame, s_seq_play, cpu->a0 & 0xFFFFu, cpu->a1 & 0xFFFFu,
+                   cpu->a2 & 0xFFFFu, cpu->ra);
+            fflush(stdout);
+        }
+    }
+    if (kseg0 == 0x80020F44u) {
+        static uint32_t s_seq_stop = 0;
+        if (++s_seq_stop <= 40u) {
+            printf("[LIBSND-SEQSTOP] f%u hits=%u access=%u ra=0x%08X\n",
+                   g_ps1_frame, s_seq_stop, cpu->a0 & 0xFFFFu, cpu->ra);
+            fflush(stdout);
+        }
+    }
+    if (kseg0 == 0x800202E0u) {
+        static uint32_t s_seq_close = 0;
+        if (++s_seq_close <= 40u) {
+            printf("[LIBSND-SEQCLOSE] f%u hits=%u access=%u ra=0x%08X\n",
+                   g_ps1_frame, s_seq_close, cpu->a0 & 0xFFFFu, cpu->ra);
+            fflush(stdout);
+        }
+    }
+    if (kseg0 == 0x801361F8u) {
+        static uint32_t s_sound_tick_calls = 0;
+        s_sound_tick_called_frame = g_ps1_frame;
+        if (++s_sound_tick_calls <= 160u || (g_ps1_frame >= 140u && g_ps1_frame <= 170u)) {
+            int16_t queue_pos = 0;
+            int16_t queue0 = 0;
+            int16_t sfx_read = 0;
+            int16_t sfx_write = 0;
+            int16_t cmd_read = 0;
+            int16_t cmd_write = 0;
+            int16_t cmd_next = 0;
+            uint8_t cd_step = 0u;
+            uint8_t sound_initialized = 0u;
+            uint8_t seq_playing = 0u;
+            uint8_t seq_state = 0u;
+            memcpy(&queue_pos, &g_ram[0x1396F4], sizeof(queue_pos));
+            memcpy(&queue0, &g_ram[0x139868], sizeof(queue0));
+            memcpy(&sfx_read, &g_ram[0x138FAC], sizeof(sfx_read));
+            memcpy(&sfx_write, &g_ram[0x139000], sizeof(sfx_write));
+            memcpy(&cmd_read, &g_ram[0x139A68], sizeof(cmd_read));
+            memcpy(&cmd_write, &g_ram[0x139A70], sizeof(cmd_write));
+            memcpy(&cd_step, &g_ram[0x13AE80], sizeof(cd_step));
+            memcpy(&sound_initialized, &g_ram[0x13AEEC], sizeof(sound_initialized));
+            memcpy(&seq_playing, &g_ram[0x139810], sizeof(seq_playing));
+            memcpy(&seq_state, &g_ram[0x1390C4], sizeof(seq_state));
+            if (cmd_read >= 0 && cmd_read < 0x100) {
+                memcpy(&cmd_next, &g_ram[0x13B3E8u + (uint32_t)(uint16_t)cmd_read * 2u],
+                       sizeof(cmd_next));
+            }
+            if (cmd_read != cmd_write || seq_playing != 0u || seq_state != 0u ||
+                s_sound_tick_calls <= 160u || (g_ps1_frame >= 140u && g_ps1_frame <= 170u)) {
+                printf("[SOUND-TICK] f%u hits=%u init=%u qpos=%d q0=%d step=%u sfx=%d->%d cmd=%d->%d next=0x%04X seq=0x%02X state=0x%02X ra=0x%08X\n",
+                       g_ps1_frame, s_sound_tick_calls, (unsigned)sound_initialized,
+                       (int)queue_pos, (int)queue0, (unsigned)cd_step,
+                       (int)sfx_read, (int)sfx_write, (int)cmd_read, (int)cmd_write,
+                       (unsigned)(uint16_t)cmd_next, (unsigned)seq_playing,
+                       (unsigned)seq_state, cpu->ra);
+                fflush(stdout);
+            }
+        }
+    }
 
     /* Skip clearly invalid addresses — not BIOS entry (A0/B0/C0), not in
      * compiled range (0x80010000-0x80097FFF), and not in overlay range
@@ -3913,8 +8901,21 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
     uint32_t s4_before = cpu->s4, s5_before = cpu->s5;
     uint32_t s6_before = cpu->s6, s7_before = cpu->s7;
     uint32_t fp_before = cpu->fp;
-
-    if (kseg0 != addr && psx_dispatch_compiled(cpu, kseg0)) goto sp_check;
+    if (kseg0 != addr) {
+        if (trace_compiled_window) {
+            printf("[CBA-KSEG0-ENTER] f%u addr=0x%08X kseg0=0x%08X ra=0x%08X sp=0x%08X gs=%u sub=%u eng=0x%08X menustep=0x%08X\n",
+                   g_ps1_frame, addr, kseg0, cpu->ra, cpu->sp,
+                   trace_gs, trace_sub, trace_eng, trace_menu);
+            fflush(stdout);
+        }
+        int handled = psx_dispatch_compiled(cpu, kseg0);
+        if (trace_compiled_window) {
+            printf("[CBA-KSEG0-EXIT] f%u addr=0x%08X kseg0=0x%08X handled=%d v0=0x%08X ra=0x%08X sp=0x%08X\n",
+                   g_ps1_frame, addr, kseg0, handled, cpu->v0, cpu->ra, cpu->sp);
+            fflush(stdout);
+        }
+        if (handled) goto sp_check;
+    }
 
     /* Overlay callback aliases — overlay code sometimes calls main-binary addresses
      * that are off by a few bytes from the compiled function entry point.
@@ -3979,6 +8980,9 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
         uint32_t body = (addr == 0x80012C90u) ? 0x80012C98u :
                         (addr == 0x80012E8Cu) ? 0x80012E94u :
                                                 0x80012FECu;
+        if (addr == 0x80012FE4u) {
+            s_last_drawotag_a0 = cpu->a0;
+        }
         if (++s_split_fix <= 30u || (s_split_fix % 500u) == 0u) {
             printf("[SPLIT-FIX] #%u f%u addr=0x%08X → body=0x%08X ra=0x%08X a0=0x%08X a1=0x%08X\n",
                    s_split_fix, g_ps1_frame, addr, body, cpu->ra, cpu->a0, cpu->a1);
@@ -3990,12 +8994,34 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
 
     /* Check if address maps to a compiled function first.
      * Keep OT helpers on a dedicated runtime-override path below. */
-    if (addr != 0x80060B70u && addr != 0x800602E0u && addr != 0x8005DFD8u && addr != 0x8001A8A8u && psx_dispatch_compiled(cpu, addr)) goto sp_check;
+    if (addr != 0x80060B70u && addr != 0x800602E0u && addr != 0x8005DFD8u &&
+        addr != 0x8001A8A8u && addr != 0x8001C64Cu &&
+        addr != 0x801B97BCu && addr != 0x801B994Cu &&
+        addr != 0x801B9C80u && addr != 0x801B410Cu) {
+        if (trace_compiled_window) {
+            printf("[CBA-COMPILED-ENTER] f%u addr=0x%08X ra=0x%08X sp=0x%08X gs=%u sub=%u eng=0x%08X menustep=0x%08X\n",
+                   g_ps1_frame, addr, cpu->ra, cpu->sp,
+                   trace_gs, trace_sub, trace_eng, trace_menu);
+            fflush(stdout);
+        }
+        int handled = psx_dispatch_compiled(cpu, addr);
+        if (trace_compiled_window) {
+            printf("[CBA-COMPILED-EXIT] f%u addr=0x%08X handled=%d v0=0x%08X ra=0x%08X sp=0x%08X\n",
+                   g_ps1_frame, addr, handled, cpu->v0, cpu->ra, cpu->sp);
+            fflush(stdout);
+        }
+        if (handled) goto sp_check;
+    }
 
     /* DrawOTag/ClearOTagR calls often arrive through dynamic JALR sites where
      * the compiled function may be unavailable. Route explicitly through
      * override dispatch so OT diagnostics are guaranteed to run. */
-    if ((addr == 0x80060B70u || addr == 0x800602E0u || addr == 0x8005DFD8u || addr == 0x8001A8A8u) && psx_override_dispatch(cpu, addr)) goto sp_check;
+    if ((addr == 0x80060B70u || addr == 0x800602E0u || addr == 0x8005DFD8u ||
+         addr == 0x8001A8A8u || addr == 0x8001C64Cu ||
+         addr == 0x801B97BCu || addr == 0x801B994Cu ||
+         addr == 0x801B9C80u || addr == 0x801B410Cu ||
+         addr == 0x80106A28u) &&
+        psx_override_dispatch(cpu, addr)) goto sp_check;
 
     uint32_t func = cpu->t1;  /* BIOS function number always in t1 */
     {
@@ -4073,6 +9099,13 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             case 0x33: {  /* malloc(size) */
                 uint32_t size = (cpu->a0 + 3u) & ~3u;  /* align to 4 bytes */
                 if (g_heap_ptr + size <= g_heap_base + g_heap_size) {
+                    uint32_t alloc_start = g_heap_ptr;
+                    uint32_t alloc_end = g_heap_ptr + size;
+                    if (alloc_start < 0x800A82F0u && alloc_end > 0x800A82C0u) {
+                        printf("[HEAP-OVERLAP] malloc start=0x%08X end=0x%08X size=0x%X ra=0x%08X pc=0x%08X\n",
+                               alloc_start, alloc_end, size, cpu->ra, cpu->pc);
+                        fflush(stdout);
+                    }
                     cpu->v0 = g_heap_ptr;
                     g_heap_ptr += size;
                 } else {
@@ -4085,6 +9118,13 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 uint32_t total = cpu->a0 * cpu->a1;
                 uint32_t aligned = (total + 3u) & ~3u;
                 if (g_heap_ptr + aligned <= g_heap_base + g_heap_size) {
+                    uint32_t alloc_start = g_heap_ptr;
+                    uint32_t alloc_end = g_heap_ptr + aligned;
+                    if (alloc_start < 0x800A82F0u && alloc_end > 0x800A82C0u) {
+                        printf("[HEAP-OVERLAP] calloc start=0x%08X end=0x%08X size=0x%X ra=0x%08X pc=0x%08X\n",
+                               alloc_start, alloc_end, aligned, cpu->ra, cpu->pc);
+                        fflush(stdout);
+                    }
                     cpu->v0 = g_heap_ptr;
                     memset(&g_ram[g_heap_ptr & 0x1FFFFFFF], 0, aligned);
                     g_heap_ptr += aligned;
@@ -4097,6 +9137,12 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 uint32_t size = (cpu->a1 + 3u) & ~3u;
                 if (g_heap_ptr + size <= g_heap_base + g_heap_size) {
                     uint32_t new_ptr = g_heap_ptr;
+                    uint32_t alloc_end = g_heap_ptr + size;
+                    if (new_ptr < 0x800A82F0u && alloc_end > 0x800A82C0u) {
+                        printf("[HEAP-OVERLAP] realloc start=0x%08X end=0x%08X size=0x%X old=0x%08X ra=0x%08X pc=0x%08X\n",
+                               new_ptr, alloc_end, size, cpu->a0, cpu->ra, cpu->pc);
+                        fflush(stdout);
+                    }
                     g_heap_ptr += size;
                     if (cpu->a0) memcpy(&g_ram[new_ptr & 0x1FFFFFFF], &g_ram[cpu->a0 & 0x1FFFFFFF], size);
                     cpu->v0 = new_ptr;
@@ -4109,6 +9155,9 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 g_heap_base = cpu->a0;
                 g_heap_size = cpu->a1;
                 g_heap_ptr  = cpu->a0;
+                printf("[HEAP-INIT] base=0x%08X size=0x%08X end=0x%08X ra=0x%08X pc=0x%08X\n",
+                       g_heap_base, g_heap_size, g_heap_base + g_heap_size, cpu->ra, cpu->pc);
+                fflush(stdout);
                 return;
             }
             case 0x3C: return;  /* FlushCache — no-op in recompiler */
@@ -4173,16 +9222,28 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
         }
         switch (func) {
             case 0x08: /* OpenEvent(class,spec,mode,func) → event handle */
-                /* Minimal stub: return a non-zero handle so callers don't treat it as error */
-                cpu->v0 = 0xFF000000u | (cpu->a0 & 0xFFFFu);
+                cpu->v0 = bios_event_open(cpu->a0, cpu->a1, cpu->a2, cpu->a3);
                 return;
-            case 0x09: cpu->v0 = 1; return;  /* CloseEvent — success */
+            case 0x09:
+                bios_event_close(cpu->a0);
+                cpu->v0 = 1;
+                return;
             case 0x0A: cpu->v0 = 1; return;  /* WaitEvent — return immediately (events always ready) */
             case 0x0B: cpu->v0 = 1; return;  /* TestEvent — return 1 (event fired) */
-            case 0x0C: cpu->v0 = 1; return;  /* EnableEvent — success */
-            case 0x0D: cpu->v0 = 1; return;  /* DisableEvent — success */
-            case 0x15: cpu->v0 = 1; return;  /* PAD_init2 — stub */
-            case 0x16: cpu->v0 = 0; return;  /* PAD_dr — stub, return 0 (no data) */
+            case 0x0C:
+                bios_event_set_enabled(cpu->a0, 1);
+                cpu->v0 = 1;
+                return;
+            case 0x0D:
+                bios_event_set_enabled(cpu->a0, 0);
+                cpu->v0 = 1;
+                return;
+            case 0x15: cpu->v0 = 1; return;  /* PAD_init2 — success */
+            case 0x16:
+                /* PAD_dr: report controller data ready. psx_set_pad1() keeps the
+                 * raw active-low pad bytes and status byte updated in RAM. */
+                cpu->v0 = 1;
+                return;
             case 0x0F: cpu->v0 = 1; return;  /* CloseThread — no-op in fiber model */
             case 0x0E: {  /* OpenThread(entry, sp, stksz) → thread handle */
                 if (cpu->a0 == 0x800191E0u) {
@@ -4609,6 +9670,8 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     s_cdrom_vfds[vfd_idx].start_lba = start_lba;
                     s_cdrom_vfds[vfd_idx].file_size = file_size_cd;
                     s_cdrom_vfds[vfd_idx].position  = 0;
+                    strncpy(s_cdrom_vfds[vfd_idx].name, fname, sizeof(s_cdrom_vfds[vfd_idx].name) - 1);
+                    s_cdrom_vfds[vfd_idx].name[sizeof(s_cdrom_vfds[vfd_idx].name) - 1] = '\0';
                     int fd = CDROM_FD_BASE + vfd_idx;
                     cpu->v0 = (uint32_t)fd;
                     printf("[CDROM open] fd=%d \"%s\" LBA=%u size=%u ra=0x%08X\n",
@@ -4780,6 +9843,7 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 /* CDROM virtual fd read */
                 if (is_cdrom_fd(fd)) {
                     int idx = fd - CDROM_FD_BASE;
+                    int preserve_title_like_ram = 0;
                     if (!s_cdrom_vfds[idx].active) {
                         printf("[CDROM read] INACTIVE fd=%d\n", fd);
                         cpu->v0 = (uint32_t)-1; return;
@@ -4798,6 +9862,27 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                     printf("[CDROM read] fd=%d LBA=%u+%u pos=%u len=%u -> RAM 0x%08X ra=0x%08X\n",
                            fd, slba, pos / 2048, pos, len, buf + 0x80000000u, cpu->ra);
                     fflush(stdout);
+                    preserve_title_like_ram =
+                        (pos == 0u) &&
+                        (len == fsz) &&
+                        (fsz <= sizeof(s_cd_title_ram_preserve)) &&
+                        cv_is_title_like_cdrom_file(&s_cdrom_vfds[idx]);
+                    if (preserve_title_like_ram) {
+                        memcpy(s_cd_title_ram_preserve, &g_ram[buf], fsz);
+                    }
+                    {
+                        const uint32_t state_begin = 0x97C98u;
+                        const uint32_t state_end = state_begin + 4u;
+                        if (!s_state_97c98_captured &&
+                            buf < state_end &&
+                            buf + len > state_begin) {
+                            memcpy(&s_state_97c98_saved, &g_ram[state_begin], sizeof(s_state_97c98_saved));
+                            s_state_97c98_captured = 1;
+                            printf("[STATE7C98-SAVE] before CD read value=0x%08X buf=0x%X len=0x%X lba=%u\n",
+                                   s_state_97c98_saved, buf, len, slba);
+                            fflush(stdout);
+                        }
+                    }
                     uint32_t bytes_read = 0;
                     uint8_t sec_buf[2048];
                     while (bytes_read < len) {
@@ -4810,12 +9895,154 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                             printf("[CDROM read] FAILED at sector %u\n", sector);
                             break;
                         }
+                        {
+                            uint32_t sample = 0u;
+                            memcpy(&sample, &sec_buf[sec_off], (chunk >= 4u) ? 4u : chunk);
+                            trace_suspicious_code_write("CDROM-READ", buf + bytes_read, chunk, sample);
+                        }
                         memcpy(&g_ram[buf + bytes_read], &sec_buf[sec_off], chunk);
                         bytes_read += chunk;
+                    }
+                    if (cv_cd_read_overlaps_usedisk(buf, bytes_read) &&
+                        cv_should_force_usedisk_for_cdrom_file(&s_cdrom_vfds[idx])) {
+                        cv_force_usedisk(s_cdrom_vfds[idx].name);
+                    }
+                    {
+                        uint32_t dst_begin = buf;
+                        uint32_t dst_end = buf + bytes_read;
+                        uint32_t tele_begin = 0xA245Cu;
+                        uint32_t tele_end = tele_begin + (uint32_t)sizeof(s_dra_tele_saved);
+                        uint32_t stage_lba_begin = 0xA3C68u;
+                        uint32_t stage_lba_end = stage_lba_begin + (uint32_t)sizeof(s_dra_stage_lba_saved);
+                        if (dst_begin < tele_end && dst_end > tele_begin) {
+                            static uint32_t s_dra_tele_cd_overlaps = 0;
+                            if (++s_dra_tele_cd_overlaps <= 32u) {
+                                printf("[DRA-TELE-CD] fd=%d lba=%u pos=0x%X buf=0x%X bytes=0x%X overlap=[0x%X,0x%X)\n",
+                                       fd, slba, pos, buf, bytes_read,
+                                       (dst_begin > tele_begin) ? dst_begin : tele_begin,
+                                       (dst_end < tele_end) ? dst_end : tele_end);
+                                fflush(stdout);
+                            }
+                        }
+                        if (dst_begin < stage_lba_end && dst_end > stage_lba_begin) {
+                            static uint32_t s_dra_stage_lba_cd_overlaps = 0;
+                            if (++s_dra_stage_lba_cd_overlaps <= 32u) {
+                                printf("[DRA-STAGELBA-CD] fd=%d lba=%u pos=0x%X buf=0x%X bytes=0x%X overlap=[0x%X,0x%X)\n",
+                                       fd, slba, pos, buf, bytes_read,
+                                       (dst_begin > stage_lba_begin) ? dst_begin : stage_lba_begin,
+                                       (dst_end < stage_lba_end) ? dst_end : stage_lba_end);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                    if (s_dra_tele_captured &&
+                        pos == 0u &&
+                        bytes_read == fsz &&
+                        buf == 0x80000u &&
+                        cv_should_restore_dra_tele_after_leave_menu(&s_cdrom_vfds[idx])) {
+                        s_dra_tele_restore_pending = 1;
+                        s_dra_stage_lba_restore_pending = s_dra_stage_lba_captured ? 1 : 0;
+                        memset(s_dra_tele_restore_reason, 0, sizeof(s_dra_tele_restore_reason));
+                        strncpy(s_dra_tele_restore_reason, s_cdrom_vfds[idx].name,
+                                sizeof(s_dra_tele_restore_reason) - 1u);
+                        {
+                            static uint32_t s_dra_tele_restore_defer_logs = 0;
+                            if (++s_dra_tele_restore_defer_logs <= 8u) {
+                                printf("[DRA-TELE-DEFER] %s dirtied D_800A245C via RAM 0x%08X; restore deferred until leaving menu\n",
+                                       s_cdrom_vfds[idx].name, buf + 0x80000000u);
+                                fflush(stdout);
+                            }
+                        }
+                        if (s_dra_stage_lba_captured) {
+                            static uint32_t s_dra_stage_lba_restore_defer_logs = 0;
+                            if (++s_dra_stage_lba_restore_defer_logs <= 8u) {
+                                printf("[DRA-STAGELBA-DEFER] %s dirtied g_StagesLba via RAM 0x%08X; restore deferred until leaving menu\n",
+                                       s_cdrom_vfds[idx].name, buf + 0x80000000u);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                    if (pos == 0u &&
+                        bytes_read == fsz &&
+                        cv_is_title_like_cdrom_file(&s_cdrom_vfds[idx])) {
+                            cv_upload_title_like_cd_file(&g_ram[buf], bytes_read, s_cdrom_vfds[idx].name);
+                            if (preserve_title_like_ram) {
+                                s_cd_title_restore_addr = buf;
+                                s_cd_title_restore_size = bytes_read;
+                            s_cd_title_restore_pending = 1;
+                            printf("[CD-TITLE-RAM-DEFER] %s will restore 0x%X bytes at RAM 0x%08X on title entry\n",
+                                   s_cdrom_vfds[idx].name, bytes_read, buf + 0x80000000u);
+                            fflush(stdout);
+                        }
+                    }
+                    if (s_dra_tele_captured &&
+                        buf == 0x80000u &&
+                        bytes_read == 0x40000u &&
+                        slba == 25558u) {
+                        static uint32_t s_dra_tele_restore_logs = 0;
+                        memcpy(&g_ram[0xA245C], s_dra_tele_saved, sizeof(s_dra_tele_saved));
+                        if (++s_dra_tele_restore_logs <= 8u) {
+                            uint16_t x = 0, y = 0, room = 0, unk6 = 0, stage = 0;
+                            memcpy(&x, &g_ram[0xA245C], 2);
+                            memcpy(&y, &g_ram[0xA245E], 2);
+                            memcpy(&room, &g_ram[0xA2460], 2);
+                            memcpy(&unk6, &g_ram[0xA2462], 2);
+                            memcpy(&stage, &g_ram[0xA2464], 2);
+                            printf("[DRA-TELE-RESTORE] after F_TITLE0 entry0={x=%u y=%u room=0x%04X unk6=0x%04X stage=0x%04X}\n",
+                                   x, y, room, unk6, stage);
+                            fflush(stdout);
+                        }
+                    }
+                    if (s_state_97c98_captured &&
+                        buf == 0x80000u &&
+                        bytes_read == 0x40000u &&
+                        slba == 25558u) {
+                        static uint32_t s_state_97c98_restore_logs = 0;
+                        uint32_t clobbered = 0;
+                        memcpy(&clobbered, &g_ram[0x97C98], sizeof(clobbered));
+                        memcpy(&g_ram[0x97C98], &s_state_97c98_saved, sizeof(s_state_97c98_saved));
+                        if (++s_state_97c98_restore_logs <= 8u) {
+                            printf("[STATE7C98-RESTORE] after F_TITLE0 old=0x%08X restored=0x%08X\n",
+                                   clobbered, s_state_97c98_saved);
+                            fflush(stdout);
+                        }
                     }
                     s_cdrom_vfds[idx].position = pos + bytes_read;
                     cpu->v0 = bytes_read;
                     printf("[CDROM read] done: %u bytes read\n", bytes_read);
+                    if (!s_g_api_init_captured && buf == 0xA0000u && bytes_read >= 0x144u) {
+                        uint32_t first_fn = 0;
+                        memcpy(s_g_api_init_saved, &g_ram[0xA0004], 0x140);
+                        s_g_api_init_captured = 1;
+                        memcpy(&first_fn, &s_g_api_init_saved[0x40], 4);
+                        printf("[GAPI-SAVE] first=0x%08X\n", first_fn);
+                    }
+                    if (!s_dra_tele_captured &&
+                        buf <= 0xA245Cu &&
+                        buf + bytes_read >= 0xA245Cu + sizeof(s_dra_tele_saved)) {
+                        uint16_t x = 0, y = 0, room = 0, unk6 = 0, stage = 0;
+                        memcpy(s_dra_tele_saved, &g_ram[0xA245C], sizeof(s_dra_tele_saved));
+                        s_dra_tele_captured = 1;
+                        memcpy(&x, &s_dra_tele_saved[0], 2);
+                        memcpy(&y, &s_dra_tele_saved[2], 2);
+                        memcpy(&room, &s_dra_tele_saved[4], 2);
+                        memcpy(&unk6, &s_dra_tele_saved[6], 2);
+                        memcpy(&stage, &s_dra_tele_saved[8], 2);
+                        printf("[DRA-TELE-SAVE] entry0={x=%u y=%u room=0x%04X unk6=0x%04X stage=0x%04X}\n",
+                               x, y, room, unk6, stage);
+                    }
+                    if (!s_dra_stage_lba_captured &&
+                        buf <= 0xA3C68u &&
+                        buf + bytes_read >= 0xA3C68u + sizeof(s_dra_stage_lba_saved)) {
+                        uint8_t st0_unk28 = 0;
+                        uint8_t menu_unk28 = 0;
+                        memcpy(s_dra_stage_lba_saved, &g_ram[0xA3C68], sizeof(s_dra_stage_lba_saved));
+                        s_dra_stage_lba_captured = 1;
+                        st0_unk28 = s_dra_stage_lba_saved[0x1Fu * 44u];
+                        menu_unk28 = s_dra_stage_lba_saved[0x45u * 44u];
+                        printf("[DRA-STAGELBA-SAVE] st0=0x%02X menu45=0x%02X size=0x%X\n",
+                               st0_unk28, menu_unk28, (unsigned)sizeof(s_dra_stage_lba_saved));
+                    }
                     fflush(stdout);
                     return;
                 }
@@ -4963,7 +10190,9 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 if (cpu->a0) puts((const char*)&g_ram[cpu->a0 & 0x1FFFFFFF]);
                 return;
             }
-            case 0x07: return;  /* DeliverEvent — no-op (no real event system) */
+            case 0x07:
+                bios_event_deliver(cpu, cpu->a0, cpu->a1);
+                return;
             case 0x17: return;  /* ReturnFromException — no-op in recompiler */
             case 0x18: return;  /* SetDefaultExitFromException — no-op */
             case 0x19: return;  /* SetCustomExitFromException — no-op */
@@ -5087,6 +10316,24 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             }
             case 0x4B: cpu->v0 = 1; return;  /* StartCard — success */
             case 0x4C: cpu->v0 = 1; return;  /* StopCard — success */
+            case 0x51: { /* Krom2RawAdd(ch) -> ptr or -1 */
+                static uint32_t s_krom_calls = 0;
+                const uint8_t* glyph = psx_krom2raw_lookup((uint16_t)cpu->a0);
+                if (!glyph) {
+                    cpu->v0 = 0xFFFFFFFFu;
+                    return;
+                }
+                memcpy(&g_scratch[0x3C0], glyph, 30);
+                memset(&g_scratch[0x3DE], 0, 2);
+                cpu->v0 = 0x1F8003C0u;
+                if (++s_krom_calls <= 20u) {
+                    printf("[KROM] f%u #%u ch=0x%04X -> 0x%08X ra=0x%08X\n",
+                           g_ps1_frame, s_krom_calls, (uint32_t)(cpu->a0 & 0xFFFFu),
+                           cpu->v0, cpu->ra);
+                    fflush(stdout);
+                }
+                return;
+            }
             case 0x56: /* GetC0Table — return pointer to dummy table in RAM */
                 cpu->v0 = 0x80000100u; /* point to zero-filled area near bottom of RAM */
                 return;
@@ -5098,12 +10345,16 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
                 if (!s_b0_init) {
                     s_b0_init = 1;
                     static const struct { uint8_t fn; uint32_t addr; } b0_entries[] = {
-                        { 0x07, 0x8005B3ACu }, { 0x08, 0x8005B3BCu },
-                        { 0x09, 0x8005B3CCu }, { 0x0A, 0x8005B3DCu }, /* wait/test events near this area */
+                        { 0x07, 0x8006476Cu }, /* DeliverEvent */
+                        { 0x08, 0x8005B3ACu }, /* OpenEvent */
+                        { 0x09, 0x8005B3BCu }, /* CloseEvent */
+                        { 0x0A, 0x8007659Cu }, /* WaitEvent */
                         { 0x0B, 0x8005B3CCu }, /* TestEvent */
                         { 0x0C, 0x8005B3DCu }, /* EnableEvent */
-                        { 0x0D, 0x8005B3ECu },
-                        { 0x0E, 0x8005B3FCu }, { 0x0F, 0x8005B3FCu }, { 0x10, 0x8005B40Cu },
+                        { 0x0D, 0x80074E94u }, /* DisableEvent */
+                        { 0x0E, 0x8005B3ECu }, /* OpenThread */
+                        { 0x0F, 0x8005B3FCu }, /* CloseThread */
+                        { 0x10, 0x8005B40Cu }, /* ChangeThread */
                         { 0x32, 0x8005B43Cu }, /* open */
                         { 0x33, 0x8005B44Cu }, /* lseek */
                         { 0x34, 0x8005B45Cu }, /* read */
@@ -5405,8 +10656,18 @@ void call_by_address(CPUState* cpu, uint32_t addr) {
             }
 
             mips_interpret(cpu, norm);
-
-
+            if (trace_late_render_callee) {
+                uint32_t late_ot_after[4] = {0};
+                memcpy(&late_ot_after[0], &g_ram[0x3CB0Cu], sizeof(uint32_t));
+                memcpy(&late_ot_after[1], &g_ram[0x3CB68u], sizeof(uint32_t));
+                memcpy(&late_ot_after[2], &g_ram[0x3CF7Cu], sizeof(uint32_t));
+                memcpy(&late_ot_after[3], &g_ram[0x54770u], sizeof(uint32_t));
+                printf("[LATE-CALLEE-OUT] f%u addr=0x%08X v0=0x%08X ot=%08X/%08X/%08X/%08X->%08X/%08X/%08X/%08X\n",
+                       g_ps1_frame, norm, cpu->v0,
+                       late_ot_before[0], late_ot_before[1], late_ot_before[2], late_ot_before[3],
+                       late_ot_after[0], late_ot_after[1], late_ot_after[2], late_ot_after[3]);
+                fflush(stdout);
+            }
             return;
         }
     }
@@ -5553,6 +10814,233 @@ static uint32_t s_b2p_cache_frame = 0;
  * Do NOT add psx_register_override() here. If a function needs different
  * behavior, fix code_generator.cpp to emit correct code. */
 int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
+    {
+        uint32_t player_ovl_init = 0;
+        memcpy(&player_ovl_init, &g_ram[0x13C004u], sizeof(player_ovl_init));
+        if (addr == player_ovl_init &&
+            player_ovl_init >= 0x80100000u && player_ovl_init < 0x80200000u) {
+            static uint32_t s_player_ovl_init_dispatch_hits = 0;
+            uint32_t game_state = 0;
+            uint32_t stage_id = 0;
+            uint32_t current_entity = 0;
+            memcpy(&game_state, &g_ram[0x3C734u], sizeof(game_state));
+            memcpy(&stage_id, &g_ram[0x974A0u], sizeof(stage_id));
+            memcpy(&current_entity, &g_ram[0x6C3B8u], sizeof(current_entity));
+            if (++s_player_ovl_init_dispatch_hits <= 16u ||
+                (s_player_ovl_init_dispatch_hits % 64u) == 0u) {
+                printf("[PLAYERINIT-DISPATCH] f%u n=%u addr=0x%08X gs=0x%08X st=0x%08X cur=0x%08X a0=0x%08X ra=0x%08X\n",
+                       g_ps1_frame, s_player_ovl_init_dispatch_hits, addr,
+                       game_state, stage_id, current_entity, cpu->a0, cpu->ra);
+                fflush(stdout);
+            }
+        }
+    }
+    if (addr == 0x800EA5E4u) {
+        uint32_t arg0 = cpu->a0;
+        uint32_t temp_v0 = arg0 & ~0xFFu;
+        uint32_t index = arg0 & 0xFFu;
+        uint32_t clut_table_ptr = 0;
+        uint32_t clut_desc = 0;
+        uint32_t clut0 = 0;
+        uint32_t clut1 = 0;
+        uint32_t clut2 = 0;
+        static uint32_t s_pal_desc_clamps = 0;
+
+        if (temp_v0 & 0x8000u) {
+            if (!cv_read_ram_u32(0x8003C78Cu, &clut_table_ptr) ||
+                !cv_read_ram_u32(clut_table_ptr + index * 4u, &clut_desc)) {
+                cpu->v0 = (uint32_t)-1;
+                return 1;
+            }
+        } else {
+            if (!cv_read_ram_u32(0x800A3BB8u + index * 4u, &clut_desc)) {
+                cpu->v0 = (uint32_t)-1;
+                return 1;
+            }
+        }
+
+        if (clut_desc == 0u || clut_desc == 0xFFFFFFFFu) {
+            cpu->v0 = 1u;
+            return 1;
+        }
+        if (!cv_read_ram_u32(clut_desc + 0u, &clut0) ||
+            !cv_read_ram_u32(clut_desc + 4u, &clut1) ||
+            !cv_read_ram_u32(clut_desc + 8u, &clut2)) {
+            cpu->v0 = (uint32_t)-1;
+            return 1;
+        }
+        if (clut0 == 0u || clut0 == 0xFFFFFFFFu) {
+            cpu->v0 = 1u;
+            return 1;
+        }
+
+        for (uint32_t slot = 0; slot < 32u; slot++) {
+            uint32_t slot_phys = 0x6C3C4u + slot * 0x40u;
+            uint16_t slot_kind = 0;
+            memcpy(&slot_kind, &g_ram[slot_phys + 0x08u], sizeof(slot_kind));
+            if (slot_kind == 0u) {
+                uint32_t start = clut1 >> 8;
+                uint32_t count = (clut2 + clut1 - 1u) >> 8;
+                uint16_t kind = (uint16_t)((clut0 & 0xFFFFu) | temp_v0);
+                uint16_t unk_e = ((clut0 & 0xFFFFu) == 2u || (clut0 & 0xFFFFu) == 16u) ? 0x1Fu : 0u;
+                cv_write_ram_u32_phys(slot_phys + 0x00u, clut_desc);
+                cv_write_ram_u32_phys(slot_phys + 0x04u, clut_desc + 12u);
+                cv_write_ram_u16_phys(slot_phys + 0x08u, kind);
+                cv_write_ram_u16_phys(slot_phys + 0x0Au, 0u);
+                cv_write_ram_u16_phys(slot_phys + 0x0Cu, 0u);
+                cv_write_ram_u16_phys(slot_phys + 0x0Eu, unk_e);
+                memset(&g_ram[slot_phys + 0x10u], 0, 0x30u);
+                if (start > 0x2Fu || count > 0x2Fu) {
+                    if (++s_pal_desc_clamps <= 40u) {
+                        printf("[PAL-DESC-CLAMP] f%u arg0=0x%08X clut=0x%08X start=%u count=%u kind=0x%04X ra=0x%08X\n",
+                               g_ps1_frame, arg0, clut_desc, start, count, (uint32_t)(clut0 & 0xFFFFu), cpu->ra);
+                        fflush(stdout);
+                    }
+                    if (start > 0x2Fu) {
+                        start = 0x30u;
+                    }
+                    if (count > 0x2Fu) {
+                        count = 0x2Fu;
+                    }
+                }
+                if (start < 0x30u && start <= count) {
+                    for (uint32_t j = start; j <= count; j++) {
+                        g_ram[slot_phys + 0x10u + j] = 1u;
+                    }
+                }
+                cpu->v0 = 0u;
+                return 1;
+            }
+        }
+
+        cpu->v0 = (uint32_t)-1;
+        return 1;
+    }
+
+    if (addr == 0x800E9880u) {
+        static uint32_t s_memcard_status_calls = 0;
+        int32_t ret = -1;
+        if (cpu->a0 == 0u && cpu->a1 == 0u) {
+            ret = 1;
+        }
+        cpu->v0 = (uint32_t)ret;
+        if (++s_memcard_status_calls <= 32u) {
+            printf("[MEMCARD-STATUS] f%u #%u port=%u card=%u -> %d ra=0x%08X\n",
+                   g_ps1_frame, s_memcard_status_calls, cpu->a0, cpu->a1, ret, cpu->ra);
+            fflush(stdout);
+        }
+        return 1;
+    }
+
+    if (addr == 0x80106A28u) {
+        static uint32_t s_font4bpp_calls = 0;
+        uint8_t* out = addr_ptr(0x80137EF8u);
+        if (!out) {
+            cpu->v0 = 0u;
+            return 1;
+        }
+        memset(out, 0, 96);
+        if (!psx_font_render_4bpp((uint16_t)cpu->a0, (uint16_t)cpu->a1, out)) {
+            cpu->v0 = 0u;
+            return 1;
+        }
+        cpu->v0 = 0x80137EF8u;
+        if (++s_font4bpp_calls <= 24u) {
+            printf("[FONT4BPP] f%u #%u ch=0x%04X kind=%u out=%02X %02X %02X %02X %02X %02X ra=0x%08X\n",
+                   g_ps1_frame, s_font4bpp_calls, (uint32_t)(cpu->a0 & 0xFFFFu),
+                   (uint32_t)(cpu->a1 & 0xFFFFu),
+                   out[0], out[1], out[2], out[3], out[4], out[5], cpu->ra);
+            fflush(stdout);
+        }
+        return 1;
+    }
+
+    if (addr == 0x8001C64Cu) {
+        static uint32_t s_stgetnext_hook = 0;
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        int handle_stream = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (++s_stgetnext_hook <= 12u || (s_stgetnext_hook % 4096u) == 0u) {
+            printf("[STGETNEXT-HOOK] f%u #%u gs=%u busy=%u a0=0x%08X a1=0x%08X ra=0x%08X\n",
+                   g_ps1_frame, s_stgetnext_hook, game_state, video_busy, cpu->a0, cpu->a1, cpu->ra);
+            fflush(stdout);
+        }
+        if (game_state <= 1u && video_busy != 0u) {
+            handle_stream = 1;
+        } else if (game_state == 5u && (video_busy != 0u || cpu->ra == 0x801B97E8u)) {
+            handle_stream = 1;
+            if (video_busy == 0u) {
+                uint32_t one = 1u;
+                memcpy(&g_ram[0x3C728], &one, sizeof(one));
+                video_busy = 1u;
+            }
+        }
+        if (handle_stream) {
+            static const uint32_t k_fake_stream_header_addr = 0x1F8003A0u;
+            const uint16_t width = 320u;
+            const uint16_t height = 240u;
+            uint32_t zero = 0u;
+            uint8_t* out_addr = cpu->a0 ? addr_ptr(cpu->a0) : NULL;
+            uint8_t* out_header = cpu->a1 ? addr_ptr(cpu->a1) : NULL;
+
+            run_sel_stream_player();
+
+            memset(&g_scratch[0x3A0], 0, 0x20);
+            memcpy(&g_scratch[0x3B0], &width, sizeof(width));
+            memcpy(&g_scratch[0x3B2], &height, sizeof(height));
+            if (out_addr) {
+                memcpy(out_addr, &zero, sizeof(zero));
+            }
+            if (out_header) {
+                memcpy(out_header, &k_fake_stream_header_addr, sizeof(k_fake_stream_header_addr));
+            }
+
+            cpu->v0 = 0; /* "sector ready": StreamNext returns addr==0, StreamNextVlc exits cleanly. */
+            return 1;
+        }
+    }
+
+    /* 0x801B410C = HandleTitleScreen — do not consume it here as a stream
+     * helper. Let it run naturally and JAL into the helpers we hook below. */
+
+    if (addr == 0x801B97BCu) {
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (game_state <= 1u || (video_busy != 0u && game_state == 5u)) {
+            if (video_busy != 0u) run_sel_stream_player();
+            cpu->v0 = 0;
+            return 1;
+        }
+    }
+
+    if (addr == 0x801B994Cu) {
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (game_state <= 1u || (video_busy != 0u && game_state == 5u)) {
+            if (video_busy != 0u) run_sel_stream_player();
+            cpu->v0 = 0;
+            return 1;
+        }
+    }
+
+    if (addr == 0x801B9C80u) {
+        uint32_t game_state = 0;
+        uint32_t video_busy = 0;
+        memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+        memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+        if (game_state <= 1u || (video_busy != 0u && game_state == 5u)) {
+            if (video_busy != 0u) run_sel_stream_player();
+            cpu->v0 = 0;
+            return 1;
+        }
+    }
+
     /* ---- CD subsystem init: register callbacks and return success ---- */
     if (addr == 0x8001930Cu) {
         static int s_logged = 0;
@@ -6990,15 +12478,38 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 /* a0 = DRAWENV struct pointer; command buffer at a0+0x1C (word offset 7) */
                 uint32_t buf_addr = cpu->a0 + 0x1C;
                 uint8_t* buf = addr_ptr(buf_addr);
+                int16_t clip_x = 0, clip_y = 0, clip_w = 0, clip_h = 0;
+                int16_t ofs_x = 0, ofs_y = 0;
+                uint8_t dtd = 0, dfe = 0, isbg = 0, r0 = 0, g0 = 0, b0 = 0;
+                if (addr_ptr(cpu->a0)) {
+                    memcpy(&clip_x, addr_ptr(cpu->a0 + 0x00), 2);
+                    memcpy(&clip_y, addr_ptr(cpu->a0 + 0x02), 2);
+                    memcpy(&clip_w, addr_ptr(cpu->a0 + 0x04), 2);
+                    memcpy(&clip_h, addr_ptr(cpu->a0 + 0x06), 2);
+                    memcpy(&ofs_x,  addr_ptr(cpu->a0 + 0x08), 2);
+                    memcpy(&ofs_y,  addr_ptr(cpu->a0 + 0x0A), 2);
+                    memcpy(&dtd,    addr_ptr(cpu->a0 + 0x16), 1);
+                    memcpy(&dfe,    addr_ptr(cpu->a0 + 0x17), 1);
+                    memcpy(&isbg,   addr_ptr(cpu->a0 + 0x18), 1);
+                    memcpy(&r0,     addr_ptr(cpu->a0 + 0x19), 1);
+                    memcpy(&g0,     addr_ptr(cpu->a0 + 0x1A), 1);
+                    memcpy(&b0,     addr_ptr(cpu->a0 + 0x1B), 1);
+                }
                 if (buf) {
                     uint32_t hdr, w1, w2, w3;
                     memcpy(&hdr, buf, 4); memcpy(&w1, buf+4, 4);
                     memcpy(&w2, buf+8, 4); memcpy(&w3, buf+12, 4);
-                    printf("[PUT-DRAW-ENV] #%u f%u a0=0x%08X buf=0x%08X hdr=%08X w1=%08X w2=%08X w3=%08X\n",
-                           s_pde, g_ps1_frame, cpu->a0, buf_addr, hdr, w1, w2, w3);
+                    printf("[PUT-DRAW-ENV] #%u f%u a0=0x%08X clip=(%d,%d %dx%d) ofs=(%d,%d) dtd=%u dfe=%u isbg=%u bg=(%u,%u,%u) buf=0x%08X hdr=%08X w1=%08X w2=%08X w3=%08X\n",
+                           s_pde, g_ps1_frame, cpu->a0,
+                           clip_x, clip_y, clip_w, clip_h, ofs_x, ofs_y,
+                           dtd, dfe, isbg, r0, g0, b0,
+                           buf_addr, hdr, w1, w2, w3);
                 } else {
-                    printf("[PUT-DRAW-ENV] #%u f%u a0=0x%08X buf=0x%08X (NULL)\n",
-                           s_pde, g_ps1_frame, cpu->a0, buf_addr);
+                    printf("[PUT-DRAW-ENV] #%u f%u a0=0x%08X clip=(%d,%d %dx%d) ofs=(%d,%d) dtd=%u dfe=%u isbg=%u bg=(%u,%u,%u) buf=0x%08X (NULL)\n",
+                           s_pde, g_ps1_frame, cpu->a0,
+                           clip_x, clip_y, clip_w, clip_h, ofs_x, ofs_y,
+                           dtd, dfe, isbg, r0, g0, b0,
+                           buf_addr);
                 }
                 fflush(stdout);
             }
@@ -7070,10 +12581,25 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
          * Override: return 1 so the callback dispatch path is reachable. */
         case 0x80015650u: {
             static uint32_t s_15650_calls = 0;
-            cpu->v0 = 1u;
+            const int force_idle = (g_force_cd_idle_frame != 0u &&
+                                    g_force_cd_idle_frame == g_ps1_frame);
+            uint8_t s2_byte = 0xFFu;
+            uint32_t s2_phys = 0u;
+            if (force_idle && cpu->s2 >= 0x80000000u && cpu->s2 < 0x80200000u) {
+                s2_phys = cpu->s2 - 0x80000000u;
+                g_ram[s2_phys] = 5u;
+                s2_byte = g_ram[s2_phys];
+            }
+            cpu->v0 = force_idle ? 0u : 1u;
             if (++s_15650_calls <= 5 || (s_15650_calls % 240u) == 0u) {
-                printf("[CD-AVAIL] f%u func_80015650 → v0=1 (CD data available)\n",
-                       g_ps1_frame);
+                printf("[CD-AVAIL] f%u func_80015650 → v0=%u%s",
+                       g_ps1_frame, cpu->v0,
+                       force_idle ? " (forced idle)" : " (CD data available)");
+                if (force_idle) {
+                    printf(" s2=0x%08X phys=0x%05X *s2=0x%02X",
+                           cpu->s2, s2_phys, s2_byte);
+                }
+                printf("\n");
                 fflush(stdout);
             }
             return 1;
@@ -7089,6 +12615,17 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             static uint32_t s_19B98_calls = 0;
             static uint32_t s_19B98_cycle = 0;
             ++s_19B98_calls;
+            maybe_resolve_stalled_video_playback();
+            if (g_force_cd_idle_frame != 0u && g_force_cd_idle_frame == g_ps1_frame) {
+                g_ram[0x32D80] = 5u;
+                cpu->v0 = 0u;
+                if (s_19B98_calls <= 10 || (s_19B98_calls % 480u) == 0u) {
+                    printf("[CD-STATUS] f%u func_80019B98 #%u → v0=0x%04X (forced idle, D80=0x%02X)\n",
+                           g_ps1_frame, s_19B98_calls, cpu->v0, g_ram[0x32D80]);
+                    fflush(stdout);
+                }
+                return 1;
+            }
             /* Return 0x06 on the first call of each cycle, then 0. 
              * A110 loops: call 19B98 → if nonzero → process callbacks → loop.
              * Returning 0 exits the loop so the function can return. */
@@ -7107,13 +12644,110 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             return 1;
         }
 
+        /* Castlevania libcd entrypoints (real SOTN addresses).
+         * The older 0x80065470/0x800659BC hooks are for a different game and do not
+         * affect DRA's DoCdCommand path. */
+        case 0x80019570u: {
+            if (cpu->a1 != 0u) {
+                uint8_t* result = addr_ptr(cpu->a1);
+                if (result) {
+                    memset(result, 0, 8);
+                }
+            }
+            cpu->v0 = 0x02u; /* CdlComplete */
+            return 1;
+        }
+
+        case 0x800195E0u:
+        case 0x80019718u: {
+            uint8_t cmd = (uint8_t)cpu->a0;
+            uint8_t* param = cpu->a1 ? addr_ptr(cpu->a1) : NULL;
+            uint8_t* result = (addr == 0x800195E0u && cpu->a2 != 0u) ? addr_ptr(cpu->a2) : NULL;
+            if (result) {
+                memset(result, 0, 8);
+            }
+            switch (cmd) {
+            case 0x02u: { /* CdlSetloc */
+                if (param) {
+                    uint8_t bm = param[0];
+                    uint8_t bs = param[1];
+                    uint8_t bf = param[2];
+                    uint32_t m = (uint32_t)((bm >> 4) * 10 + (bm & 0xFu));
+                    uint32_t s = (uint32_t)((bs >> 4) * 10 + (bs & 0xFu));
+                    uint32_t f = (uint32_t)((bf >> 4) * 10 + (bf & 0xFu));
+                    uint32_t lba = (m * 60u + s) * 75u + f;
+                    if (lba >= 150u) {
+                        lba -= 150u;
+                    }
+                    g_cdrom_lba = lba;
+                }
+                break;
+            }
+            case 0x06u: { /* CdlReadN */
+                extern void xa_audio_seek(uint32_t lba);
+                xa_audio_seek(g_cdrom_lba);
+                break;
+            }
+            case 0x08u: /* CdlStop */
+            case 0x09u: { /* CdlPause */
+                extern void xa_audio_seek(uint32_t lba);
+                xa_audio_seek(0u);
+                break;
+            }
+            case 0x0Du: { /* CdlSetfilter */
+                if (param) {
+                    extern void xa_audio_set_filter(uint8_t file, uint8_t channel);
+                    xa_audio_set_filter(param[0], param[1]);
+                }
+                break;
+            }
+            case 0x0Eu: /* CdlSetmode */
+            case 0x01u: /* CdlNop */
+            case 0x0Bu: /* CdlMute */
+            case 0x0Cu: /* CdlDemute */
+            default:
+                break;
+            }
+            cpu->v0 = 1u;
+            return 1;
+        }
+
+        case 0x8001C080u: {
+            uint32_t sector_count = cpu->a0;
+            uint32_t dest = cpu->a1;
+            uint8_t sec_buf[2048];
+            for (uint32_t i = 0; i < sector_count; ++i) {
+                if (!psx_cdrom_read_sector(g_cdrom_lba + i, sec_buf)) {
+                    cpu->v0 = 0u;
+                    return 1;
+                }
+                psx_runtime_load(dest + i * 2048u, sec_buf, 2048u);
+            }
+            g_cdrom_lba += sector_count;
+            cpu->v0 = 1u;
+            return 1;
+        }
+
+        case 0x8001C188u: {
+            if (cpu->a1 != 0u) {
+                uint8_t* result = addr_ptr(cpu->a1);
+                if (result) {
+                    memset(result, 0, 8);
+                }
+            }
+            cpu->v0 = 0u;
+            return 1;
+        }
+
         case 0x80016C54u: {
             /* VSync — DRA.BIN's MainGame loop calls this every frame.
              * If running inside the game fiber, yield back to the pump loop.
              * Otherwise (boot or non-fiber context), present + continue. */
             extern void psx_present_frame(void);
             static uint32_t s_vsync_calls = 0;
-            if (++s_vsync_calls <= 20 || (s_vsync_calls % 240u) == 0u) {
+            ++s_vsync_calls;
+            if (s_vsync_calls <= 20 || (s_vsync_calls % 240u) == 0u ||
+                (g_ps1_frame >= 807u && g_ps1_frame < 830u)) {
                 uint32_t c0f8 = 0, c73ec = 0, c734 = 0, d1c0 = 0, b62b0 = 0;
                 memcpy(&c0f8, &g_ram[0x3C0F8], 4);
                 memcpy(&c73ec, &g_ram[0x973EC], 4);
@@ -7140,8 +12774,19 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 memcpy(cpu, g_game_saved, MIPS_GP_REGS * sizeof(uint32_t));
                 return 1;  /* handled — don't run compiled VSync */
             }
-            /* Non-game-fiber context (boot, scheduler): present + run normally */
+            /* Non-game-fiber context (boot or interpreter-based gameplay):
+             * present the frame, then end this interpreted frame cleanly. */
             psx_present_frame();
+            g_vsync_frame_done = 1;
+            return 1;  /* handled — skip compiled VSync */
+        }
+
+        case 0x8001290Cu: {
+            if (g_ps1_frame >= 807u && g_ps1_frame < 830u) {
+                printf("[DRAWSYNC] f%u mode=%u ra=0x%08X\n",
+                       g_ps1_frame, cpu->a0, cpu->ra);
+                fflush(stdout);
+            }
             return 0;
         }
 
@@ -7150,6 +12795,20 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
              * Let compiled code handle it naturally. The timer override (+33 per
              * call) ensures the loop fires after ~29 iterations. */
             static uint32_t s_a110_calls = 0;
+            uint32_t game_state = 0;
+            uint32_t video_busy = 0;
+            memcpy(&game_state, &g_ram[0x3C734], sizeof(game_state));
+            memcpy(&video_busy, &g_ram[0x3C728], sizeof(video_busy));
+            if ((game_state == 5u && video_busy != 0u) ||
+                (g_force_cd_idle_frame != 0u && g_force_cd_idle_frame == g_ps1_frame)) {
+                if (++s_a110_calls <= 20 || (s_a110_calls % 240u) == 0u) {
+                    printf("[A110-INTERP] f%u call#%u interpreting A110 in gs=%u busy=%u D80=0x%02X\n",
+                           g_ps1_frame, s_a110_calls, game_state, video_busy, g_ram[0x32D80]);
+                    fflush(stdout);
+                }
+                mips_interpret(cpu, 0x8001A110u);
+                return 1;
+            }
             if (++s_a110_calls <= 10 || (s_a110_calls % 240u) == 0u) {
                 printf("[A110-RUN] f%u call#%u compiled (ra=0x%08X a0=0x%08X)\n",
                        g_ps1_frame, s_a110_calls, cpu->ra, cpu->a0);
@@ -7171,8 +12830,6 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         }
 
         case 0x8001A65Cu: {
-            /* func_8001A65C reads RAM[0x32AB0] (display callback) and falls
-             * through to func_8001A664. Let compiled code handle it. */
             static uint32_t s_a65c_hits = 0;
             if (++s_a65c_hits <= 10u || (s_a65c_hits % 240u) == 0u) {
                 uint32_t cb = 0;
@@ -7191,6 +12848,15 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
              * Re-entry guard: if we're already interpreting A664 (e.g. via
              * A664 → A110 → callback → A664), fall through to compiled stub. */
             if (s_interp_a664) return 0;   /* allow compiled stub on re-entry */
+            if (g_force_cd_idle_frame != 0u && g_force_cd_idle_frame == g_ps1_frame) {
+                static uint32_t s_a664_force_short = 0;
+                cpu->a3 = 1u;
+                if (++s_a664_force_short <= 20u || (s_a664_force_short % 240u) == 0u) {
+                    printf("[A664-FORCE] f%u hits=%u forcing a3=1 for short return path\n",
+                           g_ps1_frame, s_a664_force_short);
+                    fflush(stdout);
+                }
+            }
             s_interp_a664 = 1;
             mips_interpret(cpu, 0x8001A664u);
             s_interp_a664 = 0;
@@ -7216,8 +12882,10 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             }
             if (s_interp_split_16074_16124) {
                 static uint32_t s_split_hits = 0;
+                int trace_split = trace_cv_split_interpret_enabled();
                 ++s_split_hits;
-                if (s_split_hits <= 20u || (s_split_hits % 240u) == 0u) {
+                if (trace_split &&
+                    (s_split_hits <= 20u || (s_split_hits % 240u) == 0u)) {
                     printf("[SPLIT-HOOK] f%u hits=%u addr=0x%08X a0=0x%08X a1=0x%08X ra=0x%08X\n",
                            g_ps1_frame, s_split_hits, addr, cpu->a0, cpu->a1, cpu->ra);
                     fflush(stdout);
@@ -7238,7 +12906,8 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 uint32_t t2_before = cpu->t2;
                 uint32_t t3_before = cpu->t3;
                 mips_interpret(cpu, addr);
-                if (s_split_hits <= 20u || (s_split_hits % 240u) == 0u) {
+                if (trace_split &&
+                    (s_split_hits <= 20u || (s_split_hits % 240u) == 0u)) {
                     printf("[SPLIT-RET] f%u hits=%u addr=0x%08X sp=0x%08X->0x%08X v0=0x%08X->0x%08X v1=0x%08X->0x%08X t1=0x%08X->0x%08X t2=0x%08X->0x%08X t3=0x%08X->0x%08X a1=0x%08X ra=0x%08X\n",
                            g_ps1_frame, s_split_hits, addr, sp_before, cpu->sp,
                            v0_before, cpu->v0, v1_before, cpu->v1,
@@ -7269,6 +12938,18 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         case 0x8001AA74u:
         case 0x8001ABB0u: {
             static int s_interp_a8a8_callees = -1;
+            static uint32_t s_force_a9e0_exit = 0;
+            if (addr == 0x8001A9E0u &&
+                g_force_cd_idle_frame != 0u &&
+                g_force_cd_idle_frame == g_ps1_frame) {
+                if (++s_force_a9e0_exit <= 20u || (s_force_a9e0_exit % 240u) == 0u) {
+                    printf("[A9E0-FORCE] f%u routing stalled FMV exit through A9F0 (D80=0x%02X)\n",
+                           g_ps1_frame, g_ram[0x32D80]);
+                    fflush(stdout);
+                }
+                mips_interpret(cpu, 0x8001A9F0u);
+                return 1;
+            }
             if (s_interp_a8a8_callees < 0) {
                 const char* env = getenv("PSX_CV_INTERPRET_A8A8_CALLEES");
                 s_interp_a8a8_callees = (env && env[0] && env[0] != '0') ? 1 : 0;
@@ -7288,6 +12969,16 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             static uint32_t s_a8a8_hits = 0;
             static int s_force_a8a8_a1_otcur = -1;
             ++s_a8a8_hits;
+            if (g_force_cd_idle_frame != 0u && g_force_cd_idle_frame == g_ps1_frame) {
+                static uint32_t s_force_a8a8_exit = 0;
+                if (++s_force_a8a8_exit <= 20u || (s_force_a8a8_exit % 240u) == 0u) {
+                    printf("[A8A8-FORCE] f%u routing stalled FMV exit through A9F0 (D80=0x%02X)\n",
+                           g_ps1_frame, g_ram[0x32D80]);
+                    fflush(stdout);
+                }
+                mips_interpret(cpu, 0x8001A9F0u);
+                return 1;
+            }
             if (s_force_a8a8_a1_otcur < 0) {
                 const char* env = getenv("PSX_CV_FORCE_A8A8_A1_OTCUR");
                 s_force_a8a8_a1_otcur = (env && env[0] && env[0] != '0') ? 1 : 0;
@@ -7580,13 +13271,21 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
             memcpy(&kon_lo, &g_ram[0x9B690], 2);
             memcpy(&kon_hi, &g_ram[0x9B692], 2);
             static uint32_t s_flush = 0; ++s_flush;
-            /* [FLUSH-KON] first 10 — re-enable: if (s_flush <= 10) printf(...); */
+            if (kon_lo != 0u || kon_hi != 0u || s_flush <= 20u) {
+                printf("[FLUSH-KON] f%u hits=%u kon_lo=0x%04X kon_hi=0x%04X ra=0x%08X\n",
+                       g_ps1_frame, s_flush, kon_lo, kon_hi, cpu->ra);
+                fflush(stdout);
+            }
             break;
         }
         case 0x8007028Cu: {
             /* FUN_8007028c — try to key on voice.  Log entry args to diagnose guard failures. */
             static uint32_t s_k28 = 0; ++s_k28;
-            /* [KON-TRY] first 20 — re-enable: if (s_k28 <= 20) printf(...); */
+            if (s_k28 <= 60u) {
+                printf("[KON-TRY] f%u hits=%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X\n",
+                       g_ps1_frame, s_k28, cpu->a0, cpu->a1, cpu->a2, cpu->a3, cpu->ra);
+                fflush(stdout);
+            }
             break;
         }
         /* Main polling loop functions */
@@ -7685,14 +13384,67 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         }
         case 0x80016940u: { static uint32_t s_ff = 0; ++s_ff; /* [TRACE] FUN_80016940 (frame-flip) */ break; }
         case 0x80060C10u: { static uint32_t s_c10 = 0; ++s_c10; /* [GPU-Q] first 10 — re-enable printf when investigating GPU queue */ break; }
-        case 0x80060624u: { static uint32_t s_624 = 0; if (++s_624 <= 10) { printf("[TRACE] FUN_80060624 (LoadImage) call #%u a0=0x%08X a1=0x%08X\n", s_624, cpu->a0, cpu->a1); fflush(stdout); } break; }
+        case 0x80060624u: {
+            extern void gpu_submit_word(uint32_t w);
+            uint8_t* rect_ptr = addr_ptr(cpu->a0);
+            uint8_t* data_ptr = addr_ptr(cpu->a1);
+            if (!rect_ptr || !data_ptr) {
+                static uint32_t s_624_null = 0;
+                if (++s_624_null <= 5u) {
+                    printf("[LoadImage] NULL ptr a0=0x%08X a1=0x%08X\n", cpu->a0, cpu->a1);
+                    fflush(stdout);
+                }
+                cpu->v0 = 0;
+                return 1;
+            }
+
+            int16_t rx, ry, rw, rh;
+            memcpy(&rx, rect_ptr + 0, 2);
+            memcpy(&ry, rect_ptr + 2, 2);
+            memcpy(&rw, rect_ptr + 4, 2);
+            memcpy(&rh, rect_ptr + 6, 2);
+
+            static uint32_t s_624 = 0;
+            if (++s_624 <= 30u) {
+                printf("[LoadImage] #%u f%u rect=(%d,%d,%d,%d) data=0x%08X\n",
+                       s_624, g_ps1_frame, rx, ry, rw, rh, cpu->a1);
+                fflush(stdout);
+            }
+
+            uint16_t dx = (uint16_t)rx & 0x3FFu;
+            uint16_t dy = (uint16_t)ry & 0x1FFu;
+            uint16_t dw = (uint16_t)rw;
+            uint16_t dh = (uint16_t)rh;
+            if (dw == 0u) dw = 0x400u;
+            if (dh == 0u) dh = 0x200u;
+            if ((uint32_t)dx + (uint32_t)dw > 1024u) dw = (uint16_t)(1024u - dx);
+            if ((uint32_t)dy + (uint32_t)dh > 512u)  dh = (uint16_t)(512u - dy);
+
+            gpu_submit_word(0xA0000000u);
+            gpu_submit_word(((uint32_t)dy << 16) | (uint32_t)dx);
+            gpu_submit_word(((uint32_t)dh << 16) | (uint32_t)dw);
+
+            {
+                uint32_t num_pixels = (uint32_t)dw * (uint32_t)dh;
+                uint32_t num_words = (num_pixels + 1u) / 2u;
+                for (uint32_t i = 0; i < num_words; i++) {
+                    uint32_t w;
+                    memcpy(&w, data_ptr + i * 4u, 4);
+                    gpu_submit_word(w);
+                }
+            }
+
+            cpu->v0 = 0;
+            return 1;
+        }
         case 0x80060EF0u: { static uint32_t s_ef0 = 0; if (++s_ef0 <= 5) { printf("[TRACE] FUN_80060EF0 (GPU dispatch) call #%u\n", s_ef0); fflush(stdout); } break; }
         case 0x80067E84u: break; /* [TRACE] FUN_80067E84 (IRQ disable B) */
         case 0x8005DFD8u: {
             /* addPrim — count per frame, let compiled code run */
             static uint32_t s_addprim_hits = 0;
             g_addprim_count++;
-            if (++s_addprim_hits <= 10 || (s_addprim_hits % 120u) == 0u) {
+            if (++s_addprim_hits <= 10 || (s_addprim_hits % 120u) == 0u ||
+                (g_ps1_frame >= 1790u && g_ps1_frame <= 1810u)) {
                 printf("[ADDPRIM-HIT] f%u hits=%u a0=0x%08X a1=0x%08X\n",
                        g_ps1_frame, s_addprim_hits, cpu->a0, cpu->a1);
                 fflush(stdout);
@@ -7764,7 +13516,33 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         case 0x80016FD8u: { static uint32_t s_fd8 = 0; if (++s_fd8 <= 5) { printf("[TRACE] func_80016FD8\n"); fflush(stdout); } break; }
         case 0x800170F8u: { static uint32_t s_f8 = 0; if (++s_f8 <= 5) { printf("[TRACE] func_800170F8\n"); fflush(stdout); } break; }
         case 0x80067C30u: { static uint32_t s_gc = 0; if (++s_gc <= 5) { printf("[TRACE] func_80067C30 call #%u\n", s_gc); fflush(stdout); } break; }
-        case 0x8005F420u: { static uint32_t s_pde = 0; if (++s_pde <= 5) { printf("[TRACE] func_8005F420 (PutDispEnv) call #%u\n", s_pde); fflush(stdout); } break; }
+        case 0x8005F420u: {
+            static uint32_t s_pde = 0;
+            if (++s_pde <= 10) {
+                int16_t disp_x = 0, disp_y = 0, disp_w = 0, disp_h = 0;
+                int16_t scr_x = 0, scr_y = 0, scr_w = 0, scr_h = 0;
+                uint8_t isinter = 0, isrgb24 = 0;
+                if (addr_ptr(cpu->a0)) {
+                    memcpy(&disp_x,  addr_ptr(cpu->a0 + 0x00), 2);
+                    memcpy(&disp_y,  addr_ptr(cpu->a0 + 0x02), 2);
+                    memcpy(&disp_w,  addr_ptr(cpu->a0 + 0x04), 2);
+                    memcpy(&disp_h,  addr_ptr(cpu->a0 + 0x06), 2);
+                    memcpy(&scr_x,   addr_ptr(cpu->a0 + 0x08), 2);
+                    memcpy(&scr_y,   addr_ptr(cpu->a0 + 0x0A), 2);
+                    memcpy(&scr_w,   addr_ptr(cpu->a0 + 0x0C), 2);
+                    memcpy(&scr_h,   addr_ptr(cpu->a0 + 0x0E), 2);
+                    memcpy(&isinter, addr_ptr(cpu->a0 + 0x10), 1);
+                    memcpy(&isrgb24, addr_ptr(cpu->a0 + 0x11), 1);
+                }
+                printf("[PUT-DISP-ENV] #%u f%u a0=0x%08X disp=(%d,%d %dx%d) screen=(%d,%d %dx%d) inter=%u rgb24=%u\n",
+                       s_pde, g_ps1_frame, cpu->a0,
+                       disp_x, disp_y, disp_w, disp_h,
+                       scr_x, scr_y, scr_w, scr_h,
+                       isinter, isrgb24);
+                fflush(stdout);
+            }
+            break;
+        }
         case 0x80067D78u: { static uint32_t s_gd = 0; if (++s_gd <= 3) { printf("[TRACE] func_80067D78 call #%u a0=0x%X a1=0x%X\n", s_gd, cpu->a0, cpu->a1); fflush(stdout); } break; }
 
         /* ================================================================
@@ -7865,10 +13643,16 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
              * inverts to active-high, returns in v0.
              * psx_set_pad1() writes ~buttons (active-low) there each frame. */
             uint16_t al = (uint16_t)(g_ram[0x9eb5a] | ((uint16_t)g_ram[0x9eb5b] << 8));
-            cpu->v0 = (uint32_t)(uint16_t)(~al);
-            { static uint32_t s_28d = 0; ++s_28d;
-              /* [PAD-READ] first 5 + every 500 + DIAG — commented out (re-enable for pad debugging) */
-              /* [PAD-ATCK] Circle/Square seen — commented out (re-enable for attack debugging) */
+            uint16_t buttons = (uint16_t)(~al);
+            cpu->v0 = (uint32_t)buttons;
+            { static uint32_t s_28d = 0; static uint16_t s_last_buttons = 0xFFFFu; ++s_28d;
+              if (cv_trace_pad_flow_enabled() &&
+                  (s_28d <= 12u || buttons != s_last_buttons || buttons != 0u || (s_28d % 500u) == 0u)) {
+                  printf("[PAD-READ] f%u #%u raw=0x%04X buttons=0x%04X ra=0x%08X\n",
+                         g_ps1_frame, s_28d, al, buttons, cpu->ra);
+                  fflush(stdout);
+              }
+              s_last_buttons = buttons;
             }
             return 1;
         }
@@ -7884,18 +13668,72 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         }
     }
 
+    if (addr == 0x80131F68u) {
+        static uint32_t s_sound_gate_logs = 0;
+        uint32_t c9a4 = 0u;
+        int32_t d_8013b61c = 0;
+        int16_t d_8013901c = 0;
+        uint8_t d_801390a0 = 0u;
+        int32_t d_800bd1c4 = 0;
+        memcpy(&c9a4, &g_ram[0x3C9A4], sizeof(c9a4));
+        memcpy(&d_8013b61c, &g_ram[0x13B61C], sizeof(d_8013b61c));
+        memcpy(&d_8013901c, &g_ram[0x13901C], sizeof(d_8013901c));
+        memcpy(&d_801390a0, &g_ram[0x1390A0], sizeof(d_801390a0));
+        memcpy(&d_800bd1c4, &g_ram[0x0BD1C4], sizeof(d_800bd1c4));
+        if (c9a4 == 0x12u && (++s_sound_gate_logs <= 120u || (s_sound_gate_logs % 120u) == 0u)) {
+            int gate = (d_8013b61c != 0) || (d_8013901c != 0);
+            printf("[SEL-12-GATE] f%u gate=%d B61C=%d 3901C=%d 390A0=%u BD1C4=%d ra=0x%08X\n",
+                   g_ps1_frame, gate, d_8013b61c, (int)d_8013901c, (unsigned)d_801390a0,
+                   d_800bd1c4, cpu->ra);
+            fflush(stdout);
+        }
+    }
+
+    if (addr == 0x801361F8u) {
+        static uint32_t s_sound_tick_hits = 0;
+        int16_t queue_pos = 0;
+        int16_t queue0 = 0;
+        uint8_t cd_step = 0u;
+        int16_t cmd_read = 0;
+        int16_t cmd_write = 0;
+        int16_t cmd_next = 0;
+        uint8_t seq_playing = 0u;
+        uint8_t seq_state = 0u;
+        s_sound_tick_called_frame = g_ps1_frame;
+        memcpy(&queue_pos, &g_ram[0x1396F4], sizeof(queue_pos));
+        memcpy(&queue0, &g_ram[0x139868], sizeof(queue0));
+        memcpy(&cd_step, &g_ram[0x13AE80], sizeof(cd_step));
+        memcpy(&cmd_read, &g_ram[0x139A68], sizeof(cmd_read));
+        memcpy(&cmd_write, &g_ram[0x139A70], sizeof(cmd_write));
+        memcpy(&seq_playing, &g_ram[0x139810], sizeof(seq_playing));
+        memcpy(&seq_state, &g_ram[0x1390C4], sizeof(seq_state));
+        if (cmd_read >= 0 && cmd_read < 0x100) {
+            memcpy(&cmd_next, &g_ram[0x13B3E8u + (uint32_t)(uint16_t)cmd_read * 2u],
+                   sizeof(cmd_next));
+        }
+        if (++s_sound_tick_hits <= 160u ||
+            (g_ps1_frame >= 140u && g_ps1_frame <= 170u) ||
+            cmd_read != cmd_write || seq_playing != 0u || seq_state != 0u) {
+            printf("[SOUND-TICK] f%u hits=%u qpos=%d q0=%d step=%u cmd=%d->%d next=0x%04X seq=0x%02X state=0x%02X ra=0x%08X\n",
+                   g_ps1_frame, s_sound_tick_hits, (int)queue_pos, (int)queue0,
+                   (unsigned)cd_step, (int)cmd_read, (int)cmd_write,
+                   (unsigned)(uint16_t)cmd_next, (unsigned)seq_playing,
+                   (unsigned)seq_state, cpu->ra);
+            fflush(stdout);
+        }
+    }
+
     /* FUN_80060AE4 — GPU state cache writer (called by PutDrawEnv / PutDispEnv).
      * Ghidra decompile:
      *   *DAT_80090d70 = param_1;
      *   *(char *)((param_1 >> 0x18) + 0x8009b18c) = (char)param_1;
      * It stores GP0/GP1 commands in a RAM-side cache only — never writes to GPU
-     * hardware port 0x1F801810.  That means E1-E6 drawing-area/offset/mode
-     * commands never reach our OpenGLRenderer.  We intercept here and forward
-     * GP0 environment commands (E1-E6) to the GPU interpreter so the renderer's
-     * drawing area and offset are kept in sync.  Return 0 so MIPS also runs to
-     * update the RAM cache as expected by the rest of the game. */
+     * hardware ports.  Forward the environment/display commands to the GPU
+     * interpreter so the renderer stays in sync while the game still updates the
+     * RAM-side cache it expects. */
     if (addr == 0x80060AE4u) {
         extern void gpu_submit_word(uint32_t w);
+        extern void gpu_write_gp1(uint32_t cmd);
         uint32_t cmd = cpu->a0;
         uint8_t  cmd_byte = (uint8_t)(cmd >> 24);
         static uint32_t s_e_log = 0;
@@ -7905,6 +13743,9 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                 fflush(stdout);
             }
             gpu_submit_word(cmd);
+        }
+        if (cmd_byte >= 0x03u && cmd_byte <= 0x08u) {
+            gpu_write_gp1(cmd);
         }
         /* Track E3/E4/E5 for frame diagnostics */
         if (cmd_byte == 0xE3) {
@@ -7961,6 +13802,12 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
      * Our runtime never fires IRQs, so it would spin for up to 0x3C0000
      * iterations before timing out. Override: return 2 = command OK. */
     if (addr == 0x80065470u) {
+        if (cpu->a1 != 0u) {
+            uint8_t* result = addr_ptr(cpu->a1);
+            if (result) {
+                memset(result, 0, 8);
+            }
+        }
         cpu->v0 = 2;
         return 1;
     }
@@ -8000,14 +13847,20 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         return 1;
     }
 
-    /* FUN_800659BC — CDROM command dispatcher.
-     * Intercepts all CD-ROM commands.  Returns 0 (success) for most.
-     * CdlSeekL (cmd=2): reads the BCD MSF from the CdlLOC pointer in a1,
-     * converts to an absolute LBA, and stores in g_cdrom_lba for CdRead. */
+    /* FUN_800659BC — CdControl(com, param, result).
+     * PSX CdControl returns non-zero on success.  Returning 0 here traps
+     * DoCdCommand()-driven XA startup at step 1 forever (q=[4,10,0] in SEL 0x12),
+     * so emulate a successful command completion and clear the status byte. */
     if (addr == 0x800659BCu) {
         uint8_t cmd = (uint8_t)cpu->a0;
+        if (cpu->a2 != 0u) {
+            uint8_t* result = addr_ptr(cpu->a2);
+            if (result) {
+                memset(result, 0, 8);
+            }
+        }
         if (cmd == 2u && cpu->a1 != 0u) {
-            /* CdlSeekL — a1 = pointer to CdlLOC {minute, second, frame, ?} (BCD) */
+            /* CdlSetloc/CdlSeekL-style location command. */
             uint8_t* p = addr_ptr(cpu->a1);
             if (p) {
                 uint8_t bm = p[0], bs = p[1], bf = p[2];
@@ -8026,7 +13879,7 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
                  * later title-music seek) is used to initialise video decoding. */
             }
         }
-        cpu->v0 = 0;
+        cpu->v0 = 1;
         return 1;
     }
 
@@ -8062,17 +13915,39 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         extern void gpu_abort_streaming(void);
         extern int g_in_drawtag;
         static uint32_t s_drawtag_hook_hits = 0;
+        static uint32_t s_dt_frame_last = 0xFFFFFFFFu;
+        static uint32_t s_dt_frame_count = 0;
         uint32_t ptr = cpu->a0;
         /* Normalize KUSEG → KSEG0 */
         if ((ptr & 0xFF000000u) == 0u && ptr != 0u) ptr |= 0x80000000u;
         static int s_drawtag = 0;
         int word_count = 0;
         uint32_t start_head = ptr;
+        if (g_ps1_frame != s_dt_frame_last) {
+            s_dt_frame_last = g_ps1_frame;
+            s_dt_frame_count = 0;
+        }
+        ++s_dt_frame_count;
         ++s_drawtag_hook_hits;
         if (s_drawtag_hook_hits <= 20u || (s_drawtag_hook_hits % 240u) == 0u) {
-            printf("[DRAWTAG-HOOK] f%u hits=%u a0=0x%08X ptr=0x%08X\n",
-                   g_ps1_frame, s_drawtag_hook_hits, cpu->a0, ptr);
+            printf("[DRAWTAG-HOOK] f%u hits=%u a0=0x%08X ptr=0x%08X call#%u/frame ra=0x%08X\n",
+                   g_ps1_frame, s_drawtag_hook_hits, cpu->a0, ptr,
+                   s_dt_frame_count, cpu->ra);
             fflush(stdout);
+        }
+
+        /* If the game already called DrawOTag this frame, skip the pump's redundant
+         * replay. Re-submitting the same OT is enough to recreate the frontend
+         * overlap/alternation artifacts, but only the pump uses this synthetic RA. */
+        if (s_dt_frame_count > 1u && cpu->ra == 0x80010EA4u) {
+            static uint32_t s_skip_count = 0;
+            if (++s_skip_count <= 20u || (s_skip_count % 240u) == 0u) {
+                printf("[DRAWTAG-SKIP-DUP] f%u skip duplicate pump DrawOTag call#%u (head=0x%08X)\n",
+                       g_ps1_frame, s_dt_frame_count, ptr);
+                fflush(stdout);
+            }
+            cpu->v0 = 0;
+            return 1;
         }
         g_in_drawtag = 1;
 
@@ -8453,6 +14328,8 @@ int psx_override_dispatch(CPUState* cpu, uint32_t addr) {
         extern void fmv_player_seek(uint32_t lba);
         extern int  fmv_player_is_active(void);
 
+        g_last_fmv_poll_frame = g_ps1_frame;
+
         /* Detect external skip: PS1 code set the skip flag (e.g. user pressed Enter).
          * This check runs BEFORE tick so we don't decode extra frames after skip.
          * Note: we never reach here with s_fmv_init==1 && flag==1 from our own
@@ -8596,10 +14473,10 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
  * _DAT_8009eb5a (g_ram[0x9eb5a]) as active-low pad data, then inverts it.
  * FUN_800223e0 calls FUN_80028D70 → stores result in _DAT_8009c9d8 →
  * computes _DAT_1f8001fc = held & ~prev_held (newly-pressed edge).
- * The game reads _DAT_1f8001fc for button events.
- *
- * We write ~buttons (active-low) to g_ram[0x9eb5a] so FUN_80028D70 returns
- * the correct active-high bitmask after inversion. */
+ * The game reads raw pad state through BIOS/libpad, but on this branch the
+ * title flow only becomes responsive if we also keep DRA's g_pads[] updated.
+ * We therefore mirror both the raw active-low bytes and the decoded g_pads[0]
+ * state from the same input source. */
 void psx_set_pad1(uint16_t buttons) {
     g_pad1_state = buttons;
     /* Arm INTERP-CALL trace window on Circle (0x2000) or Square (0x8000) press */
@@ -8617,6 +14494,15 @@ void psx_set_pad1(uint16_t buttons) {
     s_prev_buttons = buttons;
 
     uint16_t active_low = ~buttons;
+    if (cv_trace_pad_flow_enabled()) {
+        static uint16_t s_last_logged_buttons = 0xFFFFu;
+        if (buttons != s_last_logged_buttons) {
+            printf("[PAD-WRITE] f%u buttons=0x%04X raw=0x%04X\n",
+                   g_ps1_frame, buttons, active_low);
+            fflush(stdout);
+            s_last_logged_buttons = buttons;
+        }
+    }
     g_ram[0x9eb5a] = (uint8_t)(active_low & 0xFF);
     g_ram[0x9eb5b] = (uint8_t)(active_low >> 8);
     /* Clear pad transfer status byte (0x9EB58) — 0 = controller OK.
@@ -9016,17 +14902,474 @@ void cv_display_pump_frame(CPUState* cpu) {
             fflush(stdout);
         }
         if (g_fiber_game) {
+            cv_restore_saved_g_api_slice("pre-maingame");
             /* Switch to game fiber — it resumes MainGame where VSync yielded,
              * or starts fresh if this is the first frame */
             SwitchToFiber(g_fiber_game);
             /* Game fiber yielded at VSync — game regs saved in g_game_saved.
              * Increment frame counter since one game frame completed. */
             static uint32_t s_game_frames = 0;
-            if (++s_game_frames <= 20u || (s_game_frames % 240u) == 0u) {
+            ++s_game_frames;
+            if (s_game_frames <= 20u || (s_game_frames % 240u) == 0u ||
+                (g_ps1_frame >= 807u && g_ps1_frame < 830u)) {
                 printf("[CV-GAME] f%u game_frame=%u addPrim=%u\n",
                        g_ps1_frame, s_game_frames, g_addprim_count);
                 fflush(stdout);
             }
+        }
+    }
+
+    {
+        uint32_t game_state_after = 0;
+        uint32_t sub_state_after = 0;
+        uint32_t v_bafc_after = 0;
+        uint32_t v_c398_after = 0;
+        uint32_t video_busy_after = 0;
+        uint32_t menu_step_after = 0;
+        uint32_t eng_step_after = 0;
+        uint32_t stage_id_after = 0;
+        static uint32_t s_prev_game_state_after = UINT32_MAX;
+        static uint32_t s_gs2_enter_frame = 0;
+        static uint32_t s_prev_menu_ptrs[5];
+        static uint32_t s_saved_menu_ptrs[5];
+        static uint32_t s_saved_menu_table[100];
+        static int s_prev_menu_ptrs_init = 0;
+        memcpy(&game_state_after, &g_ram[0x3C734], 4);
+        memcpy(&sub_state_after, &g_ram[0x73060], 4);
+        memcpy(&v_bafc_after, &g_ram[0x6BAFC], 4);
+        memcpy(&v_c398_after, &g_ram[0x6C398], 4);
+        memcpy(&video_busy_after, &g_ram[0x3C728], 4);
+        memcpy(&menu_step_after, &g_ram[0x978F8], 4);
+        memcpy(&eng_step_after, &g_ram[0x3C9A4], 4);
+        memcpy(&stage_id_after, &g_ram[0x974A0u], 4);
+
+        /* Keep the title/new-game FMV path moving even when the original
+         * streaming fiber never reaches FUN_8001EFE8 on this frame.
+         * run_sel_stream_player() is already frame-gated internally, so calling
+         * it here only fills the missing canonical gs=0/5 tick. */
+        if (video_busy_after != 0u &&
+            (game_state_after == 0u || game_state_after == 5u) &&
+            g_last_fmv_poll_frame != g_ps1_frame) {
+            static uint32_t s_pump_fmv_ticks = 0;
+            if (++s_pump_fmv_ticks <= 20u || (s_pump_fmv_ticks % 240u) == 0u) {
+                uint32_t current_stream = 0;
+                memcpy(&current_stream, &g_ram[0x3C100], 4);
+                printf("[CV-FMV-PUMP] f%u tick gs=%u busy=%u stream=%u\n",
+                       g_ps1_frame, game_state_after, video_busy_after, current_stream);
+                fflush(stdout);
+            }
+            run_sel_stream_player();
+            memcpy(&video_busy_after, &g_ram[0x3C728], 4);
+        }
+
+        {
+            static const uint32_t k_menu_ptr_phys[5] = {
+                0xA83C8u, 0xA83CCu, 0xA83D0u, 0xA83D4u, 0xA83D8u
+            };
+            uint32_t cur_menu_ptrs[5];
+            for (int i = 0; i < 5; i++) {
+                memcpy(&cur_menu_ptrs[i], &g_ram[k_menu_ptr_phys[i]], 4);
+            }
+            if (!s_prev_menu_ptrs_init) {
+                memcpy(s_saved_menu_table, &g_ram[0xA8258], sizeof(s_saved_menu_table));
+                memcpy(s_prev_menu_ptrs, cur_menu_ptrs, sizeof(s_prev_menu_ptrs));
+                memcpy(s_saved_menu_ptrs, cur_menu_ptrs, sizeof(s_saved_menu_ptrs));
+                s_prev_menu_ptrs_init = 1;
+                printf("[MENU-PTRS] f%u init gs=%u sub=%u eng=0x%08X menustep=0x%08X p0=0x%08X p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X\n",
+                       g_ps1_frame, game_state_after, sub_state_after, eng_step_after, menu_step_after,
+                       cur_menu_ptrs[0], cur_menu_ptrs[1], cur_menu_ptrs[2], cur_menu_ptrs[3], cur_menu_ptrs[4]);
+                fflush(stdout);
+            } else if (memcmp(s_prev_menu_ptrs, cur_menu_ptrs, sizeof(s_prev_menu_ptrs)) != 0) {
+                printf("[MENU-PTRS] f%u change gs=%u sub=%u eng=0x%08X menustep=0x%08X"
+                       " p0=0x%08X->0x%08X p1=0x%08X->0x%08X p2=0x%08X->0x%08X"
+                       " p3=0x%08X->0x%08X p4=0x%08X->0x%08X\n",
+                       g_ps1_frame, game_state_after, sub_state_after, eng_step_after, menu_step_after,
+                       s_prev_menu_ptrs[0], cur_menu_ptrs[0],
+                       s_prev_menu_ptrs[1], cur_menu_ptrs[1],
+                       s_prev_menu_ptrs[2], cur_menu_ptrs[2],
+                       s_prev_menu_ptrs[3], cur_menu_ptrs[3],
+                       s_prev_menu_ptrs[4], cur_menu_ptrs[4]);
+                fflush(stdout);
+                memcpy(s_prev_menu_ptrs, cur_menu_ptrs, sizeof(s_prev_menu_ptrs));
+            }
+            {
+                uint32_t restored_table_indices[16];
+                const uint32_t saved_menu_table_count =
+                    (uint32_t)(sizeof(s_saved_menu_table) / sizeof(s_saved_menu_table[0]));
+                const uint32_t restored_table_index_capacity =
+                    (uint32_t)(sizeof(restored_table_indices) / sizeof(restored_table_indices[0]));
+                uint32_t restored_table_count = 0;
+                for (uint32_t i = 0; i < saved_menu_table_count; i++) {
+                    uint32_t cur_value;
+                    memcpy(&cur_value, &g_ram[0xA8258u + i * 4u], 4);
+                    if (cur_value == 0u && s_saved_menu_table[i] != 0u) {
+                        memcpy(&g_ram[0xA8258u + i * 4u], &s_saved_menu_table[i], 4);
+                        if (restored_table_count < restored_table_index_capacity) {
+                            restored_table_indices[restored_table_count] = i;
+                        }
+                        restored_table_count++;
+                    }
+                }
+                int restored = 0;
+                for (int i = 0; i < 5; i++) {
+                    if (cur_menu_ptrs[i] == 0u && s_saved_menu_ptrs[i] != 0u) {
+                        memcpy(&g_ram[k_menu_ptr_phys[i]], &s_saved_menu_ptrs[i], 4);
+                        cur_menu_ptrs[i] = s_saved_menu_ptrs[i];
+                        restored = 1;
+                    }
+                }
+                if (restored_table_count != 0u || restored) {
+                    printf("[MENU-PTRS-RESTORE] f%u gs=%u sub=%u eng=0x%08X menustep=0x%08X restored=%u"
+                           " p0=0x%08X p1=0x%08X p2=0x%08X p3=0x%08X p4=0x%08X\n",
+                           g_ps1_frame, game_state_after, sub_state_after, eng_step_after, menu_step_after,
+                           restored_table_count,
+                           cur_menu_ptrs[0], cur_menu_ptrs[1], cur_menu_ptrs[2], cur_menu_ptrs[3], cur_menu_ptrs[4]);
+                    fflush(stdout);
+                    if (restored_table_count != 0u) {
+                        printf("[MENU-TABLE-RESTORE] f%u", g_ps1_frame);
+                        for (uint32_t i = 0; i < restored_table_count && i < restored_table_index_capacity; i++) {
+                            printf(" i%u", restored_table_indices[i]);
+                        }
+                        if (restored_table_count > restored_table_index_capacity) {
+                            printf(" ...");
+                        }
+                        printf("\n");
+                        fflush(stdout);
+                    }
+                    memcpy(s_prev_menu_ptrs, cur_menu_ptrs, sizeof(s_prev_menu_ptrs));
+                }
+            }
+        }
+        if (s_dra_tele_restore_pending &&
+            s_dra_tele_captured &&
+            game_state_after != 8u) {
+            static uint32_t s_dra_tele_restore_leave_menu_logs = 0;
+            memcpy(&g_ram[0xA245C], s_dra_tele_saved, sizeof(s_dra_tele_saved));
+            s_dra_tele_restore_pending = 0;
+            if (++s_dra_tele_restore_leave_menu_logs <= 8u) {
+                uint16_t x = 0, y = 0, room = 0, unk6 = 0, stage = 0;
+                memcpy(&x, &g_ram[0xA245C], 2);
+                memcpy(&y, &g_ram[0xA245E], 2);
+                memcpy(&room, &g_ram[0xA2460], 2);
+                memcpy(&unk6, &g_ram[0xA2462], 2);
+                memcpy(&stage, &g_ram[0xA2464], 2);
+                printf("[DRA-TELE-RESTORE] f%u after leaving menu via %s entry0={x=%u y=%u room=0x%04X unk6=0x%04X stage=0x%04X}\n",
+                       g_ps1_frame,
+                       s_dra_tele_restore_reason[0] ? s_dra_tele_restore_reason : "<unknown>",
+                       x, y, room, unk6, stage);
+                fflush(stdout);
+            }
+        }
+        if (s_dra_stage_lba_restore_pending &&
+            s_dra_stage_lba_captured &&
+            game_state_after != 8u) {
+            static uint32_t s_dra_stage_lba_restore_leave_menu_logs = 0;
+            memcpy(&g_ram[0xA3C68], s_dra_stage_lba_saved, sizeof(s_dra_stage_lba_saved));
+            s_dra_stage_lba_restore_pending = 0;
+            if (++s_dra_stage_lba_restore_leave_menu_logs <= 8u) {
+                uint8_t st0_unk28 = g_ram[0xA3C68u + 0x1Fu * 44u];
+                uint8_t menu_unk28 = g_ram[0xA3C68u + 0x45u * 44u];
+                printf("[DRA-STAGELBA-RESTORE] f%u after leaving menu via %s st0=0x%02X menu45=0x%02X\n",
+                       g_ps1_frame,
+                       s_dra_tele_restore_reason[0] ? s_dra_tele_restore_reason : "<unknown>",
+                       st0_unk28, menu_unk28);
+                fflush(stdout);
+            }
+        }
+        if (!s_dra_tele_restore_pending && !s_dra_stage_lba_restore_pending) {
+            memset(s_dra_tele_restore_reason, 0, sizeof(s_dra_tele_restore_reason));
+        }
+        if (game_state_after == 2u && s_prev_game_state_after != 2u) {
+            uint32_t stage_id_enter = 0;
+            s_gs2_enter_frame = g_ps1_frame;
+            memcpy(&stage_id_enter, &g_ram[0x974A0u], sizeof(stage_id_enter));
+            if ((stage_id_enter & 0xFFu) == 0x1Fu) {  /* STAGE_ST0 */
+                if (s_prev_game_state_after == 4u) {
+                    memset(&g_ram[0x733D8u], 0, 0xBCu * 256u); /* g_Entities */
+                    memset(&g_ram[0x9CE78u], 0, 0x34u * 0x500u); /* g_PrimBuf */
+                    printf("[CV-STAGE-RESET] f%u cleared g_Entities/g_PrimBuf for ST0 gs4->gs2\n",
+                           g_ps1_frame);
+                    fflush(stdout);
+                }
+                uint32_t player_entity_addr = 0x800733D8u;  /* &PLAYER */
+                memcpy(&g_ram[0x6C3B8u], &player_entity_addr, 4);
+                printf("[CV-PLAYER-INIT] f%u injected g_CurrentEntity=0x%08X (&PLAYER) for ST0\n",
+                       g_ps1_frame, player_entity_addr);
+                fflush(stdout);
+            }
+        }
+        {
+            static int s_stats_injected = 0;
+            if (!s_stats_injected &&
+                game_state_after == 2u &&
+                s_prev_game_state_after == 4u) {
+                uint32_t stage_id_chk = 0;
+                memcpy(&stage_id_chk, &g_ram[0x974A0u], sizeof(stage_id_chk));
+                if ((stage_id_chk & 0xFFu) == 0x1Fu) {  /* STAGE_ST0 */
+                    int32_t v = 0;
+                    s_stats_injected = 1;
+
+                    memset(&g_ram[0x9798Au], 0, 169); /* equipHandCount */
+                    memset(&g_ram[0x97A33u], 0, 90);  /* equipBodyCount */
+                    memset(&g_ram[0x97982u], 0, 8);   /* spells */
+                    memset(&g_ram[0x97BC8u], 0, 16);  /* statsEquip */
+                    memset(&g_ram[0x97BD8u], 0, 16);  /* statsTotal */
+
+                    v = 0; memcpy(&g_ram[0x97BF8u], &v, 4); /* D_80097BF8 */
+                    v = 0; memcpy(&g_ram[0x97B9Cu], &v, 4); /* spellsLearnt */
+
+                    v = 50; memcpy(&g_ram[0x97BA0u], &v, 4); /* hp */
+                    v = 50; memcpy(&g_ram[0x97BA4u], &v, 4); /* hpMax */
+                    v = 30; memcpy(&g_ram[0x97BA8u], &v, 4); /* hearts */
+                    v = 99; memcpy(&g_ram[0x97BACu], &v, 4); /* heartsMax */
+                    v = 20; memcpy(&g_ram[0x97BB0u], &v, 4); /* mp */
+                    v = 20; memcpy(&g_ram[0x97BB4u], &v, 4); /* mpMax */
+                    v = 10; memcpy(&g_ram[0x97BB8u], &v, 4); /* statsBase[STR] */
+                    v = 10; memcpy(&g_ram[0x97BBCu], &v, 4); /* statsBase[CON] */
+                    v = 10; memcpy(&g_ram[0x97BC0u], &v, 4); /* statsBase[INT] */
+                    v = 10; memcpy(&g_ram[0x97BC4u], &v, 4); /* statsBase[LCK] */
+                    v = 1;  memcpy(&g_ram[0x97BE8u], &v, 4); /* level */
+                    v = 0;  memcpy(&g_ram[0x97BECu], &v, 4); /* exp */
+                    v = 0;  memcpy(&g_ram[0x97BF0u], &v, 4); /* gold */
+                    v = 0;  memcpy(&g_ram[0x97BF4u], &v, 4); /* killCount */
+                    v = 0;  memcpy(&g_ram[0x97BFCu], &v, 4); /* subWeapon */
+
+                    memset(&g_ram[0x97C00u], 0, 5 * 4); /* wornEquipment */
+                    memset(&g_ram[0x97C1Cu], 0, 2 * 4); /* attackHands */
+                    v = 0; memcpy(&g_ram[0x97C24u], &v, 4); /* defenseEquip */
+                    memset(&g_ram[0x97C30u], 0, 4 * 4); /* timers */
+
+                    g_ram[0x9798Au + 0] = 1;      /* ITEM_EMPTY_HAND */
+                    g_ram[0x97A33u + 0x00] = 1;   /* ITEM_NO_ARMOR */
+                    g_ram[0x97A33u + 0x1A] = 1;   /* ITEM_EMPTY_HEAD */
+                    g_ram[0x97A33u + 0x30] = 1;   /* ITEM_NO_CAPE */
+                    g_ram[0x97A33u + 0x39] = 1;   /* ITEM_NO_ACCESSORY */
+
+                    for (int oi = 0; oi < 169; oi++) {
+                        g_ram[0x97A8Du + oi] = (uint8_t)oi;
+                    }
+                    for (int oi = 0; oi < 90; oi++) {
+                        g_ram[0x97B36u + oi] = (uint8_t)oi;
+                    }
+                    for (int ri = 0; ri < 30; ri++) {
+                        g_ram[0x97964u + ri] = 0x01;
+                    }
+                    g_ram[0x97964u + 10] |= 2;  /* RELIC_CUBE_OF_ZOE */
+                    g_ram[0x97964u + 11] |= 2;  /* RELIC_SPIRIT_ORB */
+                    g_ram[0x97964u + 15] |= 2;  /* RELIC_FAERIE_SCROLL */
+                    g_ram[0x97964u + 16] |= 2;  /* RELIC_JEWEL_OF_OPEN */
+
+                    printf("[CV-STATS-INIT] f%u injected Richter/ST0 stats "
+                           "(hp=50 hearts=30 mp=20 subWpn=0)\n", g_ps1_frame);
+                    fflush(stdout);
+                }
+            }
+        }
+        s_prev_game_state_after = game_state_after;
+        {
+            if (game_state_after == 2u) {
+                uint32_t gs2_age_log = g_ps1_frame - s_gs2_enter_frame;
+                if (gs2_age_log <= 16u || (gs2_age_log != 0u && (gs2_age_log % 60u) == 0u)) {
+                    uint32_t fade_prim = 0;
+                    uint32_t fade_map_prim = 0;
+                    uint32_t fade_step = 0;
+                    uint32_t fade_follow = 0;
+                    uint32_t eng_step_log = 0;
+                    uint32_t game_step_log = 0;
+                    uint32_t menu_step_log = 0;
+                    uint32_t menu_vis_log = 0;
+                    uint32_t stage_id_log = 0;
+                    uint32_t cutscene_control = 0;
+                    uint32_t pause_allowed = 0;
+                    uint32_t pad_sim = 0;
+                    int32_t demo_timer = 0;
+                    uint32_t player_pad_pressed = 0;
+                    uint32_t player_pad_tapped = 0;
+                    uint32_t player_pad_held = 0;
+                    uint16_t game_pad_pressed = 0;
+                    uint16_t game_pad_tapped = 0;
+                    uint16_t player_step = 0;
+                    uint16_t player_anim_frame = 0;
+                    uint32_t player_x_raw = 0;
+                    uint32_t player_y_raw = 0;
+                    uint32_t tile_scroll_x_raw = 0;
+                    uint32_t tile_scroll_y_raw = 0;
+                    uint32_t bg_scroll_x_raw = 0;
+                    uint32_t bg_scroll_y_raw = 0;
+                    uint32_t cd_step_log = 0;
+                    uint32_t is_using_cd_log = 0;
+                    uint32_t current_entity_log = 0;
+                    uint32_t player_pfn_log = 0;
+                    uint32_t player_params_log = 0;
+                    int32_t player_prim_index_log = -1;
+                    uint16_t player_entity_id_log = 0;
+                    uint16_t player_palette_log = 0;
+                    uint8_t player_draw_flags_log = 0;
+                    uint16_t player_scale_x_log = 0;
+                    uint16_t player_scale_y_log = 0;
+                    uint16_t player_rot_pivot_y_log = 0;
+                    uint16_t player_z_priority_log = 0;
+                    uint32_t player_flags_log = 0;
+                    uint32_t player_anim_ptr_log = 0;
+                    uint16_t player_anim_set_log = 0;
+                    uint32_t player_prim_next_log = 0;
+                    uint16_t player_prim_priority_log = 0;
+                    uint16_t player_prim_draw_mode_log = 0;
+                    int16_t player_prim_x0_log = 0;
+                    int16_t player_prim_y0_log = 0;
+                    int16_t player_prim_x1_log = 0;
+                    int16_t player_prim_y1_log = 0;
+                    uint8_t player_prim_type_log = 0;
+                    uint32_t player_prim_valid_log = 0;
+                    uint32_t sprite_banks_ptr_log = 0;
+                    uint32_t sprite_bank_10_log = 0;
+                    uint32_t sprite_bank_11_log = 0;
+                    uint32_t sprite_bank_12_log = 0;
+                    uint32_t sprite_bank_13_log = 0;
+                    uint32_t player_ovl_entity = 0;
+                    uint32_t player_ovl_init = 0;
+                    uint32_t player_ovl_step = 0;
+                    memcpy(&fade_prim, &g_ram[0x13799Cu], sizeof(fade_prim));
+                    memcpy(&fade_map_prim, &g_ram[0x1379A0u], sizeof(fade_map_prim));
+                    memcpy(&fade_step, &g_ram[0x1379A4u], sizeof(fade_step));
+                    memcpy(&fade_follow, &g_ram[0x1379A8u], sizeof(fade_follow));
+                    memcpy(&eng_step_log, &g_ram[0x3C9A4u], sizeof(eng_step_log));
+                    memcpy(&game_step_log, &g_ram[0x73060u], sizeof(game_step_log));
+                    memcpy(&menu_step_log, &g_ram[0x978F8u], sizeof(menu_step_log));
+                    memcpy(&menu_vis_log, &g_ram[0x973ECu], sizeof(menu_vis_log));
+                    memcpy(&stage_id_log, &g_ram[0x974A0u], sizeof(stage_id_log));
+                    memcpy(&cutscene_control, &g_ram[0x3C704u], sizeof(cutscene_control));
+                    memcpy(&pause_allowed, &g_ram[0x3C8B8u], sizeof(pause_allowed));
+                    memcpy(&player_pad_pressed, &g_ram[0x72EE8u], sizeof(player_pad_pressed));
+                    memcpy(&player_pad_tapped, &g_ram[0x72EECu], sizeof(player_pad_tapped));
+                    memcpy(&player_pad_held, &g_ram[0x72EF0u], sizeof(player_pad_held));
+                    memcpy(&pad_sim, &g_ram[0x72EF4u], sizeof(pad_sim));
+                    memcpy(&demo_timer, &g_ram[0x72EFCu], sizeof(demo_timer));
+                    memcpy(&game_pad_pressed, &g_ram[0x97490u], sizeof(game_pad_pressed));
+                    memcpy(&game_pad_tapped, &g_ram[0x97494u], sizeof(game_pad_tapped));
+                    memcpy(&player_step, &g_ram[0x73404u], sizeof(player_step));
+                    memcpy(&player_anim_frame, &g_ram[0x7342Eu], sizeof(player_anim_frame));
+                    memcpy(&player_x_raw, &g_ram[0x733D8u], sizeof(player_x_raw));
+                    memcpy(&player_y_raw, &g_ram[0x733DCu], sizeof(player_y_raw));
+                    memcpy(&tile_scroll_x_raw, &g_ram[0x7308Cu], sizeof(tile_scroll_x_raw));
+                    memcpy(&tile_scroll_y_raw, &g_ram[0x73090u], sizeof(tile_scroll_y_raw));
+                    memcpy(&bg_scroll_x_raw, &g_ram[0x730E0u], sizeof(bg_scroll_x_raw));
+                    memcpy(&bg_scroll_y_raw, &g_ram[0x730E4u], sizeof(bg_scroll_y_raw));
+                    memcpy(&cd_step_log, &g_ram[0x6C398u], sizeof(cd_step_log));
+                    memcpy(&is_using_cd_log, &g_ram[0x6C3B0u], sizeof(is_using_cd_log));
+                    memcpy(&current_entity_log, &g_ram[0x6C3B8u], sizeof(current_entity_log));
+                    memcpy(&player_pfn_log, &g_ram[0x73400u], sizeof(player_pfn_log));
+                    memcpy(&player_params_log, &g_ram[0x73408u], sizeof(player_params_log));
+                    memcpy(&player_prim_index_log, &g_ram[0x7343Cu], sizeof(player_prim_index_log));
+                    memcpy(&player_palette_log, &g_ram[0x733EEu], sizeof(player_palette_log));
+                    player_draw_flags_log = g_ram[0x733F1u];
+                    memcpy(&player_scale_x_log, &g_ram[0x733F2u], sizeof(player_scale_x_log));
+                    memcpy(&player_scale_y_log, &g_ram[0x733F4u], sizeof(player_scale_y_log));
+                    memcpy(&player_rot_pivot_y_log, &g_ram[0x733FAu], sizeof(player_rot_pivot_y_log));
+                    memcpy(&player_z_priority_log, &g_ram[0x733FCu], sizeof(player_z_priority_log));
+                    memcpy(&player_entity_id_log, &g_ram[0x733FEu], sizeof(player_entity_id_log));
+                    memcpy(&player_flags_log, &g_ram[0x7340Cu], sizeof(player_flags_log));
+                    memcpy(&player_anim_ptr_log, &g_ram[0x73424u], sizeof(player_anim_ptr_log));
+                    memcpy(&player_anim_set_log, &g_ram[0x7342Cu], sizeof(player_anim_set_log));
+                    memcpy(&player_ovl_entity, &g_ram[0x13C000u], sizeof(player_ovl_entity));
+                    memcpy(&player_ovl_init, &g_ram[0x13C004u], sizeof(player_ovl_init));
+                    memcpy(&player_ovl_step, &g_ram[0x13C008u], sizeof(player_ovl_step));
+                    memcpy(&sprite_banks_ptr_log, &g_ram[0x3C788u], sizeof(sprite_banks_ptr_log));
+                    if (sprite_banks_ptr_log >= 0x80000000u &&
+                        (sprite_banks_ptr_log & 0x1FFFFFFFu) + 0x14u * 4u <= sizeof(g_ram)) {
+                        uint32_t sprite_banks_phys = sprite_banks_ptr_log & 0x1FFFFFFFu;
+                        memcpy(&sprite_bank_10_log, &g_ram[sprite_banks_phys + 0x10u * 4u], sizeof(sprite_bank_10_log));
+                        memcpy(&sprite_bank_11_log, &g_ram[sprite_banks_phys + 0x11u * 4u], sizeof(sprite_bank_11_log));
+                        memcpy(&sprite_bank_12_log, &g_ram[sprite_banks_phys + 0x12u * 4u], sizeof(sprite_bank_12_log));
+                        memcpy(&sprite_bank_13_log, &g_ram[sprite_banks_phys + 0x13u * 4u], sizeof(sprite_bank_13_log));
+                    }
+                    if (player_prim_index_log >= 0 && player_prim_index_log < 0x500) {
+                        uint32_t prim_phys = 0x86FECu + (uint32_t)player_prim_index_log * 0x34u;
+                        if (prim_phys + 0x34u <= sizeof(g_ram)) {
+                            memcpy(&player_prim_next_log, &g_ram[prim_phys + 0x00u], sizeof(player_prim_next_log));
+                            player_prim_type_log = g_ram[prim_phys + 0x07u];
+                            memcpy(&player_prim_x0_log, &g_ram[prim_phys + 0x08u], sizeof(player_prim_x0_log));
+                            memcpy(&player_prim_y0_log, &g_ram[prim_phys + 0x0Au], sizeof(player_prim_y0_log));
+                            memcpy(&player_prim_x1_log, &g_ram[prim_phys + 0x14u], sizeof(player_prim_x1_log));
+                            memcpy(&player_prim_y1_log, &g_ram[prim_phys + 0x16u], sizeof(player_prim_y1_log));
+                            memcpy(&player_prim_priority_log, &g_ram[prim_phys + 0x26u], sizeof(player_prim_priority_log));
+                            memcpy(&player_prim_draw_mode_log, &g_ram[prim_phys + 0x32u], sizeof(player_prim_draw_mode_log));
+                            player_prim_valid_log = 1u;
+                        }
+                    }
+                    printf("[GS2-FADE] f%u age=%u eng=0x%08X menustep=0x%08X menuvis=0x%08X fadePrim=%u mapPrim=%u step=%u follow=%u\n",
+                           g_ps1_frame, gs2_age_log, eng_step_log, menu_step_log, menu_vis_log,
+                           fade_prim, fade_map_prim, fade_step, fade_follow);
+                    fflush(stdout);
+                    if ((stage_id_log & 0xFFu) == 0x1Fu) {
+                        const int player_x = (int16_t)(player_x_raw >> 16);
+                        const int player_y = (int16_t)(player_y_raw >> 16);
+                        const int tile_scroll_x = (int16_t)(tile_scroll_x_raw >> 16);
+                        const int tile_scroll_y = (int16_t)(tile_scroll_y_raw >> 16);
+                        const int bg_scroll_x = (int16_t)(bg_scroll_x_raw >> 16);
+                        const int bg_scroll_y = (int16_t)(bg_scroll_y_raw >> 16);
+                        printf("[GS2-ST0] f%u age=%u eng=0x%08X gstep=0x%08X cut=0x%08X pause=0x%08X demo=%d padSim=0x%08X gpad=(0x%04X/0x%04X) ppad=(0x%08X/0x%08X/0x%08X) pstep=0x%04X frame=0x%04X pfn=0x%08X param=0x%08X prim=%d curEnt=0x%08X povl=(0x%08X,0x%08X,0x%08X) pxy=(%d,%d) fg=(%d,%d) bg0=(%d,%d) cdBusy=0x%08X cdStep=0x%08X\n",
+                                g_ps1_frame, gs2_age_log, eng_step_log, game_step_log,
+                                cutscene_control, pause_allowed, demo_timer, pad_sim,
+                                (uint32_t)game_pad_pressed, (uint32_t)game_pad_tapped,
+                                player_pad_pressed, player_pad_tapped, player_pad_held,
+                                (uint32_t)player_step, (uint32_t)player_anim_frame,
+                                player_pfn_log, player_params_log, player_prim_index_log, current_entity_log,
+                                player_ovl_entity, player_ovl_init, player_ovl_step,
+                                player_x, player_y, tile_scroll_x, tile_scroll_y,
+                                bg_scroll_x, bg_scroll_y, is_using_cd_log, cd_step_log);
+                        printf("[GS2-ST0-PRIM] f%u age=%u ent=0x%04X flags=0x%08X prim=%d valid=%u type=%u next=0x%08X pri=0x%04X draw=0x%04X x0=%d y0=%d x1=%d y1=%d\n",
+                               g_ps1_frame, gs2_age_log, (uint32_t)player_entity_id_log, player_flags_log,
+                               player_prim_index_log, player_prim_valid_log, (uint32_t)player_prim_type_log,
+                               player_prim_next_log, (uint32_t)player_prim_priority_log,
+                               (uint32_t)player_prim_draw_mode_log, (int)player_prim_x0_log,
+                               (int)player_prim_y0_log, (int)player_prim_x1_log, (int)player_prim_y1_log);
+                        printf("[GS2-ST0-SPR] f%u age=%u pal=0x%04X draw=0x%02X scale=(0x%04X,0x%04X) pivotY=0x%04X z=0x%04X anim=0x%08X animSet=0x%04X frame=0x%04X spriteBanks=0x%08X [10]=0x%08X [11]=0x%08X [12]=0x%08X [13]=0x%08X\n",
+                               g_ps1_frame, gs2_age_log, (uint32_t)player_palette_log,
+                               (uint32_t)player_draw_flags_log, (uint32_t)player_scale_x_log,
+                               (uint32_t)player_scale_y_log, (uint32_t)player_rot_pivot_y_log,
+                               (uint32_t)player_z_priority_log, player_anim_ptr_log,
+                               (uint32_t)player_anim_set_log,
+                               (uint32_t)player_anim_frame, sprite_banks_ptr_log,
+                               sprite_bank_10_log, sprite_bank_11_log, sprite_bank_12_log, sprite_bank_13_log);
+                        fflush(stdout);
+                    }
+                }
+            }
+            int defer_pump = 0;
+            uint32_t gs2_age = (game_state_after == 2u) ? (g_ps1_frame - s_gs2_enter_frame) : 0u;
+            if (game_state_after == 4u) {
+                defer_pump = 1;
+            } else if (game_state_after == 2u) {
+                int has_live_cd_request =
+                    (v_bafc_after != 0u) && (v_c398_after != 0u);
+                /* During the gs2 handoff we can defer only until Play_Default
+                 * actually starts. Once sub=3 is live, early ST0 init needs the
+                 * callback pump even if we are still inside the first few frames.
+                 * After that, only paired LoadFile/CdStep requests should
+                 * suppress the pump; stray single-field garbage during ST0 room
+                 * movement corrupts the OT if we treat it as a real CD load. */
+                defer_pump =
+                    ((gs2_age < 5u) && (sub_state_after < 3u)) ||
+                    has_live_cd_request;
+            }
+            if (defer_pump) {
+            static uint32_t s_pump_defer_cd = 0;
+            if (++s_pump_defer_cd <= 64u || (s_pump_defer_cd % 256u) == 0u) {
+                printf("[CV-PUMP-DEFER] f%u n=%u gs=%u sub=%u age=%u BAFC=0x%08X C398=0x%08X -> returning before callback pump\n",
+                       g_ps1_frame, s_pump_defer_cd, game_state_after, sub_state_after, gs2_age,
+                       v_bafc_after, v_c398_after);
+                fflush(stdout);
+            }
+            cpu->sp = save_sp;
+            cpu->ra = save_ra;
+            cpu->s0 = save_s0; cpu->s1 = save_s1;
+            cpu->s2 = save_s2; cpu->s3 = save_s3;
+            cpu->s4 = save_s4; cpu->s5 = save_s5;
+            cpu->s6 = save_s6; cpu->s7 = save_s7;
+            cpu->fp = save_fp;
+            return;
+        }
         }
     }
 
@@ -9339,21 +15682,26 @@ void cv_display_pump_frame(CPUState* cpu) {
         }
     }
     if (s_pump_call_drawotag) {
-        /* Read OT head pointers from RAM */
+        /* Prefer the OT head the game's DrawOTag actually received this frame.
+         * The game alternates OT buffers, so fixed RAM pointers can be stale. */
+        uint32_t ot_head = s_last_drawotag_a0;
         uint32_t ot_cur = 0;
         uint32_t ot_alt = 0;
         memcpy(&ot_cur, &g_ram[0x39280], 4);
         memcpy(&ot_alt, &g_ram[0x3927C], 4);
-        
-        /* Use current OT, fallback to alt if current is null */
-        uint32_t ot_head = ot_cur;
-        if (ot_head == 0u) ot_head = ot_alt;
+
+        if (ot_head == 0u) {
+            ot_head = ot_cur;
+            if (ot_head == 0u) {
+                ot_head = ot_alt;
+            }
+        }
         
         if (ot_head != 0u) {
             static uint32_t s_drawotag_calls = 0;
             if (++s_drawotag_calls <= 10u || (s_drawotag_calls % 120u) == 0u) {
-                printf("[CV-PUMP-DRAW] f%u call#%u DrawOTag(0x%08X) otCur=0x%08X otAlt=0x%08X\n",
-                       g_ps1_frame, s_drawotag_calls, ot_head, ot_cur, ot_alt);
+                printf("[CV-PUMP-DRAW] f%u call#%u DrawOTag(0x%08X) saved=0x%08X otCur=0x%08X otAlt=0x%08X\n",
+                       g_ps1_frame, s_drawotag_calls, ot_head, s_last_drawotag_a0, ot_cur, ot_alt);
                 fflush(stdout);
             }
             
@@ -9366,6 +15714,39 @@ void cv_display_pump_frame(CPUState* cpu) {
             cpu->ra = save_draw_ra;
             cpu->a0 = save_draw_a0;
         }
+    }
+
+    if (s_sound_tick_called_frame != g_ps1_frame) {
+        static uint32_t s_sound_tick_pumps = 0;
+        (void)cv_call_preserve_cpu_state(cpu, 0x801361F8u, 0u, 0u, 0u, 0u);
+        if (s_sound_tick_called_frame == g_ps1_frame) {
+            if (++s_sound_tick_pumps <= 20u || (s_sound_tick_pumps % 240u) == 0u) {
+                printf("[SOUND-TICK-PUMP] f%u injected missing sound tick #%u\n",
+                       g_ps1_frame, s_sound_tick_pumps);
+                fflush(stdout);
+            }
+        }
+    }
+    if (s_sound_tick_called_frame == g_ps1_frame) {
+        static uint32_t s_sound_flush_pumps = 0;
+        (void)cv_call_preserve_cpu_state(cpu, 0x800247C8u, 0u, 0u, 0u, 0u);
+        if (++s_sound_flush_pumps <= 20u || (s_sound_flush_pumps % 240u) == 0u) {
+            printf("[SOUND-FLUSH-PUMP] f%u injected SpuVmFlush #%u\n",
+                   g_ps1_frame, s_sound_flush_pumps);
+            fflush(stdout);
+        }
+    }
+
+    if (g_ps1_frame >= 807u && g_ps1_frame < 830u) {
+        uint32_t v_bafc = 0;
+        uint32_t v_c398 = 0;
+        uint32_t cb_end = 0;
+        memcpy(&v_bafc, &g_ram[0x6BAFC], 4);
+        memcpy(&v_c398, &g_ram[0x6C398], 4);
+        memcpy(&cb_end, &g_ram[0x32AB0], 4);
+        printf("[CV-PUMP-END] f%u BAFC=0x%08X C398=0x%08X cb=0x%08X 32D80=0x%02X\n",
+               g_ps1_frame, v_bafc, v_c398, cb_end, g_ram[0x32D80]);
+        fflush(stdout);
     }
 
     cpu->sp = save_sp;

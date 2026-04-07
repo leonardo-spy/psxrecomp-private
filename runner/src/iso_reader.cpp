@@ -5,6 +5,47 @@
 
 namespace PS1 {
 
+namespace {
+
+std::string NormalizeIsoPath(const std::string& path) {
+    std::string normalized;
+    normalized.reserve(path.size());
+    for (unsigned char c : path) {
+        if (c == '\\') {
+            normalized.push_back('/');
+        } else {
+            normalized.push_back(static_cast<char>(std::toupper(c)));
+        }
+    }
+    return normalized;
+}
+
+std::vector<std::string> SplitIsoPath(const std::string& path) {
+    std::vector<std::string> parts;
+    std::string normalized = NormalizeIsoPath(path);
+    size_t start = 0;
+    while (start < normalized.size()) {
+        while (start < normalized.size() && normalized[start] == '/') {
+            start++;
+        }
+        if (start >= normalized.size()) {
+            break;
+        }
+        size_t end = normalized.find('/', start);
+        std::string part = normalized.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return parts;
+}
+
+} // namespace
+
 // PS1 CD-ROM sector size (Mode 2, Form 1 user data)
 constexpr size_t SECTOR_SIZE = 2048;
 
@@ -314,33 +355,47 @@ std::vector<ISOFileEntry> ISOReader::ListFiles(const std::string& path) {
         return results;
     }
 
-    if (path.empty()) {
-        // List root directory
-        RootDirectoryInfo root = GetRootDirectory();
-        return ListFilesByLBA(root.lba, root.size);
+    RootDirectoryInfo dir;
+    if (!ResolveDirectory(path, dir)) {
+        return results;
     }
 
-    // Non-empty path: navigate to that subdirectory within the root
-    // Find the matching directory entry in root
-    RootDirectoryInfo root = GetRootDirectory();
-    std::vector<ISOFileEntry> root_entries = ListFilesByLBA(root.lba, root.size);
+    return ListFilesByLBA(dir.lba, dir.size > 0 ? dir.size : 2048);
+}
 
-    std::string path_upper = path;
-    std::transform(path_upper.begin(), path_upper.end(), path_upper.begin(),
-                   [](unsigned char c) { return std::toupper(c); });
+bool ISOReader::ResolveDirectory(const std::string& path, RootDirectoryInfo& dir) {
+    if (!is_open_) {
+        return false;
+    }
 
-    for (const auto& e : root_entries) {
-        if (!e.is_directory) continue;
-        std::string name_upper = e.name;
-        std::transform(name_upper.begin(), name_upper.end(), name_upper.begin(),
-                       [](unsigned char c) { return std::toupper(c); });
-        if (name_upper == path_upper) {
-            // Found the subdirectory — list its contents
-            return ListFilesByLBA(e.lba, e.size > 0 ? e.size : 2048);
+    RootDirectoryInfo current = GetRootDirectory();
+    if (path.empty()) {
+        dir = current;
+        return true;
+    }
+
+    std::vector<std::string> parts = SplitIsoPath(path);
+    for (const auto& part : parts) {
+        std::vector<ISOFileEntry> entries = ListFilesByLBA(current.lba, current.size > 0 ? current.size : 2048);
+        bool found = false;
+        for (const auto& entry : entries) {
+            if (!entry.is_directory) {
+                continue;
+            }
+            if (NormalizeIsoPath(entry.name) == part) {
+                current.lba = entry.lba;
+                current.size = entry.size > 0 ? entry.size : 2048;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
         }
     }
 
-    return results;  // Directory not found
+    dir = current;
+    return true;
 }
 
 bool ISOReader::FindFile(const std::string& path, ISOFileEntry& entry) {
@@ -349,56 +404,59 @@ bool ISOReader::FindFile(const std::string& path, ISOFileEntry& entry) {
         return false;
     }
 
-    // Check if path contains a directory separator
-    size_t sep = path.find('/');
-    if (sep == std::string::npos) {
-        sep = path.find('\\');
-    }
+    std::string normalized = NormalizeIsoPath(path);
+    std::string file_only = normalized;
 
+    // Check if path contains a directory separator
+    size_t sep = normalized.find_last_of('/');
     if (sep != std::string::npos) {
         // Subdirectory path: "DIR/FILE" or "DIR\FILE"
-        std::string dir_name  = path.substr(0, sep);
-        std::string file_name = path.substr(sep + 1);
+        std::string dir_name = normalized.substr(0, sep);
+        file_only = normalized.substr(sep + 1);
 
         // List the subdirectory
         std::vector<ISOFileEntry> sub_files = ListFiles(dir_name);
 
-        std::string file_upper = file_name;
-        std::transform(file_upper.begin(), file_upper.end(), file_upper.begin(),
-                       [](unsigned char c) { return std::toupper(c); });
-
         for (const auto& f : sub_files) {
-            std::string name_upper = f.name;
-            std::transform(name_upper.begin(), name_upper.end(), name_upper.begin(),
-                           [](unsigned char c) { return std::toupper(c); });
-            if (name_upper == file_upper) {
+            if (NormalizeIsoPath(f.name) == file_only) {
                 entry = f;
                 return true;
             }
         }
-        return false;
+    } else {
+        // Root-level file: search root directory first
+        std::vector<ISOFileEntry> files = ListFiles("");
+
+        // Search for matching filename (case-insensitive comparison)
+        for (const auto& file : files) {
+            if (NormalizeIsoPath(file.name) == normalized) {
+                entry = file;
+                return true;
+            }
+        }
     }
 
-    // Root-level file: search root directory
-    std::vector<ISOFileEntry> files = ListFiles("");
+    RootDirectoryInfo root = GetRootDirectory();
+    return FindFileRecursive(file_only, root.lba, root.size, entry);
+}
 
-    // Search for matching filename (case-insensitive comparison)
-    for (const auto& file : files) {
-        std::string file_upper = file.name;
-        std::string path_upper = path;
+bool ISOReader::FindFileRecursive(const std::string& file_name, uint32_t lba, uint32_t dir_size, ISOFileEntry& entry) {
+    std::vector<ISOFileEntry> entries = ListFilesByLBA(lba, dir_size > 0 ? dir_size : 2048);
 
-        std::transform(file_upper.begin(), file_upper.end(), file_upper.begin(),
-                       [](unsigned char c) { return std::toupper(c); });
-        std::transform(path_upper.begin(), path_upper.end(), path_upper.begin(),
-                       [](unsigned char c) { return std::toupper(c); });
-
-        if (file_upper == path_upper) {
-            entry = file;
+    for (const auto& cur : entries) {
+        if (!cur.is_directory && NormalizeIsoPath(cur.name) == file_name) {
+            entry = cur;
             return true;
         }
     }
 
-    // File not found
+    for (const auto& cur : entries) {
+        if (cur.is_directory &&
+            FindFileRecursive(file_name, cur.lba, cur.size > 0 ? cur.size : 2048, entry)) {
+            return true;
+        }
+    }
+
     return false;
 }
 

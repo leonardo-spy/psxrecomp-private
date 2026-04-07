@@ -76,6 +76,10 @@ static HANDLE             g_done_event = NULL;
 static std::thread             g_thread;
 static std::atomic<bool>       g_running{false};
 static std::atomic<uint32_t>   g_seek_lba{UINT32_MAX};
+static std::atomic<uint32_t>   g_filter{0xFFFFFFFFu};
+static std::atomic<uint32_t>   g_filter_version{1u};
+static std::atomic<uint32_t>   g_active_filter_version{0u};
+static std::atomic<uint32_t>   g_current_lba{UINT32_MAX};
 
 /* Channel lock — set to first audio file/channel seen after each seek */
 static uint8_t  g_xa_file    = 0xFF;  /* 0xFF = not yet locked */
@@ -195,6 +199,8 @@ static void audio_thread()
                 /* LBA 0 = stop: flush queued WinMM buffers immediately and go idle */
                 waveOutReset(g_wave);
                 lba = UINT32_MAX;
+                g_current_lba.store(UINT32_MAX, std::memory_order_relaxed);
+                g_active_filter_version.store(0u, std::memory_order_relaxed);
                 prevL[0] = prevL[1] = prevR[0] = prevR[1] = 0;
                 sect_pos = sect_rem = 0;
                 buf_pos  = 0;
@@ -206,12 +212,16 @@ static void audio_thread()
                 fflush(stdout);
             } else {
                 lba = req;
+                g_current_lba.store(lba, std::memory_order_relaxed);
+                g_active_filter_version.store(
+                    g_filter_version.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
                 prevL[0] = prevL[1] = prevR[0] = prevR[1] = 0;
                 sect_pos = sect_rem = 0;
                 buf_pos  = 0;
                 no_audio = 0;
                 resamp_phase = 0;
-                g_xa_file    = 0xFF;  /* unlock channel — re-lock to first audio sector */
+                g_xa_file    = 0xFF;  /* unlock channel — re-lock to requested channel */
                 g_xa_channel = 0xFF;
                 /* Reset WAV capture so each seek overwrites from the start.
                  * This ensures xa_capture.wav always contains the most recent
@@ -274,27 +284,41 @@ static void audio_thread()
             uint8_t chan_num = raw[XA_SUBHDR_OFF + 1];
 
             if (submode & SUBMODE_AUDIO) {
+                uint32_t filter = g_filter.load(std::memory_order_relaxed);
+                bool filter_enabled = filter != 0xFFFFFFFFu;
+                uint8_t want_file = (uint8_t)(filter >> 8);
+                uint8_t want_channel = (uint8_t)filter;
+                bool matches_filter = !filter_enabled ||
+                                      (file_num == want_file && chan_num == want_channel);
                 /* Lock channel on first audio sector seen after seek.
                  * PS1 discs multiplex many channels; mixing them corrupts
                  * the IIR filter state and produces garbled output. */
                 if (g_xa_file == 0xFF) {
-                    g_xa_file    = file_num;
-                    g_xa_channel = chan_num;
-                    uint8_t coding = raw[XA_SUBHDR_OFF + 3];
-                    /* codingInfo: bit0=stereo, bits2-3=rate(0=37800,1=18900), bits4-5=depth(0=4bit) */
-                    printf("[XA] Locked to file=%u ch=%u codingInfo=0x%02X (%s %s %s)\n",
-                           file_num, chan_num, coding,
-                           (coding & 0x01) ? "stereo" : "mono",
-                           ((coding >> 2) & 0x03) == 0 ? "37800Hz" : "18900Hz",
-                           ((coding >> 4) & 0x03) == 0 ? "4-bit" : "8-bit");
-                    fflush(stdout);
+                    if (!matches_filter) {
+                        if (++no_audio > 20) {
+                            printf("[XA] No filtered audio near LBA %u (want file=%u ch=%u) — stopping\n",
+                                   lba, want_file, want_channel);
+                            fflush(stdout);
+                            lba = UINT32_MAX;
+                            break;
+                        }
+                    } else {
+                        g_xa_file    = file_num;
+                        g_xa_channel = chan_num;
+                        uint8_t coding = raw[XA_SUBHDR_OFF + 3];
+                        /* codingInfo: bit0=stereo, bits2-3=rate(0=37800,1=18900), bits4-5=depth(0=4bit) */
+                        printf("[XA] Locked to file=%u ch=%u codingInfo=0x%02X (%s %s %s)\n",
+                               file_num, chan_num, coding,
+                               (coding & 0x01) ? "stereo" : "mono",
+                               ((coding >> 2) & 0x03) == 0 ? "37800Hz" : "18900Hz",
+                               ((coding >> 4) & 0x03) == 0 ? "4-bit" : "8-bit");
+                        fflush(stdout);
+                    }
                 }
 
-                /* Any audio sector resets the no_audio watchdog */
-                no_audio = 0;
-
-                /* Decode only the locked channel; skip others silently */
+                /* Decode only the locked/requested channel; skip others silently */
                 if (file_num == g_xa_file && chan_num == g_xa_channel) {
+                    no_audio = 0;
                     xa_decode_sector(raw + XA_DATA_OFF, sect_pcm, prevL, prevR);
                     sect_pos = 0;
                     sect_rem = SAMPLES_PER_SECTOR;
@@ -439,7 +463,25 @@ void xa_audio_set_volume(float v)
 void xa_audio_seek(uint32_t lba)
 {
     if (!g_wave) return;
+    uint32_t pending = g_seek_lba.load(std::memory_order_relaxed);
+    uint32_t current = g_current_lba.load(std::memory_order_relaxed);
+    uint32_t filter_version = g_filter_version.load(std::memory_order_relaxed);
+    uint32_t active_filter_version =
+        g_active_filter_version.load(std::memory_order_relaxed);
+    if (lba != 0u && pending == UINT32_MAX &&
+        current == lba && active_filter_version == filter_version) {
+        return;
+    }
     g_seek_lba.store(lba, std::memory_order_release);
+}
+
+void xa_audio_set_filter(uint8_t file, uint8_t channel)
+{
+    uint32_t filter = ((uint32_t)file << 8) | (uint32_t)channel;
+    uint32_t old = g_filter.exchange(filter, std::memory_order_acq_rel);
+    if (old != filter) {
+        g_filter_version.fetch_add(1u, std::memory_order_acq_rel);
+    }
 }
 
 void xa_audio_shutdown(void)

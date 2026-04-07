@@ -51,6 +51,8 @@
 #include <atomic>
 #include <thread>
 
+extern "C" uint32_t g_ps1_frame;
+
 /* -------------------------------------------------------------------------
  * Constants
  * ---------------------------------------------------------------------- */
@@ -76,6 +78,20 @@ static uint32_t g_transfer_addr = 0;
 
 /* Master volume scale: 0.0 = silent, 1.0 = full.  Applied in spu_mix(). */
 static float g_spu_master_vol = 1.0f;
+
+static int spu_trace_kon_enabled(void)
+{
+    static int s_init = 0;
+    static int s_enabled = 0;
+    if (!s_init) {
+        char value[8] = {0};
+        DWORD len = GetEnvironmentVariableA("PSX_TRACE_SPU_KON", value,
+                                            (DWORD)sizeof(value));
+        s_enabled = (len > 0 && value[0] != '0') ? 1 : 0;
+        s_init = 1;
+    }
+    return s_enabled;
+}
 
 /* -------------------------------------------------------------------------
  * SPU-ADPCM filter coefficients (same K0/K1 as XA-ADPCM)
@@ -465,8 +481,12 @@ static void key_on(uint16_t mask, int base_bit)
                            |  (uint32_t)g_spu_regs[vi * 8 + 4];
 
         static uint32_t s_kon = 0;
-        /* [SPU KON] first 30 — re-enable printf when investigating voice keying */
         ++s_kon;
+        if (spu_trace_kon_enabled() && s_kon <= 128u) {
+            printf("[SPU-KON] f%u #%u voice=%d start=0x%05X pitch=0x%04X adsr=0x%08X mask=0x%04X\n",
+                   g_ps1_frame, s_kon, vi, (uint32_t)start_reg * 8u, pitch, adsr32, mask);
+            fflush(stdout);
+        }
 
         v->cur_addr    = (uint32_t)start_reg * 8u;
         v->counter     = 0;

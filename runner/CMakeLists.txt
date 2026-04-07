@@ -30,6 +30,7 @@ FetchContent_MakeAvailable(fmt)
 add_executable(PSXRecompGame
     src/main_runner.cpp
     src/runtime.c
+    src/psx_krom_font.c
     src/gte.cpp
     src/gpu_state.cpp
     src/gpu_interpreter.cpp
